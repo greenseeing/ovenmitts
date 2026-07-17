@@ -1,0 +1,17 @@
+xorriso 1.3.2 : RockRidge filesystem manipulator, libburnia project.
+
+Drive current: -dev '/dev/sr0'
+Media current: DVD+RW
+Media status : is blank
+Media summary: 0 sessions, 0 data blocks, 0 data, 4488m free
+Beginning to write data track.
+xorriso : UPDATE : Formatting. Working since 0 seconds
+xorriso : UPDATE : Thank you for being patient. Working since 2 seconds.
+xorriso : UPDATE :  512 of 3665 MB written (fifo 97%) [buf  94%]   2.4x.
+xorriso : UPDATE :  513 of 3665 MB written (fifo 99%) [buf  94%]   1.0x.
+xorriso : UPDATE :  517 of 3665 MB written (fifo 94%) [buf  94%]   2.8x.
+xorriso : UPDATE :  522 of 3665 MB written (fifo 99%) [buf  94%]   4.0x.
+xorriso : UPDATE : Writing:    20208s   38.2%   fifo  52%  buf  99%  4.0xD
+xorriso : UPDATE : Writing:    52885s  100.0%   fifo   0%  buf  99%  0.0xD
+xorriso : UPDATE : Closing track/session. Working since 44 seconds
+Writing to '/dev/sr0' completed successfully.

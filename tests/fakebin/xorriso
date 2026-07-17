@@ -1,0 +1,92 @@
+#!/bin/sh
+# Fake xorriso: dispatches on argv exactly like the pipeline invokes the real
+# tool (probe / -as mkisofs / -as cdrecord / -md5 on -check_media / report_lba).
+# Transcripts come from the real-output fixtures in ../fixtures.
+set -eu
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+fixtures="$here/../fixtures"
+
+if [ "${1:-}" = "-outdev" ] && [ "${3:-}" = "-toc" ]; then
+    cat "$fixtures/xorriso_probe_bdr_blank_full.txt"
+    exit 0
+fi
+
+if [ "${1:-}" = "-as" ] && [ "${2:-}" = "mkisofs" ]; then
+    shift 2
+    iso=""
+    prev=""
+    for a in "$@"; do
+        if [ "$prev" = "-o" ]; then iso="$a"; fi
+        prev="$a"
+    done
+    if [ -z "$iso" ]; then
+        echo "fake xorriso: -as mkisofs without -o" >&2
+        exit 2
+    fi
+    contents="$iso.contents"
+    rm -rf "$contents"
+    mkdir -p "$contents"
+    : > "$iso"
+    grafting=0
+    for a in "$@"; do
+        if [ "$grafting" = 0 ]; then
+            if [ "$a" = "-graft-points" ]; then grafting=1; fi
+            continue
+        fi
+        target=${a%%=*}
+        source=${a#*=}
+        dest="$contents$target"
+        mkdir -p "$(dirname "$dest")"
+        cp "$source" "$dest"
+        cat "$source" >> "$iso"
+    done
+    printf 'xorriso : UPDATE :  25.00%% done\n' >&2
+    printf 'xorriso : UPDATE :  50.00%% done, estimate finish Thu Jul 17 00:00:00 2026\n' >&2
+    printf 'xorriso : UPDATE :  99.05%% done\n' >&2
+    printf 'ISO image produced: %s sectors\n' "$(( ($(wc -c < "$iso") + 2047) / 2048 ))" >&2
+    exit 0
+fi
+
+if [ "${1:-}" = "-outdev" ] && [ "${3:-}" = "-format" ]; then
+    printf 'xorriso : UPDATE : Formatting  100.0%%\n' >&2
+    exit 0
+fi
+
+if [ "${1:-}" = "-as" ] && [ "${2:-}" = "cdrecord" ]; then
+    shift 2
+    : "${OVENMITTS_FAKE_DEVICE:?fake xorriso: OVENMITTS_FAKE_DEVICE unset}"
+    printf '%s\n' "$@" > "$OVENMITTS_FAKE_DEVICE.cdrecord_argv"
+    dev=""
+    iso=""
+    for a in "$@"; do
+        case "$a" in
+            dev=*) dev=${a#dev=} ;;
+            -*|*=*) ;;
+            *) iso="$a" ;;
+        esac
+    done
+    if [ -z "$dev" ] || [ -z "$iso" ]; then
+        echo "fake xorriso: -as cdrecord needs dev= and an ISO argument" >&2
+        exit 2
+    fi
+    cp "$iso" "$OVENMITTS_FAKE_DEVICE"
+    printf 'xorriso : UPDATE :  4 of 8 MB written (fifo 97%%) [buf  94%%]   4.0x.\n' >&2
+    printf 'xorriso : UPDATE : Writing:    4096s  100.0%%   fifo   0%%  buf  99%%  4.0xD\n' >&2
+    printf "Writing to '%s' completed successfully.\n" "$dev"
+    exit 0
+fi
+
+if [ "${1:-}" = "-md5" ] && [ "${2:-}" = "on" ] && [ "${5:-}" = "-check_media" ]; then
+    cat "$fixtures/check_media_clean.txt"
+    exit 0
+fi
+
+if [ "${1:-}" = "-indev" ] && [ "${3:-}" = "-find" ]; then
+    printf 'Report layout: xt , Startlba ,   Blocks , Filesize , ISO image path\n'
+    printf "File data lba:  0 ,       32 ,     4096 ,  8388608 , '/vault.hc'\n"
+    printf "File data lba:  0 ,     4128 ,     1536 ,  3145728 , '/notes.bin'\n"
+    exit 0
+fi
+
+echo "fake xorriso: unhandled argv: $*" >&2
+exit 1

@@ -1,0 +1,16 @@
+INQUIRY:                [PIONEER ][BD-RW   BDR-205 ][1.09]
+GET [CURRENT] CONFIGURATION:
+ Mounted Media:         41h, BD-R SRM+POW
+ Media ID:              TDKBLD/RBB
+READ DISC INFORMATION:
+ Disc status:           appendable
+ Number of Sessions:    1
+ State of Last Session: incomplete
+ "Next" Track:          1
+ Number of Tracks:      1
+READ TRACK INFORMATION[#1]:
+ Track State:           partial incremental
+ Track Start Address:   0*2KB
+ Free Blocks:           0*2KB
+ Track Size:            12088320*2KB
+READ CAPACITY:          12088320*2048=24756879360

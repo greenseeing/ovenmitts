@@ -1,0 +1,12 @@
+xorriso : UPDATE :  12276k blocks read in 1291 seconds , 6.0xB
+xorriso : UPDATE :  12289k blocks read in 1292 seconds , 6.0xB
+xorriso : UPDATE :  12294k blocks read in 1292 seconds = 4.4xB
+Media checks :        lba ,       size , quality
+Media region :          0 ,        160 , + good
+Media region :        160 ,         32 , + slow
+Media region :        192 ,        128 , + good
+Media region :        320 ,         32 , + slow
+Media region :        352 ,         32 , + good
+Media region :        384 ,         64 , + slow
+Media region :        448 ,   12588945 , + good
+Media region :   12589393 ,   11062959 , 0 untested

@@ -1,0 +1,12 @@
+Drive current: -outdev '/dev/sr1'
+Media current: BD-RE
+Media status : is written , is appendable
+Media summary: 2 sessions, 105470 data blocks,  206m data, 22.4g free
+Format status: formatted, with 23610.0 MiB
+BD Spare Area: 0 blocks consumed, 131072 blocks available
+Format idx 0 : 00h , 11826176s , 23098.0 MiB
+Format idx 1 : 01h , 11564032s , 22586.0 MiB
+Format idx 2 : 30h , 11826176s , 23098.0 MiB
+Format idx 3 : 30h , 11564032s , 22586.0 MiB
+Format idx 4 : 30h , 12088320s , 23610.0 MiB
+Format idx 5 : 31h , 12219392s , 23866.0 MiB

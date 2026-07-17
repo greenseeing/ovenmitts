@@ -1,0 +1,9 @@
+Drive current: -dev '/dev/sr0'
+Drive access : exclusive:unrestricted
+Drive type   : vendor 'HL-DT-ST' product 'BD-RE WH16NS40' revision '1.02'
+Drive id     : 'K9AE5EA4251 '
+Media current: BD-R sequential recording
+Media product: MILLEN/MR1/0 , Millenniata Inc.
+Media status : is blank
+Media blocks : 0 readable , 12219392 writable , 12219392 overall
+Media summary: 0 sessions, 0 data blocks, 0 data, 23.3g free

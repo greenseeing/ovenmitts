@@ -1,0 +1,13 @@
+Block size: 2097152
+Source file count: 1
+Source block count: 32768
+Redundancy: 15%
+Recovery block count: 4916
+Recovery file count: 1
+Opening: vault.hc
+Computing Reed Solomon matrix.
+Constructing: 12.3%Constructing: 45.6%Constructing: 99.9%Constructing: done.
+Processing: 0.1%Processing: 12.3%Processing: 99.9%Writing recovery packets
+Wrote 10309599232 bytes to disk
+Writing verification packets
+Done

@@ -1,0 +1,15 @@
+xorriso 1.5.6 : RockRidge filesystem manipulator, libburnia project.
+
+Drive current: -outdev 'stdio:/staging/VAULT_20260717.iso'
+Media current: stdio file, overwriteable
+Media status : is blank
+Media summary: 0 sessions, 0 data blocks, 0 data, 1904g free
+xorriso : UPDATE : 594 files added in 1 seconds
+Added to ISO image: file '/vault.hc'='/home/user/vault.hc'
+xorriso : UPDATE :  0.52% done
+xorriso : UPDATE : 26.11% done, estimate finish Thu Jan 02 15:33:40 2025
+xorriso : UPDATE : 52.22% done, estimate finish Thu Jan 02 15:33:35 2025
+xorriso : UPDATE : 99.05% done
+ISO image produced: 10424 sectors
+Written to medium : 10424 sectors at LBA 0
+Writing to 'stdio:/staging/VAULT_20260717.iso' completed successfully.

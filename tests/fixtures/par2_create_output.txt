@@ -1,0 +1,13 @@
+Block size: 52440
+Source file count: 1
+Source block count: 2000
+Redundancy: 5%
+Recovery block count: 100
+Recovery file count: 7
+Opening: test.img
+Computing Reed Solomon matrix.
+Constructing: done.
+Wrote 5244000 bytes to disk
+Writing recovery packets
+Writing verification packets
+Done

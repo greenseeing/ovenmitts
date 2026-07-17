@@ -1,0 +1,11 @@
+Drive current: -indev '/dev/sr0'
+Media current: BD-R
+Media status : is written , is closed
+Media summary: 1 session, 11730592 data blocks, 22.4g data, 0 free
+Volume id    : 'ARCHIVE_2026_01'
+xorriso : UPDATE :  11726k blocks read in 981 seconds , 8.1xB
+xorriso : UPDATE :  11730k blocks read in 982 seconds = 8.0xB
+Media checks :        lba ,       size , quality
+Media region :          0 ,   11730592 , + good
+MD5 checks   :        lba ,       size , result
+MD5 tag range:          0 ,   11730592 , 0 md5_mismatch

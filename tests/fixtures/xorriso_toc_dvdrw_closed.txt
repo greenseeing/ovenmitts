@@ -1,0 +1,11 @@
+Drive current: -dev '/dev/sr1'
+Drive type   : vendor 'Optiarc' product 'BD RW BD-5300S' revision '1.04'
+Media current: DVD-RW sequential recording
+Media product: RITEKW04 , Ritek Corp
+Media status : is written , is closed
+Media blocks : 306592 readable , 0 writable , 2298496 overall
+TOC layout   : Idx ,  sbsector ,       Size , Volume Id
+ISO session  :   1 ,         0 ,    106696s , ISOIMAGE
+ISO session  :   2 ,    135536 ,    108385s , ISOIMAGE
+ISO session  :   3 ,    250240 ,     56202s , ISOIMAGE
+Media summary: 3 sessions, 271744 data blocks,  531m data,     0 free

@@ -1,0 +1,47 @@
+#!/bin/sh
+# Fake par2: enforces the design contract (explicit -s slice size, never the
+# 2000-block default; explicit -B basepath, else real par2 bases on the .par2
+# dir and skips the payload), records cwd+argv next to the output.
+set -eu
+if [ "${1:-}" != "create" ]; then
+    echo "fake par2: only 'create' is supported, got: $*" >&2
+    exit 2
+fi
+shift
+slice=""
+base=""
+out=""
+input=""
+for a in "$@"; do
+    case "$a" in
+        -s*) slice=${a#-s} ;;
+        -B*) base=${a#-B} ;;
+        -*) ;;
+        *) if [ -z "$out" ]; then out="$a"; else input="$a"; fi ;;
+    esac
+done
+case "$slice" in
+    ''|*[!0-9]*)
+        echo "fake par2: missing/non-numeric -s slice (bare block-count default is forbidden): '$slice'" >&2
+        exit 3
+        ;;
+esac
+if [ -z "$out" ] || [ -z "$input" ]; then
+    echo "fake par2: need <out.par2> and <input> arguments" >&2
+    exit 3
+fi
+if [ -z "$base" ] || [ ! -f "$base/$input" ]; then
+    echo "Ignoring out of basepath source file: $input"
+    echo "fake par2: -B basepath must contain '$input' (got '-B$base')" >&2
+    exit 3
+fi
+if [ ! -f "$input" ]; then
+    echo "fake par2: input '$input' not found in cwd $(pwd)" >&2
+    exit 3
+fi
+{ pwd; printf '%s\n' create "$@"; } > "$out.argv"
+printf 'fake par2 index for %s' "$input" > "$out"
+printf 'fake par2 recovery volume for %s' "$input" > "${out%.par2}.vol000+01.par2"
+printf 'Processing: 50.0%%\r'
+printf 'Done\n'
+exit 0

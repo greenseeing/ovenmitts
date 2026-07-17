@@ -1,0 +1,6 @@
+xorriso : UPDATE : Blanking  ( 1.0% done in 2 seconds )
+xorriso : UPDATE : Blanking  ( 95.4% done in 36 seconds )
+xorriso : UPDATE : Blanking  ( 99.0% done in 37 seconds )
+Blanking done
+xorriso : UPDATE : Formatting  ( 99.0% done in 912 seconds )
+Formatting done

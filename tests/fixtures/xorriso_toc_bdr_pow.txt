@@ -1,0 +1,9 @@
+Drive current: -dev '/dev/sr0'
+Drive access : exclusive:unrestricted
+Drive type   : vendor 'HL-DT-ST' product 'BD-RE WH16NS40' revision '1.02'
+Drive id     : 'K9AE5EA4251 '
+Media current: BD-R sequential recording, Pseudo Overwrite formatted
+Media product: VERBAT/IMk/0 , Mitsubishi Kagaku Media Co.
+Media status : is unsuitable , is POW formatted
+Media blocks : 35185280 readable , 12906880 unused , 48092160 overall
+Media summary: unsuitable Pseudo Overwrite formatted BD-R

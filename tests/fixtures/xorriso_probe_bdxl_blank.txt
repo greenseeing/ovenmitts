@@ -1,0 +1,11 @@
+Drive current: -outdev '/dev/sr1'
+Media current: BD-R sequential recording
+Media status : is blank
+Media summary: 0 sessions, 0 data blocks, 0 data, 93.2g free
+Format status: unformatted, up to 95466.0 MiB
+Format idx 0 : 00h , 47305728s , 92394.0 MiB
+Format idx 1 : 32h , 47305728s , 92394.0 MiB
+Format idx 2 : 32h , 30790656s , 60138.0 MiB
+Format idx 3 : 32h , 48092160s , 93930.0 MiB
+Write speed L:   8992k ,  2.0xB
+Write speed H:  17984k ,  4.0xB

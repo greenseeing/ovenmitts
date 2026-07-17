@@ -1,0 +1,24 @@
+xorriso : UPDATE : 292736 blocks read in 70 seconds , 1.4xB
+xorriso : UPDATE : 296448 blocks read in 71 seconds , 1.6xB
+xorriso : UPDATE : 297824 blocks read in 72 seconds , 0.5xB
+libburn : SORRY : SCSI error on read_10(297824,32): [3 11 05] Medium error. L-EC uncorrectable error.
+xorriso : UPDATE : 308288 blocks read in 91 seconds , 1.7xB
+xorriso : UPDATE :  12337k blocks read in 2787 seconds , 2.1xB
+xorriso : UPDATE :  12342k blocks read in 2788 seconds , 2.1xB
+xorriso : UPDATE :  12342k blocks read in 2788 seconds = 2.1xB
+Media checks :        lba ,       size , quality
+Media region :          0 ,     264736 , + good
+Media region :     264736 ,         32 , + slow
+Media region :     264768 ,      33056 , + good
+Media region :     297824 ,         32 , - unreadable
+Media region :     297856 ,         32 , + slow
+Media region :     297888 ,         32 , + good
+Media region :     297920 ,         32 , - unreadable
+Media region :     297952 ,         32 , + good
+Media region :     297984 ,         32 , + slow
+Media region :     298016 ,         32 , + good
+Media region :     298048 ,         32 , - unreadable
+Media region :     298080 ,   12340187 , + good
+Media region :   12638267 ,   11014085 , 0 untested
+xorriso : NOTE : Tolerated problem event of severity 'SORRY'
+xorriso : NOTE : -return_with SORRY 32 triggered by problem severity SORRY

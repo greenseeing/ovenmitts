@@ -1,0 +1,21 @@
+#!/bin/sh
+set -eu
+case "${1:-}" in
+    mount)
+        dev=""
+        prev=""
+        for a in "$@"; do
+            if [ "$prev" = "-b" ]; then dev="$a"; fi
+            prev="$a"
+        done
+        : "${OVENMITTS_FAKE_MOUNT:?fake udisksctl: OVENMITTS_FAKE_MOUNT unset}"
+        printf 'Mounted %s at %s.\n' "$dev" "$OVENMITTS_FAKE_MOUNT"
+        ;;
+    unmount)
+        ;;
+    *)
+        echo "fake udisksctl: unhandled argv: $*" >&2
+        exit 1
+        ;;
+esac
+exit 0
