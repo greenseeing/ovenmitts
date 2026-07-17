@@ -18,6 +18,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub config: Option<PathBuf>,
 
+    /// Staging directory for the ISO and sidecar files
+    #[arg(long, global = true)]
+    pub staging: Option<PathBuf>,
+
     /// Plain line output even on a TTY
     #[arg(long, global = true)]
     pub no_tui: bool,
@@ -39,8 +43,6 @@ pub enum Command {
         /// par2 redundancy percent
         #[arg(long, value_parser = clap::value_parser!(u32).range(1..=100))]
         redundancy: Option<u32>,
-        #[arg(long)]
-        staging: Option<PathBuf>,
         /// Format with spare areas (drive-level defect management) before burning
         #[arg(long)]
         defect_management: bool,
@@ -111,6 +113,16 @@ mod tests {
         assert!(matches!(cli.command, Some(Command::Check { save: true })));
         let cli = Cli::try_parse_from(["ovenmitts", "info"]).unwrap();
         assert!(matches!(cli.command, Some(Command::Info { save: false })));
+    }
+
+    #[test]
+    fn staging_is_accepted_everywhere() {
+        let cli = Cli::try_parse_from(["ovenmitts", "v.hc", "--staging", "/s"]).unwrap();
+        assert_eq!(cli.staging, Some(PathBuf::from("/s")));
+        let cli = Cli::try_parse_from(["ovenmitts", "burn", "v.hc", "--staging", "/s"]).unwrap();
+        assert_eq!(cli.staging, Some(PathBuf::from("/s")));
+        let cli = Cli::try_parse_from(["ovenmitts", "plan", "v.hc", "--staging", "/s"]).unwrap();
+        assert_eq!(cli.staging, Some(PathBuf::from("/s")));
     }
 
     #[test]

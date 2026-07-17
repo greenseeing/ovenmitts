@@ -47,6 +47,9 @@ fn dispatch(cli: Cli) -> anyhow::Result<()> {
         cfg.device = dev.clone();
         cfg.device_explicit = true;
     }
+    if let Some(staging) = &cli.staging {
+        cfg.staging = staging.clone();
+    }
 
     match cli.command {
         None => {
@@ -95,16 +98,12 @@ fn run_command(mut cfg: Config, cmd: Command, config_path: PathBuf) -> anyhow::R
             label,
             speed,
             redundancy,
-            staging,
             defect_management,
             no_parity,
             dry_run,
             yes,
             discard_iso,
         } => {
-            if let Some(s) = staging {
-                cfg.staging = s;
-            }
             if let Some(s) = speed {
                 cfg.speed = Some(s);
             }

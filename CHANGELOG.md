@@ -29,6 +29,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `--staging` is a global flag like `--device`: it now works with the
+  default TUI invocation (`ovenmitts <payloads> --staging <dir>`) and every
+  subcommand, not just `burn`.
 - Burn, format and master failures now report xorriso's diagnostic lines
   (`FAILURE`/`FATAL`/`SORRY`/`aborting`) instead of the raw stderr tail,
   where "Thank you for being patient" keepalives could bury or evict the
