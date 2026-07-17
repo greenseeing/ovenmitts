@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- `check` on a blank disc now refuses immediately with "medium is blank -
+  nothing to check yet" instead of surfacing a cryptic xorriso error (or,
+  on 0.1.0, polling 180 s for a readable sector that a blank disc never has).
+
 ## [0.1.1] - 2026-07-17
 
 ### Added

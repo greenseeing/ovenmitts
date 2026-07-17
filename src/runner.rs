@@ -810,8 +810,12 @@ pub fn run_check(ctx: &RunnerCtx, save_to: Option<&Path>) -> Result<()> {
         // probing needs exclusive access: unmount the configured drive first
         // or an automounted disc would misroute resolution into the scan
         verify::ensure_unmounted(&ctx.tools, &ctx.cfg.device)?;
-        let (device, _media) = resolve_device(ctx)?;
+        let (device, media) = resolve_device(ctx)?;
         save_device_if(ctx, save_to, &device)?;
+        ensure!(
+            !media.blank,
+            "medium in {device} is blank - nothing to check yet (check verifies a burned disc)"
+        );
         verify::ensure_unmounted(&ctx.tools, &device)?;
         let clean = verify::check_media(&ctx.tools, &device, &mut |pct, line| {
             ctx.progress(Stage::CheckMedia, pct, line);
@@ -1281,6 +1285,10 @@ mod tests {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/xorriso_probe_bdr_blank_full.txt"
     );
+    const PROBE_WRITTEN_FIXTURE: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/xorriso_toc_dvdrw_closed.txt"
+    );
     const CHECK_CLEAN_FIXTURE: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/check_media_clean.txt"
@@ -1296,6 +1304,15 @@ mod tests {
     }
 
     fn fake_xorriso(dir: &Path, device: &Path, check_fixture: &str) -> PathBuf {
+        fake_xorriso_probing(dir, device, PROBE_FIXTURE, check_fixture)
+    }
+
+    fn fake_xorriso_probing(
+        dir: &Path,
+        device: &Path,
+        probe_fixture: &str,
+        check_fixture: &str,
+    ) -> PathBuf {
         let path = dir.join("xorriso");
         write_script(
             &path,
@@ -1333,7 +1350,7 @@ mod tests {
                  if [ \"$1\" = \"-md5\" ] && [ \"$5\" = \"-check_media\" ]; then\n\
                    cat \"{check}\"\n  exit 0\nfi\n\
                  exit 1\n",
-                probe = PROBE_FIXTURE,
+                probe = probe_fixture,
                 device = device.display(),
                 check = check_fixture,
             ),
@@ -2350,7 +2367,8 @@ mod tests {
                 let dir = tempfile::tempdir().unwrap();
                 let device = dir.path().join("device");
                 std::fs::write(&device, vec![0u8; 4096]).unwrap();
-                let xorriso = fake_xorriso(dir.path(), &device, fixture);
+                let xorriso =
+                    fake_xorriso_probing(dir.path(), &device, PROBE_WRITTEN_FIXTURE, fixture);
                 let tools = tools_with(xorriso, None, None, None);
                 let (ctx, rx, _ack) =
                     ctx_pair(cfg_with(&device, &dir.path().join("staging")), tools);
@@ -2399,7 +2417,12 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let device = dir.path().join("device");
             std::fs::write(&device, vec![0u8; 4096]).unwrap();
-            let xorriso = fake_xorriso(dir.path(), &device, CHECK_CLEAN_FIXTURE);
+            let xorriso = fake_xorriso_probing(
+                dir.path(),
+                &device,
+                PROBE_WRITTEN_FIXTURE,
+                CHECK_CLEAN_FIXTURE,
+            );
             let tools = tools_with(xorriso, None, None, None);
             let (ctx, _rx, _ack) = ctx_pair(cfg_with(&device, &dir.path().join("staging")), tools);
             let cfg_path = dir.path().join("config.toml");
@@ -2411,6 +2434,27 @@ mod tests {
             let text = std::fs::read_to_string(&cfg_path).unwrap();
             assert!(text.contains(&device.display().to_string()));
             return;
+        }
+    }
+
+    #[test]
+    fn run_check_refuses_blank_medium() {
+        loop {
+            let dir = tempfile::tempdir().unwrap();
+            let device = dir.path().join("device");
+            std::fs::write(&device, vec![0u8; 4096]).unwrap();
+            // default probe fixture reports a blank BD-R
+            let xorriso = fake_xorriso(dir.path(), &device, CHECK_CLEAN_FIXTURE);
+            let tools = tools_with(xorriso, None, None, None);
+            let (ctx, _rx, _ack) = ctx_pair(cfg_with(&device, &dir.path().join("staging")), tools);
+            match run_check(&ctx, None) {
+                Err(e) if is_busy(&e) => continue,
+                Err(e) => {
+                    assert!(e.to_string().contains("blank"), "{e:#}");
+                    return;
+                }
+                Ok(()) => panic!("check on a blank medium must refuse, not report clean"),
+            }
         }
     }
 
