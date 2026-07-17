@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Line-mode output now uses one severity vocabulary: `info:` for
+  diagnostics, `warning:` for warnings, `error: [stage]` for stage failures
+  (previously `[stage] FAILED:`), and a stage failure prints exactly one
+  error line instead of two. The `info` subcommand's listing stays bare.
 - A `device` set in the config file is now a soft preference: it is tried
   first, but auto-detection still scans `/dev/sr*` when it holds no readable
   medium. Only `--device` pins the drive hard.

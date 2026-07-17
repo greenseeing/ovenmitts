@@ -15,9 +15,22 @@ fn main() -> ExitCode {
     match dispatch(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("error: {e:#}");
+            if e.downcast_ref::<AlreadyReported>().is_none() {
+                eprintln!("error: {e:#}");
+            }
             ExitCode::FAILURE
         }
+    }
+}
+
+/// drive() already rendered this failure as an `error:` line; main must
+/// skip the duplicate top-level line but still exit nonzero.
+#[derive(Debug, Clone, Copy)]
+struct AlreadyReported;
+
+impl std::fmt::Display for AlreadyReported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("failure already reported")
     }
 }
 
@@ -151,6 +164,7 @@ where
     let worker = std::thread::spawn(move || run(&ctx));
 
     let mut line = LinePrinter::default();
+    let mut failed_rendered = false;
     for ev in rx {
         match ev {
             StageEvent::Plan {
@@ -180,7 +194,7 @@ where
             }
             StageEvent::Info(text) => {
                 line.close();
-                println!("{text}");
+                println!("info: {text}");
             }
             StageEvent::Out(text) => {
                 line.close();
@@ -200,7 +214,7 @@ where
                 let ack = match std::io::stdin().lock().read_line(&mut answer) {
                     Ok(0) | Err(_) => {
                         eprintln!(
-                            "no interactive stdin — aborting (use --yes for unattended runs)"
+                            "warning: no interactive stdin — aborting (use --yes for unattended runs)"
                         );
                         Ack::Abort
                     }
@@ -214,11 +228,13 @@ where
             }
             StageEvent::Failed { stage, error } => {
                 line.close();
-                eprintln!("[{}] FAILED: {error}", stage.label());
+                eprintln!("error: [{}] {error}", stage.label());
+                failed_rendered = true;
             }
         }
     }
     match worker.join() {
+        Ok(Err(e)) if failed_rendered => Err(e.context(AlreadyReported)),
         Ok(res) => res,
         Err(_) => anyhow::bail!("pipeline thread panicked"),
     }
@@ -316,6 +332,15 @@ fn print_report(report: &RunReport) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn already_reported_downcasts_through_context() {
+        let e = anyhow::anyhow!("boom").context(AlreadyReported);
+        assert!(e.downcast_ref::<AlreadyReported>().is_some());
+        assert!(anyhow::anyhow!("boom")
+            .downcast_ref::<AlreadyReported>()
+            .is_none());
+    }
 
     #[test]
     fn ack_parsing_accepts_yes_variants() {
