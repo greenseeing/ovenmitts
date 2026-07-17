@@ -53,13 +53,25 @@ fn dispatch(cli: Cli) -> anyhow::Result<()> {
 
     match cli.command {
         None => {
+            let interactive = !cli.no_tui && std::io::stdout().is_terminal();
             anyhow::ensure!(
-                !cli.payloads.is_empty(),
+                interactive || !cli.payloads.is_empty(),
                 "nothing to do: pass payload files (TUI) or a subcommand; see --help"
             );
             let tools = ovenmitts::tools::discover()?;
+            let payloads = if cli.payloads.is_empty() {
+                match ovenmitts::picker::pick_payloads(&cfg, &tools, std::env::current_dir()?)? {
+                    Some(paths) => paths,
+                    None => {
+                        eprintln!("nothing selected");
+                        return Ok(());
+                    }
+                }
+            } else {
+                cli.payloads
+            };
             let req = ovenmitts::runner::BurnRequest {
-                payloads: cli.payloads,
+                payloads,
                 label: None,
                 parity: true,
                 dry_run: false,
@@ -67,10 +79,10 @@ fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 amend: false,
                 discard_iso: false,
             };
-            if cli.no_tui || !std::io::stdout().is_terminal() {
-                run_cli_burn(cfg, tools, req)
-            } else {
+            if interactive {
                 ovenmitts::tui::run(cfg, tools, req)
+            } else {
+                run_cli_burn(cfg, tools, req)
             }
         }
         Some(cmd) => {

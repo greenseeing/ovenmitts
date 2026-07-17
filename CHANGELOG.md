@@ -7,13 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Bare `ovenmitts` (no payload paths, no subcommand) now opens an interactive
+  payload picker on a TTY before the plan wizard: directory browser starting
+  at cwd with checkbox multi-select, fuzzy filtering within the current
+  directory (`/` mode), hidden-files toggle (`.`), live disc-fit estimate
+  in the header (background drive probe reusing runner's device-resolution
+  policy via new `runner::detect_media`; falls back to an assumed blank BD-R
+  25 like `plan`). Selection validated via `Payload::inspect` at toggle time;
+  ancestor/descendant selections deduped. Enter with nothing selected picks
+  the cursor entry. Cancel (q/Esc) prints "nothing selected" and exits 0.
+  Non-TTY or `--no-tui` with no payloads keep the "nothing to do" error.
+  Tests: picker unit tests incl. TestBackend render test; two non-TTY
+  fallback tests in `tests/cli.rs`.
+
 ### Fixed
 
 - Verify pipeline: reuse existing mountpoint when GNOME automounts the
   re-inserted disc during raw readback (pre-check + recheck on mount failure
   to handle automount race). Tests: new unit test for mount reuse path;
   non-mountable device path for udisksctl-absent test.
-## [0.1.3] - 2026-07-17
+
+## [0.1.3]## [0.1.3] - 2026-07-17
 
 ### Added
 

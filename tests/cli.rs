@@ -97,6 +97,26 @@ fn info_save_writes_config_and_reports() {
     assert!(stdout.contains("info: saved device"), "stdout:\n{stdout}");
 }
 
+// stdout is piped here, so the interactive picker must never launch: bare
+// invocations keep the "nothing to do" bail in scripts and CI.
+#[test]
+fn bare_invocation_without_tty_bails_with_nothing_to_do() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = run(dir.path(), &[]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("nothing to do"), "stderr:\n{stderr}");
+}
+
+#[test]
+fn no_tui_without_payloads_bails_with_nothing_to_do() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = run(dir.path(), &["--no-tui"]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("nothing to do"), "stderr:\n{stderr}");
+}
+
 #[test]
 fn config_error_prints_top_level_error_line() {
     let dir = tempfile::tempdir().unwrap();

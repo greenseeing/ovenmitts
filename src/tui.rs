@@ -16,11 +16,11 @@ use crate::plan::{human_bytes, ArchivePlan, MediaInfo, Payload};
 use crate::runner::{self, Ack, BurnParams, BurnRequest, RunReport, RunnerCtx, Stage, StageEvent};
 use crate::tools::Tools;
 
-const ACCENT: Color = Color::Cyan;
-const OK: Color = Color::Green;
-const WARN: Color = Color::Yellow;
-const ERR: Color = Color::Red;
-const DIM: Color = Color::DarkGray;
+pub(crate) const ACCENT: Color = Color::Cyan;
+pub(crate) const OK: Color = Color::Green;
+pub(crate) const WARN: Color = Color::Yellow;
+pub(crate) const ERR: Color = Color::Red;
+pub(crate) const DIM: Color = Color::DarkGray;
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const LOG_CAP: usize = 200;
 
@@ -582,14 +582,7 @@ impl App {
         ])
         .areas(frame.area());
 
-        let title = Line::from(vec![
-            Span::styled(
-                "ovenmitts",
-                Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("  —  archival burn to BD-R / M-DISC", Style::new().fg(DIM)),
-        ]);
-        frame.render_widget(Paragraph::new(title), pad(header));
+        frame.render_widget(Paragraph::new(app_title()), pad(header));
 
         match self.screen {
             Screen::Plan => self.plan_screen(frame, body),
@@ -1071,7 +1064,17 @@ fn format_elapsed(d: Duration) -> String {
     format!("{:02}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
 }
 
-fn body_block(title: &str) -> Block<'_> {
+pub(crate) fn app_title() -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            "ovenmitts",
+            Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  —  archival burn to BD-R / M-DISC", Style::new().fg(DIM)),
+    ])
+}
+
+pub(crate) fn body_block(title: &str) -> Block<'_> {
     Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(ACCENT))
@@ -1088,7 +1091,7 @@ fn heading(text: &str) -> Line<'static> {
     ))
 }
 
-fn kv(key: &str, value: &str) -> Line<'static> {
+pub(crate) fn kv(key: &str, value: &str) -> Line<'static> {
     Line::from(vec![
         Span::styled(format!("  {key} "), Style::new().fg(DIM)),
         Span::styled(value.to_string(), Style::new().fg(Color::White)),
@@ -1174,7 +1177,7 @@ fn log_row(warn: bool, row: String) -> Line<'static> {
     Line::from(Span::styled(row, style))
 }
 
-fn pad(area: Rect) -> Rect {
+pub(crate) fn pad(area: Rect) -> Rect {
     Rect {
         x: area.x + 1,
         width: area.width.saturating_sub(2),

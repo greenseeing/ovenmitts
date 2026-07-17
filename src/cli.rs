@@ -9,7 +9,8 @@ use clap::{Parser, Subcommand};
     about = "Archival BD-R / M-DISC burning with parity and cache-proof verification"
 )]
 pub struct Cli {
-    /// Payload files or directories; with no subcommand this opens the TUI wizard
+    /// Payload files or directories; with no subcommand this opens the TUI
+    /// wizard, and with no payloads at all the interactive picker
     pub payloads: Vec<PathBuf>,
 
     #[arg(long, global = true)]
@@ -123,6 +124,13 @@ mod tests {
         assert_eq!(cli.staging, Some(PathBuf::from("/s")));
         let cli = Cli::try_parse_from(["ovenmitts", "plan", "v.hc", "--staging", "/s"]).unwrap();
         assert_eq!(cli.staging, Some(PathBuf::from("/s")));
+    }
+
+    #[test]
+    fn bare_invocation_parses_with_no_payloads() {
+        let cli = Cli::try_parse_from(["ovenmitts"]).unwrap();
+        assert!(cli.command.is_none());
+        assert!(cli.payloads.is_empty());
     }
 
     #[test]

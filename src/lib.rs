@@ -5,6 +5,7 @@ pub mod hashing;
 pub mod master;
 pub mod media;
 pub mod parity;
+pub mod picker;
 pub mod plan;
 pub mod runner;
 pub mod tools;

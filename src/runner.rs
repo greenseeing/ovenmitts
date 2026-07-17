@@ -992,9 +992,27 @@ fn resolve_device_from(
     ctx: &RunnerCtx,
     candidates: impl FnOnce() -> Vec<String>,
 ) -> Result<(String, MediaInfo)> {
-    let configured = ctx.cfg.device.clone();
-    let configured_err = match media::probe(&ctx.tools, &configured) {
-        Ok(media) => return Ok((configured, media)),
+    let (device, media, note) = detect_media_from(&ctx.cfg, &ctx.tools, candidates)?;
+    if let Some(note) = note {
+        ctx.info(note);
+    }
+    Ok((device, media))
+}
+
+/// Ctx-free device resolution (same policy as resolve_device) for advisory
+/// consumers like the payload picker. The note reports an auto-select swap.
+pub fn detect_media(cfg: &Config, tools: &Tools) -> Result<(String, MediaInfo, Option<String>)> {
+    detect_media_from(cfg, tools, media::list_drives)
+}
+
+fn detect_media_from(
+    cfg: &Config,
+    tools: &Tools,
+    candidates: impl FnOnce() -> Vec<String>,
+) -> Result<(String, MediaInfo, Option<String>)> {
+    let configured = cfg.device.clone();
+    let configured_err = match media::probe(tools, &configured) {
+        Ok(media) => return Ok((configured, media, None)),
         // xorriso itself failed to launch: scanning with the same binary
         // would fail identically and mask the real error
         Err(e)
@@ -1005,7 +1023,7 @@ fn resolve_device_from(
         }
         Err(e) => e,
     };
-    if ctx.cfg.device_explicit {
+    if cfg.device_explicit {
         return Err(configured_err);
     }
     let mut loaded: Vec<(String, MediaInfo)> = Vec::new();
@@ -1013,7 +1031,7 @@ fn resolve_device_from(
         if dev == configured {
             continue;
         }
-        if let Ok(media) = media::probe(&ctx.tools, &dev) {
+        if let Ok(media) = media::probe(tools, &dev) {
             loaded.push((dev, media));
         }
     }
@@ -1021,11 +1039,11 @@ fn resolve_device_from(
         0 => Err(configured_err),
         1 => {
             let (device, media) = loaded.remove(0);
-            ctx.info(format!(
+            let note = format!(
                 "no medium in {configured}; auto-selected {device} ({})",
                 media.kind.label()
-            ));
-            Ok((device, media))
+            );
+            Ok((device, media, Some(note)))
         }
         _ => Err(anyhow::Error::new(AmbiguousDrives(
             loaded

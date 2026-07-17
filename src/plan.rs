@@ -181,7 +181,7 @@ impl Payload {
     }
 }
 
-fn container_heuristic(path: &Path, size: u64) -> bool {
+pub(crate) fn container_heuristic(path: &Path, size: u64) -> bool {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     // VeraCrypt containers: .hc/.tc, or big extensionless files (ciphertext blobs)
     matches!(ext, "hc" | "tc") || (ext.is_empty() && size >= 64 * 1024 * 1024)

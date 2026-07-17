@@ -66,6 +66,11 @@ sudo usermod -aG cdrom $USER
 # burns → live pipeline → report
 ovenmitts ~/archive/vault.hc
 
+# No paths at all: pick payloads interactively first — browse from the
+# current directory, Space selects, / fuzzy-filters, live fit estimate
+# against the inserted disc, Enter hands the selection to the same plan TUI
+ovenmitts
+
 # Directories burn too — the whole tree lands under /extras on the disc
 ovenmitts ~/extras ~/archive/vault.hc
 

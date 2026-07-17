@@ -113,6 +113,7 @@ src/
   verify.rs    readiness poll, O_DIRECT exact-size read-back hash, mount + file verify, check_media
   runner.rs    pipeline orchestration; emits StageEvent over mpsc; used by CLI and TUI
   tui.rs       ratatui 0.30 live pipeline view (interactive plan → stage progress → report)
+  picker.rs    interactive payload picker for bare `ovenmitts` (browse, checkbox, fuzzy filter)
 ```
 
 Signatures in the scaffold are the contract. Fill bodies; do not change public
@@ -150,7 +151,20 @@ both sides: at most one ack per `NeedAck`, and everything the pipeline consumes
 
 ## TUI
 
-`ovenmitts <paths>...` with no subcommand on a TTY → TUI. Screens:
+`ovenmitts <paths>...` with no subcommand on a TTY → TUI; bare `ovenmitts`
+(no paths) first opens the payload picker. Screens:
+0. Pick (bare invocation only): directory browser starting at cwd, checkbox
+   multi-select of files/dirs, fuzzy filter within the current directory.
+   Keys: ↑↓/jk move, Space toggle, →/←(hl, Backspace) descend/ascend, `/`
+   filter mode (Enter keeps, Esc clears — never cancels), `.` hidden toggle,
+   Enter confirm (empty selection picks the cursor entry), q/Esc cancel →
+   "nothing selected", exit 0. Toggling runs Payload::inspect, so invalid
+   payloads refuse with the preflight message right in the status line;
+   selecting a dir absorbs selected descendants, selecting under a selected
+   ancestor refuses (the disc root stays flat; the runner still dedupes).
+   The drive is probed in the background (same auto-select policy as the
+   runner); the header shows a live fit estimate from build_plan — no disc
+   falls back to an assumed blank BD-R 25, like `plan`.
 1. Plan: media probe result, payload table, editable parameters (label, speed,
    redundancy, parity, defect management), fit bar, warnings. Keys: ↑↓/jk
    select row, ←→/hl adjust or cycle, Space toggle, `e` inline edit for
