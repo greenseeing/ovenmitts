@@ -1,6 +1,7 @@
 # ovenmitts — design
 
-Archival burns of large files (VeraCrypt containers) to BD-R / M-DISC on Linux.
+Archival burns of large files and whole directories (VeraCrypt containers,
+project trees) to BD-R / M-DISC on Linux.
 Single static binary. Pipeline: preflight → parity → checksums → master → burn → verify.
 
 Every design decision below is backed by the verified research in
@@ -52,13 +53,32 @@ check:    xorriso -md5 on -indev <dev> -check_media --
           (-md5 defaults to off; without it check runs skip the session tags)
 media id: dvd+rw-mediainfo <dev>                         (optional, if installed)
 mount:    udisksctl mount -b <dev>   /  udisksctl unmount -b <dev>
-parity:   par2 create -B<payload_dir> -r<pct> -n1 -s<slice_bytes> -m<mem_mb> <out.par2> <input>
-          (cwd = payload file's parent dir; -B pins the basepath there because
-           par2 otherwise bases on the staged .par2's dir and skips the payload;
-           no -q - par2 emits its percent stream only at default verbosity;
-           one par2 set per payload file; prefer `par2cmdline-turbo` binary
+parity:   par2 create -B<root_parent> -r<pct> -n1 -s<slice_bytes> -m<mem_mb> <out.par2> <rel_operands>...
+          (one set per top-level payload; a directory's member files are the
+           operands, relative to the payload root's parent, so the set stores
+           disc-layout paths and `par2 r -B.` repairs a disc copy; cwd = that
+           parent and -B pins the basepath there because par2 otherwise bases
+           on the staged .par2's dir and skips the sources; 0-byte members are
+           excluded - par2 cannot repair them; no -q - par2 emits its percent
+           stream only at default verbosity; prefer `par2cmdline-turbo` binary
            name `par2` or `par2turbo` if found)
 ```
+
+## Payload model
+
+A top-level payload is a regular file or a directory; the disc root is flat,
+so top-level names must be unique. A directory keeps its name at the root
+(`/extras/**`) and expands at preflight into member files (deterministic
+sorted walk, regular files only): each member is checksummed by its relative
+disc path and the payload gets ONE par2 set covering all members. Symlinks
+and special files stay on the ISO via Rock Ridge but are excluded from
+checksums and parity (warned) — the walk never follows a symlink. 0-byte
+members are checksummed and grafted but excluded from parity operands.
+Refused at preflight: empty directory payloads, non-UTF-8 file names, names
+starting with `-` (par2 would parse a flag), more than 32768 non-empty
+members, or member paths past the argv budget (tell the user to tar the
+directory). Slice sizing budgets one block of tail waste per member file so
+a multi-file set stays under the 32768-block ceiling.
 
 Implementers: verify flag syntax against the online man pages (mankier.com/1/xorriso,
 /1/xorrisofs, /1/xorrecord, manpages.debian.org par2) before finalizing; the
@@ -130,7 +150,7 @@ both sides: at most one ack per `NeedAck`, and everything the pipeline consumes
 
 ## TUI
 
-`ovenmitts <files>...` with no subcommand on a TTY → TUI. Screens:
+`ovenmitts <paths>...` with no subcommand on a TTY → TUI. Screens:
 1. Plan: media probe result, payload table, editable parameters (label, speed,
    redundancy, parity, defect management), fit bar, warnings. Keys: ↑↓/jk
    select row, ←→/hl adjust or cycle, Space toggle, `e` inline edit for

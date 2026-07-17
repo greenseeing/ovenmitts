@@ -1,8 +1,9 @@
 # ovenmitts
 
-Archival burns of large files (VeraCrypt containers) to BD-R / M-DISC on Linux.
-One binary drives the whole pipeline — parity, checksums, mastering, burning,
-cache-proof verification — and every disc it writes documents its own recovery.
+Archival burns of large files and whole directories (VeraCrypt containers,
+project trees) to BD-R / M-DISC on Linux. One binary drives the whole
+pipeline — parity, checksums, mastering, burning, cache-proof verification —
+and every disc it writes documents its own recovery.
 
 ## Why
 
@@ -29,7 +30,7 @@ single `ovenmitts` binary in place (verifying its published SHA-256 checksum
 first). **To upgrade later, run `ovenmitts update`** — it re-runs this
 installer, which does nothing when the installed version already matches the
 latest release and the backends are present. To pin a version, set
-`OVENMITTS_VERSION=0.1.0` before either command.
+`OVENMITTS_VERSION=0.1.3` before either command.
 
 Or build from source:
 
@@ -64,6 +65,9 @@ sudo usermod -aG cdrom $USER
 # TUI: interactive plan (edit label/speed/redundancy/parity live) → Enter
 # burns → live pipeline → report
 ovenmitts ~/archive/vault.hc
+
+# Directories burn too — the whole tree lands under /extras on the disc
+ovenmitts ~/extras ~/archive/vault.hc
 
 # Same pipeline, plain lines (also automatic when stdout is not a TTY)
 ovenmitts --no-tui ~/archive/vault.hc
@@ -102,7 +106,8 @@ ovenmitts plan ~/archive/vault.hc --media bd25
 ovenmitts update
 ```
 
-Global flags: `--device <dev>`, `--config <path>`, `--no-tui`. A `--device`
+Global flags: `--device <dev>`, `--config <path>`, `--staging <dir>`,
+`--no-tui`. A `--device`
 from the CLI is always used as-is; the config-file `device` (or the `/dev/sr0`
 default) is a soft preference — it is tried first and, if it cannot be probed
 (no disc — or no such drive), every subcommand scans the other `/dev/sr*` drives —
@@ -112,7 +117,7 @@ drive other than the configured one is invisible to the scan — pass
 `--device` for that case.
 
 `burn` flags: `--label` (A–Z 0–9 `_`, max 32 chars; default
-`ARCHIVE_YYYYMMDD`), `--speed`, `--redundancy` (par2 percent), `--staging`,
+`ARCHIVE_YYYYMMDD`), `--speed`, `--redundancy` (par2 percent),
 `--defect-management`, `--no-parity`, `--dry-run`, `-y`/`--yes`,
 `--discard-iso` (delete the staged ISO after a successful verify; default
 keeps it for copy 2).
@@ -182,12 +187,12 @@ keep_iso = true            # keep the staged ISO after a verified burn (default 
 
 | stage | what happens |
 |-------|--------------|
-| preflight | inspects payloads, refuses mounted VeraCrypt containers, selects the drive and probes the disc (`xorriso -toc -list_formats -list_speeds`), fit-checks with headroom, checks staging space; in the TUI the plan then stays open for editing until confirmed |
-| parity | `par2 create -B<payload dir> -r<pct> -n1 -s<slice> -m<mem>` per payload; slice size computed toward the PAR2 32768-block ceiling (~2 MiB slices on 93 GiB) — never the default 2000 blocks that defeat 15% parity |
-| checksums | streaming SHA-256 of every payload and parity file → `checksums.sha256` |
+| preflight | inspects payloads — a directory expands to its member files, warning about symlinks/special files and 0-byte files — refuses mounted VeraCrypt containers, selects the drive and probes the disc (`xorriso -toc -list_formats -list_speeds`), fit-checks with headroom, checks staging space; in the TUI the plan then stays open for editing until confirmed |
+| parity | one recovery set per top-level payload: `par2 create -B<parent> -r<pct> -n1 -s<slice> -m<mem>` with every member file as a relative operand (a directory's files share one set; 0-byte files excluded — par2 cannot repair them); slice size computed toward the PAR2 32768-block ceiling (~2 MiB slices on 93 GiB) — never the default 2000 blocks that defeat 15% parity |
+| checksums | streaming SHA-256 of every payload file (directory members by their relative disc path) and parity file → `checksums.sha256` |
 | master | writes `MANIFEST.txt` + `RECOVERY.txt`, then `xorriso -as mkisofs -iso-level 3 -rock --md5`, extracts the file→LBA map, hashes the ISO |
 | format | only with `--defect-management`: `xorriso -format as_needed`, then re-reads the reduced capacity and re-checks fit |
-| burn | `xorriso -as cdrecord -v dev=<dev> [speed=<n>] fs=64m blank=as_needed -eject <iso>` — stream recording on unformatted BD-R |
+| burn | `xorriso -as cdrecord -v dev=<dev> [speed=<n>] fs=64m blank=as_needed -eject <iso>` — stream recording on unformatted BD-R; the full xorriso transcript tees to `<label>.burn.log` next to the staged ISO, and a failure reports xorriso's diagnostic lines plus the `burn-iso` retry hint (the staged ISO survives) |
 | verify image | reloads the tray, polls drive readiness, reads exactly ISO-size bytes from the device (O_DIRECT, buffered fallback) and compares SHA-256 to the staged ISO |
 | verify files | mounts the disc read-only via udisksctl and re-hashes every file against `checksums.sha256` |
 
@@ -200,8 +205,10 @@ the disc up and verification continues unattended.
 
 ```
 /vault.hc                        payload files at the root
+/extras/…                        a directory payload keeps its whole tree
 /parity/vault.hc.par2            par2 recovery set, one per payload
 /parity/vault.hc.vol000+91.par2
+/parity/extras.par2              a directory's files share one set
 /checksums.sha256                SHA-256 of every payload and parity file
 /MANIFEST.txt                    parameters, sizes, hashes, date
 /RECOVERY.txt                    exact restore and repair commands
@@ -209,8 +216,8 @@ the disc up and verification continues unattended.
 
 The staging directory keeps off-disc copies of everything that repairs a
 damaged disc: the ISO (with a `.sha256` sidecar), the parity set,
-`checksums.sha256`, and `<label>.lba.txt` mapping every file to its disc
-sectors. Keep it.
+`checksums.sha256`, `<label>.lba.txt` mapping every file to its disc
+sectors, and `<label>.burn.log` (the full xorriso burn transcript). Keep it.
 
 ## Recovery
 
@@ -225,7 +232,7 @@ If a disc develops read errors:
 ddrescue /dev/sr0 recovered.iso rescue.map
 ddrescue -r3 /dev/sr0 recovered.iso rescue.map   # extra retry passes
 
-# 2. Extract the damaged payload
+# 2. Extract the damaged payload (a directory payload extracts as a tree)
 mount -o loop,ro recovered.iso /mnt
 # or without root:
 xorriso -osirrox on -indev recovered.iso -extract /vault.hc vault.hc
@@ -233,12 +240,27 @@ xorriso -osirrox on -indev recovered.iso -extract /vault.hc vault.hc
 # 3. Repair it with the parity on the same disc (or your off-disc copy);
 #    -B. bases the repair on the damaged copy here, not the read-only mount
 par2 r -B. /mnt/parity/vault.hc.par2 vault.hc
+# directory payload: copy the tree here first, then repair the whole set
+cp -r /mnt/extras . && par2 r -B. /mnt/parity/extras.par2
 
 # 4. Map damaged sectors to files, if you want to know what was hit
 xorriso -indev recovered.iso -find / -exec report_lba --
 ```
 
 ## Notes
+
+**Directory payloads.** A directory keeps its name at the disc root and its
+whole tree below it. Every member file is checksummed by its relative disc
+path, and one par2 set protects the payload — the set stores those relative
+paths, so `par2 r -B.` repairs a copied tree exactly as RECOVERY.txt shows.
+Symlinks and special files stay on the ISO (Rock Ridge stores them as-is) but
+are excluded from checksums and parity, with a warning — link *targets* are
+not archived unless they are also in the tree. 0-byte files are checksummed
+but cannot be parity-protected (a par2 limitation). Hard limits, refused at
+preflight: empty directory payloads, non-UTF-8 file names, payload names
+starting with `-`, and more than 32768 files in one payload — `tar` the
+directory first for those. Top-level payload names must be unique (the disc
+root is flat).
 
 **Defect management is off by default.** Unformatted BD-R streams at full speed
 and full capacity; the pipeline's read-back verify + par2 already covers write
