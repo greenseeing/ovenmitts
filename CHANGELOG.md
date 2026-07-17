@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Payloads can be directories: `ovenmitts ~/extras ~/package.hc` burns the
+  whole tree under `/extras` with per-file checksums and ONE par2 recovery
+  set per top-level payload (member paths stored relative, so `par2 r -B.`
+  works from a disc copy). Symlinks/special files stay on the ISO but are
+  excluded from checksums and parity (warned); 0-byte files are checksummed
+  but not parity-protected (par2 cannot repair them).
+
 - Every burn tees the full xorriso transcript to `<label>.burn.log` next to
   the staged ISO, so a failed burn stays diagnosable after the run.
 - A failed burn prints the transcript path and, in the full pipeline, the

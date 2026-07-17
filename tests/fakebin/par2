@@ -11,13 +11,13 @@ shift
 slice=""
 base=""
 out=""
-input=""
+inputs=""
 for a in "$@"; do
     case "$a" in
         -s*) slice=${a#-s} ;;
         -B*) base=${a#-B} ;;
         -*) ;;
-        *) if [ -z "$out" ]; then out="$a"; else input="$a"; fi ;;
+        *) if [ -z "$out" ]; then out="$a"; else inputs="$inputs $a"; fi ;;
     esac
 done
 case "$slice" in
@@ -26,22 +26,24 @@ case "$slice" in
         exit 3
         ;;
 esac
-if [ -z "$out" ] || [ -z "$input" ]; then
-    echo "fake par2: need <out.par2> and <input> arguments" >&2
+if [ -z "$out" ] || [ -z "$inputs" ]; then
+    echo "fake par2: need <out.par2> and at least one input argument" >&2
     exit 3
 fi
-if [ -z "$base" ] || [ ! -f "$base/$input" ]; then
-    echo "Ignoring out of basepath source file: $input"
-    echo "fake par2: -B basepath must contain '$input' (got '-B$base')" >&2
-    exit 3
-fi
-if [ ! -f "$input" ]; then
-    echo "fake par2: input '$input' not found in cwd $(pwd)" >&2
-    exit 3
-fi
+for input in $inputs; do
+    if [ -z "$base" ] || [ ! -f "$base/$input" ]; then
+        echo "Ignoring out of basepath source file: $input"
+        echo "fake par2: -B basepath must contain '$input' (got '-B$base')" >&2
+        exit 3
+    fi
+    if [ ! -f "$input" ]; then
+        echo "fake par2: input '$input' not found in cwd $(pwd)" >&2
+        exit 3
+    fi
+done
 { pwd; printf '%s\n' create "$@"; } > "$out.argv"
-printf 'fake par2 index for %s' "$input" > "$out"
-printf 'fake par2 recovery volume for %s' "$input" > "${out%.par2}.vol000+01.par2"
+printf 'fake par2 index for%s' "$inputs" > "$out"
+printf 'fake par2 recovery volume for%s' "$inputs" > "${out%.par2}.vol000+01.par2"
 printf 'Processing: 50.0%%\r'
 printf 'Done\n'
 exit 0

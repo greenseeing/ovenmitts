@@ -12,7 +12,7 @@ use ratatui::widgets::{Block, BorderType, Clear, Gauge, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 
 use crate::config::Config;
-use crate::plan::{human_bytes, ArchivePlan, MediaInfo, PayloadFile};
+use crate::plan::{human_bytes, ArchivePlan, MediaInfo, Payload};
 use crate::runner::{self, Ack, BurnParams, BurnRequest, RunReport, RunnerCtx, Stage, StageEvent};
 use crate::tools::Tools;
 
@@ -1028,11 +1028,19 @@ fn payload_rows(paths: &[PathBuf]) -> Vec<PayloadRow> {
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| p.display().to_string());
-            match PayloadFile::inspect(p.clone()) {
-                Ok(f) => PayloadRow {
-                    name,
-                    size_text: human_bytes(f.size),
-                    container: f.looks_like_container,
+            match Payload::inspect(p.clone()) {
+                Ok((f, _)) => PayloadRow {
+                    name: if f.is_dir {
+                        format!("{}/", f.name)
+                    } else {
+                        f.name.clone()
+                    },
+                    size_text: if f.is_dir {
+                        format!("{} ({} files)", human_bytes(f.total_size), f.files.len())
+                    } else {
+                        human_bytes(f.total_size)
+                    },
+                    container: f.looks_like_container(),
                 },
                 Err(e) => PayloadRow {
                     name,

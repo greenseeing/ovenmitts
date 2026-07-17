@@ -234,6 +234,138 @@ fn burn_failure_reports_cause_and_retry_hint() {
 }
 
 #[test]
+fn burn_pipeline_dir_and_file() {
+    let h = Harness::new();
+    let extras = h.dir.path().join("extras");
+    std::fs::create_dir_all(extras.join("sub")).unwrap();
+    std::fs::write(extras.join("a.bin"), pseudo_random(64 * 1024, 7)).unwrap();
+    std::fs::write(extras.join("empty.bin"), b"").unwrap();
+    std::fs::write(
+        extras.join("sub").join("b.bin"),
+        pseudo_random(32 * 1024, 8),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink("a.bin", extras.join("link_a")).unwrap();
+    let vault = h.payload("vault.hc", 4 * 1024 * 1024, 42);
+
+    let stage_dir = h.stage_dir("MIXED");
+    let iso = stage_dir.join("MIXED.iso");
+    h.set_mount_for(&iso);
+
+    let (ctx, rx, _ack) = h.ctx();
+    runner::run_burn(
+        &ctx,
+        &burn_request(vec![extras.clone(), vault.clone()], "MIXED"),
+    )
+    .unwrap();
+    let events = drain(ctx, rx);
+
+    assert_eq!(stage_starts(&events), BURN_STAGES);
+    assert_eq!(stage_dones(&events), BURN_STAGES);
+
+    let warns: Vec<&String> = events
+        .iter()
+        .filter_map(|ev| match ev {
+            StageEvent::Warn(t) => Some(t),
+            _ => None,
+        })
+        .collect();
+    assert!(warns.iter().any(|t| t.contains("link_a")), "{warns:?}");
+    assert!(warns.iter().any(|t| t.contains("empty.bin")), "{warns:?}");
+
+    let checksums = std::fs::read_to_string(stage_dir.join("checksums.sha256")).unwrap();
+    let entries = hashing::parse_checksums(&checksums).unwrap();
+    let rels: Vec<&str> = entries.iter().map(|(_, rel)| rel.as_str()).collect();
+    assert_eq!(
+        rels,
+        vec![
+            "extras/a.bin",
+            "extras/empty.bin",
+            "extras/sub/b.bin",
+            "vault.hc",
+            "parity/extras.par2",
+            "parity/extras.vol000+01.par2",
+            "parity/vault.hc.par2",
+            "parity/vault.hc.vol000+01.par2",
+        ]
+    );
+    assert_eq!(entries[0].0, sha256_of(&extras.join("a.bin")));
+    assert_eq!(entries[2].0, sha256_of(&extras.join("sub").join("b.bin")));
+    assert_eq!(entries[3].0, sha256_of(&vault));
+
+    let argv = std::fs::read_to_string(stage_dir.join("parity").join("extras.par2.argv")).unwrap();
+    let lines: Vec<&str> = argv.lines().collect();
+    let parent = h.dir.path().canonicalize().unwrap();
+    assert_eq!(PathBuf::from(lines[0]).canonicalize().unwrap(), parent);
+    let base = lines
+        .iter()
+        .find_map(|l| l.strip_prefix("-B"))
+        .expect("par2 argv must pin the basepath with -B");
+    assert_eq!(PathBuf::from(base).canonicalize().unwrap(), parent);
+    assert!(lines.contains(&"extras/a.bin"), "argv: {argv}");
+    assert!(lines.contains(&"extras/sub/b.bin"), "argv: {argv}");
+    assert!(
+        !lines.iter().any(|l| l.contains("empty.bin")),
+        "argv: {argv}"
+    );
+    assert!(!lines.iter().any(|l| l.contains("link_a")), "argv: {argv}");
+    assert_eq!(par2_files_under(&stage_dir.join("parity")).len(), 4);
+
+    let recovery = std::fs::read_to_string(stage_dir.join("RECOVERY.txt")).unwrap();
+    assert!(
+        recovery.lines().any(|l| l.trim() == "cp -r /mnt/extras ."),
+        "{recovery}"
+    );
+    assert!(
+        recovery
+            .lines()
+            .any(|l| l.trim() == "par2 r -B. /mnt/parity/extras.par2"),
+        "{recovery}"
+    );
+    assert!(
+        recovery
+            .lines()
+            .any(|l| l.trim() == "par2 r -B. /mnt/parity/vault.hc.par2 vault.hc"),
+        "{recovery}"
+    );
+    assert!(
+        !recovery.contains("veracrypt --text --mount-options ro /mnt/extras"),
+        "{recovery}"
+    );
+    assert!(
+        recovery.contains("veracrypt --text --mount-options ro /mnt/vault.hc"),
+        "{recovery}"
+    );
+
+    let manifest = std::fs::read_to_string(stage_dir.join("MANIFEST.txt")).unwrap();
+    assert!(manifest.contains("extras/"), "{manifest}");
+    assert!(manifest.contains("files: 3"), "{manifest}");
+}
+
+#[test]
+fn run_plan_accepts_directory() {
+    let h = Harness::new();
+    let extras = h.dir.path().join("extras");
+    std::fs::create_dir_all(extras.join("sub")).unwrap();
+    std::fs::write(extras.join("a.bin"), pseudo_random(100_000, 3)).unwrap();
+    std::fs::write(extras.join("sub").join("b.bin"), pseudo_random(50_000, 4)).unwrap();
+    let vault = h.payload("vault.hc", 200_000, 5);
+
+    let (ctx, rx, _ack) = h.ctx();
+    runner::run_plan(&ctx, &[extras, vault], Some("bd25")).unwrap();
+    let events = drain(ctx, rx);
+    let payload_bytes = events
+        .iter()
+        .find_map(|ev| match ev {
+            StageEvent::Plan { plan, .. } => Some(plan.payload_bytes),
+            _ => None,
+        })
+        .expect("no Plan event");
+    assert_eq!(payload_bytes, 350_000);
+    assert!(matches!(events.last(), Some(StageEvent::Finished { .. })));
+}
+
+#[test]
 fn burn_pipeline_end_to_end() {
     let h = Harness::new();
     let payload = h.payload("vault.hc", 8 * 1024 * 1024, 42);
@@ -267,7 +399,7 @@ fn burn_pipeline_end_to_end() {
         PathBuf::from(lines[0]).canonicalize().unwrap(),
         payload.parent().unwrap().canonicalize().unwrap()
     );
-    let slice = plan::slice_bytes_for(8 * 1024 * 1024);
+    let slice = plan::slice_bytes_for(8 * 1024 * 1024, 1);
     assert_eq!(slice, 65536);
     assert!(lines.contains(&"create"));
     let base = lines

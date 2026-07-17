@@ -6,7 +6,7 @@ use std::time::Duration;
 use anyhow::{bail, ensure, Context, Result};
 
 use crate::config::Config;
-use crate::plan::{self, human_bytes, ArchivePlan, MediaInfo, PayloadFile, PlanInput};
+use crate::plan::{self, human_bytes, ArchivePlan, MediaInfo, Payload, PlanInput};
 use crate::tools::Tools;
 use crate::{burn, hashing, master, media, parity, verify};
 
@@ -152,7 +152,7 @@ impl BurnParams {
         (self, warns)
     }
 
-    fn plan_input(&self, payloads: &[PayloadFile], headroom_pct: u32) -> PlanInput {
+    fn plan_input(&self, payloads: &[Payload], headroom_pct: u32) -> PlanInput {
         PlanInput {
             payloads: payloads.to_vec(),
             parity: self.parity,
@@ -351,10 +351,10 @@ fn burn_pipeline(ctx: &RunnerCtx, req: &BurnRequest, stage: &mut Stage) -> Resul
         ctx.start(Stage::Parity);
         let n = payloads.len() as f32;
         for (i, p) in payloads.iter().enumerate() {
-            let name = file_name_string(&p.path);
+            let name = p.name.clone();
             let mut produced = parity::create(
                 &ctx.tools,
-                &p.path,
+                p,
                 &stage_dir.join("parity"),
                 params.redundancy_pct,
                 &mut |pct, line| {
@@ -390,24 +390,34 @@ fn burn_pipeline(ctx: &RunnerCtx, req: &BurnRequest, stage: &mut Stage) -> Resul
     *stage = Stage::Checksums;
     ctx.start(Stage::Checksums);
     let mut entries: Vec<(String, String)> = Vec::new();
-    let mut manifest_rows: Vec<(String, u64, String)> = Vec::new();
+    let mut manifest_rows: Vec<master::ManifestEntry> = Vec::new();
     {
         let parity_sizes: Vec<u64> = parity_files
             .iter()
             .map(|f| std::fs::metadata(f).map(|m| m.len()).unwrap_or(0))
             .collect();
         let total: u64 =
-            payloads.iter().map(|p| p.size).sum::<u64>() + parity_sizes.iter().sum::<u64>();
+            payloads.iter().map(|p| p.total_size).sum::<u64>() + parity_sizes.iter().sum::<u64>();
         let mut base = 0u64;
         let mut th = Throttle::default();
         for p in &payloads {
-            let name = file_name_string(&p.path);
-            let sha = hashing::sha256_file(&p.path, &mut |done, _| {
-                emit_pct(ctx, Stage::Checksums, &mut th, base + done, total, &name);
-            })?;
-            base += p.size;
-            entries.push((sha.clone(), name.clone()));
-            manifest_rows.push((name, p.size, sha));
+            let mut last_sha = None;
+            for m in &p.files {
+                let sha = hashing::sha256_file(&m.abs, &mut |done, _| {
+                    emit_pct(ctx, Stage::Checksums, &mut th, base + done, total, &m.rel);
+                })?;
+                base += m.size;
+                entries.push((sha.clone(), m.rel.clone()));
+                last_sha = Some(sha);
+            }
+            manifest_rows.push(master::ManifestEntry {
+                name: p.name.clone(),
+                bytes: p.total_size,
+                files: p.files.len(),
+                is_dir: p.is_dir,
+                sha256: if p.is_dir { None } else { last_sha },
+                par2: params.parity.then(|| (p.slice_bytes(), p.parity_blocks())),
+            });
         }
         for (f, size) in parity_files.iter().zip(&parity_sizes) {
             let rel = format!("parity/{}", file_name_string(f));
@@ -437,8 +447,7 @@ fn burn_pipeline(ctx: &RunnerCtx, req: &BurnRequest, stage: &mut Stage) -> Resul
         params.parity.then_some(params.redundancy_pct),
         params.defect_management,
     )?;
-    let payload_names: Vec<String> = payloads.iter().map(|p| file_name_string(&p.path)).collect();
-    master::write_recovery(&recovery_path, &label, &payload_names)?;
+    master::write_recovery(&recovery_path, &label, &payloads)?;
     let iso = stage_dir.join(format!("{label}.iso"));
     let input = master::MasterInput {
         label: &label,
@@ -589,7 +598,7 @@ fn burn_pipeline(ctx: &RunnerCtx, req: &BurnRequest, stage: &mut Stage) -> Resul
         "keep {} off-disc: parity, {label}.lba.txt and checksums.sha256 are what repair a damaged disc",
         stage_dir.display()
     ));
-    if payloads.iter().any(|p| p.looks_like_container) {
+    if payloads.iter().any(|p| p.looks_like_container()) {
         reminders.push(
             "VeraCrypt: keep an EXTERNAL volume-header backup (Tools > Backup Volume Header); \
              create a fresh container per archive generation"
@@ -900,7 +909,10 @@ pub fn run_plan(
     media_hint: Option<&str>,
 ) -> Result<()> {
     with_failure(ctx, |_stage| {
-        let payloads = inspect_payloads(payload_paths)?;
+        let (payloads, warnings) = inspect_payloads(payload_paths)?;
+        for w in warnings {
+            ctx.warn(w);
+        }
         let (device, media) = match media_hint {
             Some(hint) => (ctx.cfg.device.clone(), media::synthetic(hint)?),
             None => match resolve_device(ctx) {
@@ -1029,28 +1041,40 @@ fn resolve_device_from(
 pub fn preflight_probe(
     ctx: &RunnerCtx,
     payload_paths: &[PathBuf],
-) -> Result<(Vec<PayloadFile>, String, MediaInfo)> {
-    let payloads = inspect_payloads(payload_paths)?;
+) -> Result<(Vec<Payload>, String, MediaInfo)> {
+    let (payloads, warnings) = inspect_payloads(payload_paths)?;
+    for w in warnings {
+        ctx.warn(w);
+    }
     for p in &payloads {
-        ctx.info(format!(
-            "payload {}: {}{}",
-            file_name_string(&p.path),
-            human_bytes(p.size),
-            if p.looks_like_container {
-                " (VeraCrypt container?)"
-            } else {
-                ""
-            }
-        ));
+        let container = if p.looks_like_container() {
+            " (VeraCrypt container?)"
+        } else {
+            ""
+        };
+        ctx.info(if p.is_dir {
+            format!(
+                "payload {}/: {} ({} files){container}",
+                p.name,
+                human_bytes(p.total_size),
+                p.files.len()
+            )
+        } else {
+            format!(
+                "payload {}: {}{container}",
+                p.name,
+                human_bytes(p.total_size)
+            )
+        });
     }
 
     if let Some(veracrypt) = &ctx.tools.veracrypt {
         let listing = veracrypt_list(veracrypt);
-        for p in &payloads {
+        for m in payloads.iter().flat_map(|p| p.files.iter()) {
             ensure!(
-                !listing_mentions(&listing, &p.path),
+                !listing_mentions(&listing, &m.abs),
                 "{} is a MOUNTED VeraCrypt container - dismount it first (veracrypt -d)",
-                p.path.display()
+                m.abs.display()
             );
         }
     }
@@ -1109,20 +1133,22 @@ fn check_staging_space(ctx: &RunnerCtx, plan: &ArchivePlan) -> Result<()> {
     Ok(())
 }
 
-fn inspect_payloads(paths: &[PathBuf]) -> Result<Vec<PayloadFile>> {
+fn inspect_payloads(paths: &[PathBuf]) -> Result<(Vec<Payload>, Vec<String>)> {
     ensure!(!paths.is_empty(), "no payload files given");
     let mut payloads = Vec::with_capacity(paths.len());
+    let mut warnings = Vec::new();
     let mut seen = HashSet::new();
     for p in paths {
-        let payload = PayloadFile::inspect(p.clone())?;
-        let name = file_name_string(&payload.path);
+        let (payload, mut w) = Payload::inspect(p.clone())?;
+        warnings.append(&mut w);
         ensure!(
-            seen.insert(name.clone()),
-            "duplicate payload filename '{name}' - the disc root is flat, rename one copy"
+            seen.insert(payload.name.clone()),
+            "duplicate payload filename '{}' - the disc root is flat, rename one copy",
+            payload.name
         );
         payloads.push(payload);
     }
-    Ok(payloads)
+    Ok((payloads, warnings))
 }
 
 fn veracrypt_list(bin: &Path) -> String {

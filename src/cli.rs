@@ -9,7 +9,7 @@ use clap::{Parser, Subcommand};
     about = "Archival BD-R / M-DISC burning with parity and cache-proof verification"
 )]
 pub struct Cli {
-    /// Payload files; with no subcommand this opens the TUI wizard
+    /// Payload files or directories; with no subcommand this opens the TUI wizard
     pub payloads: Vec<PathBuf>,
 
     #[arg(long, global = true)]

@@ -7,15 +7,17 @@ use anyhow::{bail, ensure, Context, Result};
 use crate::plan;
 use crate::tools::Tools;
 
-/// par2 create for one payload file. cwd = payload's parent and -B<parent>
-/// pins the basepath there — par2 otherwise derives it from the staged .par2
-/// path and skips the payload as "out of basepath source file"; slice size
-/// from plan::slice_bytes_for (never the 2000-block default); -n1; -m from
-/// available memory (min 512 MB, cap 4096 MB).
+/// par2 create for one payload (file or directory tree): ONE recovery set.
+/// cwd = the payload root's parent and -B<parent> pins the basepath there —
+/// par2 otherwise derives it from the staged .par2 path and skips the sources
+/// as "out of basepath source file". Member operands are passed relative so
+/// the set stores disc-layout paths (repair with -B works from a disc copy);
+/// slice size from Payload::slice_bytes (never the 2000-block default); -n1;
+/// -m from available memory (min 512 MB, cap 4096 MB).
 /// Output files land in out_dir; returns their paths.
 pub fn create(
     tools: &Tools,
-    payload: &Path,
+    payload: &plan::Payload,
     out_dir: &Path,
     redundancy_pct: u32,
     cb: &mut dyn FnMut(Option<f32>, String),
@@ -24,19 +26,21 @@ pub fn create(
         .par2
         .as_ref()
         .context("par2 not found (install par2cmdline or par2cmdline-turbo)")?;
-    let payload = payload
-        .canonicalize()
-        .with_context(|| format!("resolve payload {}", payload.display()))?;
-    let payload_name = payload
-        .file_name()
-        .and_then(|n| n.to_str())
-        .context("payload has no usable file name")?
-        .to_string();
+    let payload_name = payload.name.clone();
     let parent = payload
+        .root
         .parent()
         .context("payload has no parent directory")?;
-    let size = std::fs::metadata(&payload)?.len();
-    ensure!(size > 0, "payload is empty: {}", payload.display());
+    let operands: Vec<String> = payload
+        .parity_operands()
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    ensure!(
+        !operands.is_empty(),
+        "payload has no non-empty files to protect: {}",
+        payload.root.display()
+    );
 
     std::fs::create_dir_all(out_dir).with_context(|| format!("create {}", out_dir.display()))?;
     let out_dir = out_dir
@@ -45,11 +49,11 @@ pub fn create(
     let out_par2 = out_dir.join(format!("{payload_name}.par2"));
 
     let args = create_args(
-        &payload_name,
+        &operands,
         &out_par2,
         parent,
         redundancy_pct,
-        plan::slice_bytes_for(size),
+        payload.slice_bytes(),
         mem_mb(),
     );
     let mut child = Command::new(par2)
@@ -101,14 +105,14 @@ pub fn create(
 /// No -q: par2 prints the Processing:/Constructing: percent stream only at
 /// default verbosity (par2creator.cpp gates it on noiselevel > nlQuiet).
 pub fn create_args(
-    payload_name: &str,
+    operands: &[String],
     out_par2: &Path,
     basepath: &Path,
     redundancy_pct: u32,
     slice_bytes: u64,
     mem_mb: u32,
 ) -> Vec<String> {
-    vec![
+    let mut args = vec![
         "create".to_string(),
         format!("-B{}", basepath.display()),
         format!("-r{redundancy_pct}"),
@@ -116,8 +120,9 @@ pub fn create_args(
         format!("-s{slice_bytes}"),
         format!("-m{mem_mb}"),
         out_par2.display().to_string(),
-        payload_name.to_string(),
-    ]
+    ];
+    args.extend(operands.iter().cloned());
+    args
 }
 
 /// Pure: parse par2 stdout progress ("Constructing: 12.3%" / "Processing: ...").
@@ -193,7 +198,7 @@ mod tests {
     #[test]
     fn args_match_design_contract() {
         let args = create_args(
-            "vault.hc",
+            &["vault.hc".to_string()],
             Path::new("/stage/parity/vault.hc.par2"),
             Path::new("/data"),
             15,
@@ -216,12 +221,39 @@ mod tests {
     }
 
     #[test]
+    fn args_append_every_dir_member_operand() {
+        let args = create_args(
+            &["extras/a.bin".to_string(), "extras/sub/b.bin".to_string()],
+            Path::new("/stage/parity/extras.par2"),
+            Path::new("/data"),
+            15,
+            65_536,
+            512,
+        );
+        assert_eq!(
+            &args[6..],
+            &[
+                "/stage/parity/extras.par2",
+                "extras/a.bin",
+                "extras/sub/b.bin",
+            ]
+        );
+    }
+
+    #[test]
     fn slice_arg_never_defaults_to_2000_blocks() {
         let size = 93 * 1024 * 1024 * 1024u64;
-        let slice = plan::slice_bytes_for(size);
+        let slice = plan::slice_bytes_for(size, 1);
         assert!(size.div_ceil(slice) <= plan::PAR2_MAX_BLOCKS);
         assert!(size.div_ceil(slice) > 2000);
-        let args = create_args("v", Path::new("v.par2"), Path::new("."), 15, slice, 512);
+        let args = create_args(
+            &["v".to_string()],
+            Path::new("v.par2"),
+            Path::new("."),
+            15,
+            slice,
+            512,
+        );
         assert!(args.iter().any(|a| *a == format!("-s{slice}")));
     }
 
@@ -275,11 +307,15 @@ mod tests {
         assert_eq!(mem_mb_from_meminfo(""), 512);
     }
 
+    fn inspect(path: &Path) -> plan::Payload {
+        plan::Payload::inspect(path.to_path_buf()).unwrap().0
+    }
+
     // fork/exec ETXTBSY race: another test thread may hold a just-written fake
     // script open for write at our child's execve; retry, never in prod code.
     fn create_retrying(
         tools: &Tools,
-        payload: &Path,
+        payload: &plan::Payload,
         out_dir: &Path,
         events: &mut Vec<(Option<f32>, String)>,
     ) -> Result<Vec<PathBuf>> {
@@ -328,7 +364,7 @@ mod tests {
         };
 
         let mut events = Vec::new();
-        let files = create_retrying(&tools, &payload, &out_dir, &mut events).unwrap();
+        let files = create_retrying(&tools, &inspect(&payload), &out_dir, &mut events).unwrap();
 
         let names: Vec<_> = files
             .iter()
@@ -372,8 +408,37 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let payload = dir.path().join("v");
         std::fs::write(&payload, b"x").unwrap();
-        let err = create(&tools, &payload, dir.path(), 15, &mut |_, _| {}).unwrap_err();
+        let err = create(&tools, &inspect(&payload), dir.path(), 15, &mut |_, _| {}).unwrap_err();
         assert!(err.to_string().contains("par2 not found"));
+    }
+
+    #[test]
+    fn create_rejects_payload_with_only_empty_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let extras = dir.path().join("extras");
+        std::fs::create_dir(&extras).unwrap();
+        std::fs::write(extras.join("empty.bin"), b"").unwrap();
+        let tools = Tools {
+            xorriso: "/bin/true".into(),
+            par2: Some("/bin/true".into()),
+            par2_version: None,
+            udisksctl: None,
+            veracrypt: None,
+            eject: None,
+            mediainfo: None,
+        };
+        let err = create(
+            &tools,
+            &inspect(&extras),
+            &dir.path().join("out"),
+            15,
+            &mut |_, _| {},
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("no non-empty files to protect"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -395,8 +460,13 @@ mod tests {
             mediainfo: None,
         };
         let mut events = Vec::new();
-        let err =
-            create_retrying(&tools, &payload, &dir.path().join("out"), &mut events).unwrap_err();
+        let err = create_retrying(
+            &tools,
+            &inspect(&payload),
+            &dir.path().join("out"),
+            &mut events,
+        )
+        .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("par2 create failed"), "{msg}");
         assert!(msg.contains("boom"), "{msg}");

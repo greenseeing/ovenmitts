@@ -2,12 +2,12 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, ensure, Context, Result};
 
-use crate::plan::{self, PayloadFile};
+use crate::plan::{self, Payload};
 use crate::tools::Tools;
 
 pub struct MasterInput<'a> {
     pub label: &'a str,
-    pub payloads: &'a [PayloadFile],
+    pub payloads: &'a [Payload],
     pub parity_files: &'a [PathBuf],
     pub checksums: &'a Path,
     pub manifest: &'a Path,
@@ -70,7 +70,8 @@ pub fn master_args(input: &MasterInput) -> Vec<String> {
     args.push(input.out_iso.display().to_string());
     args.push("-graft-points".into());
     for p in input.payloads {
-        args.push(graft(&format!("/{}", file_name_of(&p.path)), &p.path));
+        // a directory source grafts its whole tree under /<name>
+        args.push(graft(&format!("/{}", p.name), &p.root));
     }
     for f in input.parity_files {
         args.push(graft(&format!("/parity/{}", file_name_of(f)), f));
@@ -113,13 +114,26 @@ pub fn parse_progress_line(line: &str) -> Option<f32> {
     (0.0..=200.0).contains(&pct).then_some(pct.min(100.0))
 }
 
+pub struct ManifestEntry {
+    pub name: String,
+    pub bytes: u64,
+    pub files: usize,
+    pub is_dir: bool,
+    /// Some for file payloads; dir payloads carry per-file hashes in
+    /// checksums.sha256 instead.
+    pub sha256: Option<String>,
+    /// Some when parity ran: (slice bytes, block count summed per member —
+    /// every file's tail slice rounds up, so this is not bytes/slice).
+    pub par2: Option<(u64, u64)>,
+}
+
 /// MANIFEST.txt: date, label, parameters (redundancy, slice size, defect
-/// management), payload names + sizes + sha256. Credits only standard tools —
+/// management), one row per top-level payload. Credits only standard tools —
 /// on-disc files never name ovenmitts.
 pub fn write_manifest(
     out: &Path,
     label: &str,
-    payloads: &[(String, u64, String)],
+    payloads: &[ManifestEntry],
     redundancy_pct: Option<u32>,
     defect_management: bool,
 ) -> Result<()> {
@@ -157,17 +171,22 @@ pub fn write_manifest(
     );
     let _ = writeln!(t);
     let _ = writeln!(t, "payloads:");
-    for (name, bytes, sha256) in payloads {
-        let _ = writeln!(t, "  {name}");
-        let _ = writeln!(t, "    bytes: {bytes} ({})", plan::human_bytes(*bytes));
-        let _ = writeln!(t, "    sha256: {sha256}");
-        if redundancy_pct.is_some() {
-            let slice = plan::slice_bytes_for(*bytes);
-            let _ = writeln!(
-                t,
-                "    par2 slice: {slice} bytes ({} blocks)",
-                bytes.div_ceil(slice)
-            );
+    for e in payloads {
+        let _ = writeln!(t, "  {}{}", e.name, if e.is_dir { "/" } else { "" });
+        let _ = writeln!(t, "    bytes: {} ({})", e.bytes, plan::human_bytes(e.bytes));
+        if e.is_dir {
+            let _ = writeln!(t, "    files: {}", e.files);
+        }
+        match &e.sha256 {
+            Some(sha) => {
+                let _ = writeln!(t, "    sha256: {sha}");
+            }
+            None => {
+                let _ = writeln!(t, "    sha256: per-file hashes in checksums.sha256");
+            }
+        }
+        if let Some((slice, blocks)) = e.par2 {
+            let _ = writeln!(t, "    par2 slice: {slice} bytes ({blocks} blocks)");
         }
     }
     std::fs::write(out, t).with_context(|| format!("write {}", out.display()))
@@ -177,7 +196,7 @@ pub fn write_manifest(
 /// exact commands for: mount + copy, ddrescue a failing disc, par2repair the
 /// payload, regenerate the file->LBA map from disc or ISO, VeraCrypt header
 /// restore pointers.
-pub fn write_recovery(out: &Path, label: &str, payload_names: &[String]) -> Result<()> {
+pub fn write_recovery(out: &Path, label: &str, payloads: &[Payload]) -> Result<()> {
     use std::fmt::Write as _;
     let mut t = String::new();
     let _ = writeln!(t, "RECOVERY — disc \"{label}\"");
@@ -190,8 +209,9 @@ pub fn write_recovery(out: &Path, label: &str, payload_names: &[String]) -> Resu
     let _ = writeln!(t);
     let _ = writeln!(t, "1. Disc reads normally: mount and copy");
     let _ = writeln!(t, "   mount -o ro /dev/sr0 /mnt");
-    for name in payload_names {
-        let _ = writeln!(t, "   cp /mnt/{name} .");
+    for p in payloads {
+        let flag = if p.is_dir { "-r " } else { "" };
+        let _ = writeln!(t, "   cp {flag}/mnt/{} .", p.name);
     }
     let _ = writeln!(t, "   sha256sum -c --ignore-missing /mnt/checksums.sha256");
     let _ = writeln!(
@@ -218,10 +238,11 @@ pub fn write_recovery(out: &Path, label: &str, payload_names: &[String]) -> Resu
     let _ = writeln!(t, "3. Extract files from the rescued image");
     let _ = writeln!(t, "   mount -o loop,ro recovered.iso /mnt");
     let _ = writeln!(t, "   or without root:");
-    for name in payload_names {
+    for p in payloads {
         let _ = writeln!(
             t,
-            "   xorriso -osirrox on -indev recovered.iso -extract /{name} {name}"
+            "   xorriso -osirrox on -indev recovered.iso -extract /{} {}",
+            p.name, p.name
         );
     }
     let _ = writeln!(t);
@@ -234,8 +255,13 @@ pub fn write_recovery(out: &Path, label: &str, payload_names: &[String]) -> Resu
         "   With the disc or image mounted at /mnt and the damaged copy in the"
     );
     let _ = writeln!(t, "   current directory:");
-    for name in payload_names {
-        let _ = writeln!(t, "   par2 r -B. /mnt/parity/{name}.par2 {name}");
+    for p in payloads {
+        // dir sets store member rel paths; a trailing operand must be a file
+        if p.is_dir {
+            let _ = writeln!(t, "   par2 r -B. /mnt/parity/{}.par2", p.name);
+        } else {
+            let _ = writeln!(t, "   par2 r -B. /mnt/parity/{}.par2 {}", p.name, p.name);
+        }
     }
     let _ = writeln!(
         t,
@@ -255,27 +281,35 @@ pub fn write_recovery(out: &Path, label: &str, payload_names: &[String]) -> Resu
         t,
         "   Works against the rescued image too: xorriso -indev recovered.iso ..."
     );
-    let _ = writeln!(t);
-    let _ = writeln!(t, "6. VeraCrypt containers");
-    let _ = writeln!(
-        t,
-        "   Containers mount read-only straight from the mounted disc:"
-    );
-    for name in payload_names {
-        let _ = writeln!(t, "   veracrypt --text --mount-options ro /mnt/{name}");
+    let containers: Vec<&str> = payloads
+        .iter()
+        .flat_map(|p| p.files.iter())
+        .filter(|m| m.container)
+        .map(|m| m.rel.as_str())
+        .collect();
+    if !containers.is_empty() {
+        let _ = writeln!(t);
+        let _ = writeln!(t, "6. VeraCrypt containers");
+        let _ = writeln!(
+            t,
+            "   Containers mount read-only straight from the mounted disc:"
+        );
+        for rel in containers {
+            let _ = writeln!(t, "   veracrypt --text --mount-options ro /mnt/{rel}");
+        }
+        let _ = writeln!(
+            t,
+            "   If the volume header is damaged, restore it from your EXTERNAL header"
+        );
+        let _ = writeln!(
+            t,
+            "   backup: VeraCrypt > Tools > Restore Volume Header. The embedded backup"
+        );
+        let _ = writeln!(
+            t,
+            "   header at the end of the container is the first fallback."
+        );
     }
-    let _ = writeln!(
-        t,
-        "   If the volume header is damaged, restore it from your EXTERNAL header"
-    );
-    let _ = writeln!(
-        t,
-        "   backup: VeraCrypt > Tools > Restore Volume Header. The embedded backup"
-    );
-    let _ = writeln!(
-        t,
-        "   header at the end of the container is the first fallback."
-    );
     std::fs::write(out, t).with_context(|| format!("write {}", out.display()))
 }
 
@@ -308,15 +342,54 @@ mod tests {
     // blog.linux-ng.de/2025/01/02/build-unattended-windows-iso/ (xorriso 1.5.6)
     const MKISOFS_LOG: &str = include_str!("../tests/fixtures/xorriso_mkisofs_progress.txt");
 
-    fn payload(path: &str, size: u64) -> PayloadFile {
-        PayloadFile {
-            path: path.into(),
-            size,
-            looks_like_container: true,
+    fn payload(path: &str, size: u64) -> Payload {
+        let name = Path::new(path)
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        Payload {
+            root: path.into(),
+            is_dir: false,
+            files: vec![plan::PayloadMember {
+                abs: path.into(),
+                rel: name.clone(),
+                size,
+                container: true,
+            }],
+            dirs: 0,
+            total_size: size,
+            name,
         }
     }
 
-    fn sample_input<'a>(payloads: &'a [PayloadFile], parity: &'a [PathBuf]) -> MasterInput<'a> {
+    fn dir_payload(path: &str, members: &[(&str, u64, bool)]) -> Payload {
+        let name = Path::new(path)
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        Payload {
+            root: path.into(),
+            is_dir: true,
+            files: members
+                .iter()
+                .map(|(rel, size, container)| plan::PayloadMember {
+                    abs: format!("{path}/{rel}").into(),
+                    rel: rel.to_string(),
+                    size: *size,
+                    container: *container,
+                })
+                .collect(),
+            dirs: 1,
+            total_size: members.iter().map(|(_, s, _)| s).sum(),
+            name,
+        }
+    }
+
+    fn sample_input<'a>(payloads: &'a [Payload], parity: &'a [PathBuf]) -> MasterInput<'a> {
         MasterInput {
             label: "VAULT_20260717",
             payloads,
@@ -357,6 +430,19 @@ mod tests {
                 "/MANIFEST.txt=/stage/MANIFEST.txt",
                 "/RECOVERY.txt=/stage/RECOVERY.txt",
             ]
+        );
+    }
+
+    #[test]
+    fn master_args_graft_directory_roots() {
+        let payloads = vec![dir_payload(
+            "/home/u/extras",
+            &[("extras/a.bin", 10, false)],
+        )];
+        let args = master_args(&sample_input(&payloads, &[]));
+        assert!(
+            args.contains(&"/extras=/home/u/extras".to_string()),
+            "{args:?}"
         );
     }
 
@@ -405,11 +491,14 @@ mod tests {
     fn manifest_records_parameters_and_payloads() {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("MANIFEST.txt");
-        let payloads = vec![(
-            "vault.hc".to_string(),
-            20 * 1024 * 1024 * 1024u64,
-            "ab".repeat(32),
-        )];
+        let payloads = vec![ManifestEntry {
+            name: "vault.hc".into(),
+            bytes: 20 * 1024 * 1024 * 1024,
+            files: 1,
+            is_dir: false,
+            sha256: Some("ab".repeat(32)),
+            par2: Some((655_360, 32_768)),
+        }];
         write_manifest(&out, "VAULT_20260717", &payloads, Some(15), false).unwrap();
         let text = std::fs::read_to_string(&out).unwrap();
         assert!(
@@ -432,7 +521,15 @@ mod tests {
     fn manifest_without_parity_and_with_dm() {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("MANIFEST.txt");
-        write_manifest(&out, "L", &[("v".into(), 10, "cd".repeat(32))], None, true).unwrap();
+        let entry = ManifestEntry {
+            name: "v".into(),
+            bytes: 10,
+            files: 1,
+            is_dir: false,
+            sha256: Some("cd".repeat(32)),
+            par2: None,
+        };
+        write_manifest(&out, "L", &[entry], None, true).unwrap();
         let text = std::fs::read_to_string(&out).unwrap();
         assert!(text.contains("parity: none"));
         assert!(text.contains("defect management: on"));
@@ -440,18 +537,44 @@ mod tests {
     }
 
     #[test]
+    fn manifest_dir_entry_points_at_checksums() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("MANIFEST.txt");
+        let entry = ManifestEntry {
+            name: "extras".into(),
+            bytes: 3_000_000,
+            files: 42,
+            is_dir: true,
+            sha256: None,
+            par2: Some((65_536, 47)),
+        };
+        write_manifest(&out, "L", &[entry], Some(15), false).unwrap();
+        let text = std::fs::read_to_string(&out).unwrap();
+        assert!(text.contains("  extras/\n"), "{text}");
+        assert!(text.contains("files: 42"), "{text}");
+        assert!(
+            text.contains("sha256: per-file hashes in checksums.sha256"),
+            "{text}"
+        );
+        assert!(
+            text.contains("par2 slice: 65536 bytes (47 blocks)"),
+            "{text}"
+        );
+    }
+
+    #[test]
     fn recovery_contains_exact_commands_per_payload() {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("RECOVERY.txt");
-        let names = vec!["vault.hc".to_string(), "notes.hc".to_string()];
-        write_recovery(&out, "VAULT_20260717", &names).unwrap();
+        let payloads = vec![payload("/h/vault.hc", 10), payload("/h/notes.hc", 5)];
+        write_recovery(&out, "VAULT_20260717", &payloads).unwrap();
         let text = std::fs::read_to_string(&out).unwrap();
         assert!(text.contains("disc \"VAULT_20260717\""));
         assert!(text.contains("mount -o ro /dev/sr0 /mnt"));
         assert!(text.contains("sha256sum -c --ignore-missing /mnt/checksums.sha256"));
         assert!(text.contains("ddrescue /dev/sr0 recovered.iso rescue.map"));
         assert!(text.contains("mount -o loop,ro recovered.iso /mnt"));
-        for n in &names {
+        for n in ["vault.hc", "notes.hc"] {
             assert!(text.contains(&format!("cp /mnt/{n} .")));
             assert!(text.contains(&format!(
                 "xorriso -osirrox on -indev recovered.iso -extract /{n} {n}"
@@ -466,6 +589,49 @@ mod tests {
             "on-disc files carry no tool branding: {text}"
         );
         assert!(text.contains("Mastered and burned with xorriso"), "{text}");
+    }
+
+    #[test]
+    fn recovery_dir_payload_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("RECOVERY.txt");
+        let payloads = vec![
+            dir_payload(
+                "/h/extras",
+                &[
+                    ("extras/a.bin", 10, false),
+                    ("extras/sub/inner.hc", 20, true),
+                ],
+            ),
+            payload("/h/vault.hc", 10),
+        ];
+        write_recovery(&out, "L", &payloads).unwrap();
+        let text = std::fs::read_to_string(&out).unwrap();
+        assert!(text.contains("cp -r /mnt/extras ."), "{text}");
+        assert!(
+            text.lines()
+                .any(|l| l.trim() == "par2 r -B. /mnt/parity/extras.par2"),
+            "{text}"
+        );
+        assert!(
+            text.contains("veracrypt --text --mount-options ro /mnt/extras/sub/inner.hc"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("veracrypt --text --mount-options ro /mnt/extras\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn recovery_omits_veracrypt_section_without_containers() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("RECOVERY.txt");
+        let payloads = vec![dir_payload("/h/extras", &[("extras/a.bin", 10, false)])];
+        write_recovery(&out, "L", &payloads).unwrap();
+        let text = std::fs::read_to_string(&out).unwrap();
+        assert!(!text.contains("veracrypt"), "{text}");
+        assert!(!text.contains("VeraCrypt containers"), "{text}");
     }
 
     fn fake_tools(script: &str, dir: &Path) -> Tools {

@@ -37,8 +37,15 @@ if [ "${1:-}" = "-as" ] && [ "${2:-}" = "mkisofs" ]; then
         source=${a#*=}
         dest="$contents$target"
         mkdir -p "$(dirname "$dest")"
-        cp "$source" "$dest"
-        cat "$source" >> "$iso"
+        if [ -d "$source" ]; then
+            cp -R "$source" "$dest"
+            find "$source" -type f | LC_ALL=C sort | while IFS= read -r f; do
+                cat "$f" >> "$iso"
+            done
+        else
+            cp "$source" "$dest"
+            cat "$source" >> "$iso"
+        fi
     done
     printf 'xorriso : UPDATE :  25.00%% done\n' >&2
     printf 'xorriso : UPDATE :  50.00%% done, estimate finish Thu Jul 17 00:00:00 2026\n' >&2
