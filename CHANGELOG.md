@@ -31,6 +31,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (previously they used the configured/default device verbatim, so a machine
   whose burner is not `/dev/sr0` always errored without `--device`).
 
+- TUI report screen no longer lists the second-copy reminder twice (the
+  runner's report already carries it; the TUI appended its own copy).
+
 - TUI run screen: long warning/info lines in the event log now word-wrap
   (with the newest lines kept visible) instead of being clipped at the right
   edge; the failure banner wraps up to 5 rows.

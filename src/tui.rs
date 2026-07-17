@@ -1014,15 +1014,6 @@ impl App {
                 Style::new().fg(WARN),
             )));
         }
-        if let Some(iso) = &report.iso_path {
-            lines.push(Line::from(Span::styled(
-                format!(
-                    "  • second copy: insert a fresh disc and run `ovenmitts burn-iso {}`",
-                    iso.display()
-                ),
-                Style::new().fg(WARN),
-            )));
-        }
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
     }
 }
@@ -1643,6 +1634,35 @@ mod tests {
             matches!(ack_rx.try_recv(), Err(TryRecvError::Empty)),
             "param keys must be inert once the run starts"
         );
+    }
+
+    #[test]
+    fn report_screen_lists_each_reminder_once() {
+        let (mut app, _ack_rx) = test_app();
+        app.apply(StageEvent::Finished {
+            report: RunReport {
+                iso_path: Some(PathBuf::from("/staging/ARCHIVE/ARCHIVE.iso")),
+                iso_sha256: Some("ab".repeat(32)),
+                iso_bytes: 4096,
+                stages: vec![],
+                reminders: vec![
+                    "second copy: insert a fresh disc and run `ovenmitts burn-iso /staging/ARCHIVE/ARCHIVE.iso`".into(),
+                ],
+            },
+        });
+        let backend = ratatui::backend::TestBackend::new(120, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.render(f)).unwrap();
+        let buf = terminal.backend().buffer();
+        let hits = (0..30)
+            .map(|y| {
+                (0..120)
+                    .map(|x| buf.cell((x, y)).unwrap().symbol())
+                    .collect::<String>()
+            })
+            .filter(|row| row.contains("second copy"))
+            .count();
+        assert_eq!(hits, 1, "the second-copy reminder must render exactly once");
     }
 
     #[test]
