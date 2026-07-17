@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- A `device` set in the config file is now a soft preference: it is tried
+  first, but auto-detection still scans `/dev/sr*` when it holds no readable
+  medium. Only `--device` pins the drive hard.
 - `check` and `verify` fail fast when no drive has a readable medium instead
   of polling up to 180 s for one.
 

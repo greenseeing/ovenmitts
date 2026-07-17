@@ -19,8 +19,8 @@ pub struct FileConfig {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub device: String,
-    /// true when the device came from the config file or --device; only a
-    /// defaulted device may be swapped by drive auto-detection.
+    /// true only when --device was passed on the CLI; a non-explicit device
+    /// (built-in default or config file) may be swapped by auto-detection.
     pub device_explicit: bool,
     pub staging: PathBuf,
     pub speed: Option<u32>,
@@ -77,7 +77,9 @@ impl Config {
             "config: headroom_pct must be 0..=50 (got {headroom_pct})"
         );
         Ok(Self {
-            device_explicit: file.device.is_some(),
+            // a config-file device is a soft preference (tried first, may be
+            // swapped by auto-detection); only --device pins, set in main
+            device_explicit: false,
             device: file.device.unwrap_or_else(|| "/dev/sr0".into()),
             staging: file.staging.unwrap_or_else(default_staging),
             speed: file.speed,
@@ -111,7 +113,7 @@ mod tests {
         let f: FileConfig = toml::from_str("device = \"/dev/sr1\"\nredundancy_pct = 20\n").unwrap();
         let c = Config::resolve(f).unwrap();
         assert_eq!(c.device, "/dev/sr1");
-        assert!(c.device_explicit);
+        assert!(!c.device_explicit, "config device is a soft preference");
         assert_eq!(c.redundancy_pct, 20);
         assert_eq!(c.headroom_pct, 5);
     }

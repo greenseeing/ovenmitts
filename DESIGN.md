@@ -144,8 +144,9 @@ Non-TTY or `--no-tui` → plain line output (same events).
 
 ## Drive selection
 
-The configured device (`--device` / config `device`) is always used as-is.
-Only the built-in default `/dev/sr0` may be swapped: if it cannot be probed
+A `--device` from the CLI is always used as-is. The built-in default
+`/dev/sr0` and a config-file `device` are soft preferences that may be
+swapped: if the preferred device cannot be probed
 (no disc, or no such drive), every drive-touching subcommand
 (`burn`/`burn-iso`/`verify`/`check`/`info`/`plan`) probes every `/dev/sr*` —
 one drive with media is auto-selected (announced in the event log), more

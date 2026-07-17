@@ -929,9 +929,10 @@ impl std::fmt::Display for AmbiguousDrives {
 
 impl std::error::Error for AmbiguousDrives {}
 
-/// Pick the drive to operate on. An explicitly configured device is used
-/// as-is. A defaulted device that cannot be probed triggers a scan of the
-/// host's drives: exactly one with media wins, ambiguity refuses.
+/// Pick the drive to operate on. A --device from the CLI is used as-is.
+/// The built-in default or a config-file device is a soft preference:
+/// probed first; if that fails, scan the host's drives — exactly one with
+/// media wins, ambiguity refuses.
 fn resolve_device(ctx: &RunnerCtx) -> Result<(String, MediaInfo)> {
     resolve_device_from(ctx, media::list_drives)
 }

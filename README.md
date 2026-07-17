@@ -95,9 +95,10 @@ ovenmitts info
 ovenmitts plan ~/archive/vault.hc --media bd25
 ```
 
-Global flags: `--device <dev>`, `--config <path>`, `--no-tui`. When no device
-is given anywhere, `/dev/sr0` is tried first and, if it cannot be probed (no
-disc — or no such drive), every subcommand scans the other `/dev/sr*` drives —
+Global flags: `--device <dev>`, `--config <path>`, `--no-tui`. A `--device`
+from the CLI is always used as-is; the config-file `device` (or the `/dev/sr0`
+default) is a soft preference — it is tried first and, if it cannot be probed
+(no disc — or no such drive), every subcommand scans the other `/dev/sr*` drives —
 exactly one with a disc is auto-selected (announced in the output); more than
 one aborts with the list so you can pick with `--device`. A mounted disc in a
 drive other than the configured one is invisible to the scan — pass
@@ -151,8 +152,9 @@ override with `--config`). Every key is optional, unknown keys are rejected,
 CLI flags win over the file:
 
 ```toml
-# device = "/dev/sr1"      # pin the burner; leaving it unset tries /dev/sr0
-                           # and auto-detects across /dev/sr* when that fails
+# device = "/dev/sr1"      # preferred burner, tried first; auto-detection
+                           # still scans /dev/sr* when it has no disc
+                           # (only --device pins the drive hard)
 staging = "/home/you/.local/share/ovenmitts/staging"
                            # parity + ISO workspace
                            # (default $XDG_DATA_HOME/ovenmitts/staging)
