@@ -1,9 +1,34 @@
 # Changelog
 
-All notable changes to this project will be documented in this file.
+All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+### Added
+
+- Payload picker now docks a "Selected" table under the browser once anything
+  is selected: one row per payload showing full path (tail-truncated to fit),
+  payload bytes, and share of the disc budget (`—` while the drive probe is
+  pending). Table is capped at 8 rows with an "… and N more" overflow note.
+  
+- Picker text no longer clips on narrow windows: media/fit/status lines and
+  the key-hint footer now word-wrap via `head_wrap` on constrained widths; the
+  footer area grows to fit wrapped lines so the →/← open/up hint stays visible
+  (that hint clipping made cross-directory selection undiscoverable). Entry
+  rows and table paths remain single-line (required for cursor tracking).
+  Tests: 5 new picker tests (table content, probing dash, tail_fit, wrap
+  helper, narrow-window render); 223 total pass, clippy/fmt clean.
+
+### Changed
+
+- `tui::head_wrap` promoted to `pub(crate)` for reuse in the picker's
+  line-wrapping logic; `kv()` demoted back to private (picker uses `wrapped()`
+  wrapper instead).
+- DESIGN.md Pick-screen paragraph expanded to document the Selected table
+  behavior and narrow-window wrapping constraints.
 
 ## [0.1.4] - 2026-07-18
 

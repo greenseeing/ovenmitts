@@ -164,7 +164,12 @@ both sides: at most one ack per `NeedAck`, and everything the pipeline consumes
    ancestor refuses (the disc root stays flat; the runner still dedupes).
    The drive is probed in the background (same auto-select policy as the
    runner); the header shows a live fit estimate from build_plan — no disc
-   falls back to an assumed blank BD-R 25, like `plan`.
+   falls back to an assumed blank BD-R 25, like `plan`. A Selected table
+   (full path tail-truncated · payload bytes · % of the disc budget, `—`
+   while probing) docks under the browser once anything is selected, capped
+   at 8 rows + "… and N more". Media/fit/status lines and the key hints
+   word-wrap via head_wrap on narrow windows; only entry rows and table
+   paths truncate (they must stay one row for cursor math).
 1. Plan: media probe result, payload table, editable parameters (label, speed,
    redundancy, parity, defect management), fit bar, warnings. Keys: ↑↓/jk
    select row, ←→/hl adjust or cycle, Space toggle, `e` inline edit for

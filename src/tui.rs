@@ -1091,7 +1091,7 @@ fn heading(text: &str) -> Line<'static> {
     ))
 }
 
-pub(crate) fn kv(key: &str, value: &str) -> Line<'static> {
+fn kv(key: &str, value: &str) -> Line<'static> {
     Line::from(vec![
         Span::styled(format!("  {key} "), Style::new().fg(DIM)),
         Span::styled(value.to_string(), Style::new().fg(Color::White)),
@@ -1112,7 +1112,7 @@ fn log_line(warn: bool, text: &str) -> Line<'static> {
 /// Greedy word wrap by char count: `head` starts row one, `cont` starts every
 /// continuation row; no row exceeds `width` chars. Words longer than a row's
 /// content width hard-split; empty text still yields the head row.
-fn head_wrap(head: &str, cont: &str, text: &str, width: usize) -> Vec<String> {
+pub(crate) fn head_wrap(head: &str, cont: &str, text: &str, width: usize) -> Vec<String> {
     // content width clamps to 1 so a pathologically narrow area cannot stall
     let content = |prefix: &str| width.saturating_sub(prefix.chars().count()).max(1);
     let mut rows: Vec<String> = Vec::new();

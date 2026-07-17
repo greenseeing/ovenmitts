@@ -14,7 +14,7 @@ use ratatui::{DefaultTerminal, Frame};
 use crate::config::Config;
 use crate::plan::{build_plan, container_heuristic, human_bytes, MediaInfo, Payload, PlanInput};
 use crate::tools::Tools;
-use crate::tui::{app_title, body_block, kv, pad, ACCENT, DIM, ERR, OK, WARN};
+use crate::tui::{app_title, body_block, head_wrap, pad, ACCENT, DIM, ERR, OK, WARN};
 
 /// Interactive payload picker for bare `ovenmitts`: browse from `start`,
 /// checkbox-select files/directories, fuzzy-filter within the current
@@ -401,10 +401,30 @@ impl Picker {
     // -- rendering ---------------------------------------------------------
 
     fn render(&self, frame: &mut Frame) {
-        let [header, body, footer] = Layout::vertical([
+        let width = frame.area().width as usize;
+        let hints = wrapped(
+            self.footer_hint(),
+            "",
+            "",
+            Style::new().fg(DIM),
+            width.saturating_sub(2),
+        );
+        let table = self.selection_rows(width.saturating_sub(4));
+        // the browser keeps at least 8 rows; the table yields on tiny windows
+        let table_h = match table.len() {
+            0 => 0,
+            n => ((n + 2) as u16).min(
+                frame
+                    .area()
+                    .height
+                    .saturating_sub(2 + 8 + hints.len() as u16),
+            ),
+        };
+        let [header, body, sel, footer] = Layout::vertical([
             Constraint::Length(2),
             Constraint::Fill(1),
-            Constraint::Length(1),
+            Constraint::Length(table_h),
+            Constraint::Length(hints.len() as u16),
         ])
         .areas(frame.area());
         frame.render_widget(Paragraph::new(app_title()), pad(header));
@@ -414,10 +434,25 @@ impl Picker {
         let inner = block.inner(pad(body));
         frame.render_widget(block, pad(body));
 
-        let mut lines: Vec<Line> = vec![self.media_line(), self.fit_line(), Line::from("")];
+        let w = inner.width as usize;
+        let mut lines: Vec<Line> = Vec::new();
+        lines.extend(self.media_lines(w));
+        lines.extend(self.fit_lines(w));
+        lines.push(Line::from(""));
+        let status_lines = match &self.status {
+            None => Vec::new(),
+            Some((warn, msg)) => {
+                let (head, color) = if *warn {
+                    ("  ! ", WARN)
+                } else {
+                    ("  · ", Color::Gray)
+                };
+                wrapped(msg, head, "    ", Style::new().fg(color), w)
+            }
+        };
         let fixed = lines.len()
             + usize::from(self.filtering || !self.filter.is_empty())
-            + usize::from(self.status.is_some());
+            + status_lines.len();
         let room = (inner.height as usize).saturating_sub(fixed).max(1);
         let start = (self.cursor + 1).saturating_sub(room);
         if self.visible.is_empty() {
@@ -427,11 +462,7 @@ impl Picker {
             )));
         }
         for (row, &idx) in self.visible.iter().enumerate().skip(start).take(room) {
-            lines.push(self.entry_line(
-                row == self.cursor,
-                &self.entries[idx],
-                inner.width as usize,
-            ));
+            lines.push(self.entry_line(row == self.cursor, &self.entries[idx], w));
         }
         if self.filtering || !self.filter.is_empty() {
             let style = if self.filtering {
@@ -445,48 +476,52 @@ impl Picker {
                 style,
             )));
         }
-        if let Some((warn, msg)) = &self.status {
-            let (head, color) = if *warn {
-                ("!", WARN)
-            } else {
-                ("·", Color::Gray)
-            };
-            lines.push(Line::from(Span::styled(
-                format!("  {head} {msg}"),
-                Style::new().fg(color),
-            )));
-        }
+        lines.extend(status_lines);
         frame.render_widget(Paragraph::new(lines), inner);
 
-        frame.render_widget(
-            Paragraph::new(Span::styled(self.footer_hint(), Style::new().fg(DIM))),
-            pad(footer),
-        );
-    }
-
-    fn media_line(&self) -> Line<'static> {
-        match &self.probe {
-            Probe::Pending => kv("media", "probing drive…"),
-            Probe::Assumed(_) => kv("media", "no disc detected · assuming a blank BD-R 25"),
-            Probe::Found(m) => kv(
-                "media",
-                &format!("{} · {} free", m.kind.label(), human_bytes(m.free_bytes)),
-            ),
+        if table_h > 0 {
+            let sel_block = body_block("Selected");
+            let sel_inner = sel_block.inner(pad(sel));
+            frame.render_widget(sel_block, pad(sel));
+            frame.render_widget(Paragraph::new(table), sel_inner);
         }
+
+        frame.render_widget(Paragraph::new(hints), pad(footer));
     }
 
-    fn fit_line(&self) -> Line<'static> {
+    fn media_lines(&self, width: usize) -> Vec<Line<'static>> {
+        let (text, style) = match &self.probe {
+            Probe::Pending => ("probing drive…".to_string(), Style::new().fg(DIM)),
+            Probe::Assumed(_) => (
+                "no disc detected · assuming a blank BD-R 25".to_string(),
+                Style::new().fg(DIM),
+            ),
+            Probe::Found(m) => (
+                format!("{} · {} free", m.kind.label(), human_bytes(m.free_bytes)),
+                Style::new().fg(Color::White),
+            ),
+        };
+        wrapped(&text, "  ", "    ", style, width)
+    }
+
+    fn fit_lines(&self, width: usize) -> Vec<Line<'static>> {
         if self.selected.is_empty() {
-            return Line::from(Span::styled("  nothing selected", Style::new().fg(DIM)));
+            return wrapped(
+                "nothing selected",
+                "  ",
+                "    ",
+                Style::new().fg(DIM),
+                width,
+            );
         }
         let n = self.selected.len();
-        match self.fit_plan() {
+        let (text, style) = match self.fit_plan() {
             None => {
                 let total: u64 = self.selected.values().map(|s| s.payload.total_size).sum();
-                Line::from(Span::styled(
-                    format!("  {n} selected · {}", human_bytes(total)),
+                (
+                    format!("{n} selected · {}", human_bytes(total)),
                     Style::new().fg(Color::White),
-                ))
+                )
             }
             Some(plan) => {
                 let (verdict, color) = if plan.fits {
@@ -494,17 +529,54 @@ impl Picker {
                 } else {
                     ("over budget", ERR)
                 };
-                Line::from(Span::styled(
+                (
                     format!(
-                        "  {n} selected · {} · est {} of {} — {verdict}",
+                        "{n} selected · {} · est {} of {} — {verdict}",
                         human_bytes(plan.payload_bytes),
                         human_bytes(plan.total_bytes_est),
                         human_bytes(plan.budget),
                     ),
                     Style::new().fg(color),
-                ))
+                )
             }
+        };
+        wrapped(&text, "  ", "    ", style, width)
+    }
+
+    /// Bottom table of the selection: full path, payload bytes, share of the
+    /// disc budget. One row per payload, oldest-path order (BTreeMap).
+    fn selection_rows(&self, width: usize) -> Vec<Line<'static>> {
+        if self.selected.is_empty() {
+            return Vec::new();
         }
+        const MAX_ROWS: usize = 8;
+        let budget = self.fit_plan().map(|p| p.budget).filter(|b| *b > 0);
+        let meta_w = "  0000.00 GiB  00.0%".chars().count();
+        let path_w = width.saturating_sub(meta_w + 2).max(8);
+        let mut lines = vec![Line::from(Span::styled(
+            format!("  {:<path_w$}  {:>10}  {:>5}", "path", "size", "used"),
+            Style::new().fg(DIM),
+        ))];
+        for s in self.selected.values().take(MAX_ROWS) {
+            let size = human_bytes(s.payload.total_size);
+            let pct = match budget {
+                Some(b) => format!("{:.1}%", 100.0 * s.payload.total_size as f64 / b as f64),
+                None => "—".into(),
+            };
+            let path = tail_fit(&display_dir(&s.payload.root), path_w);
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {path:<path_w$}"), Style::new().fg(Color::White)),
+                Span::styled(format!("  {size:>10}  {pct:>5}"), Style::new().fg(DIM)),
+            ]));
+        }
+        let extra = self.selected.len().saturating_sub(MAX_ROWS);
+        if extra > 0 {
+            lines.push(Line::from(Span::styled(
+                format!("  … and {extra} more"),
+                Style::new().fg(DIM),
+            )));
+        }
+        lines
     }
 
     fn entry_line(&self, current: bool, e: &Entry, width: usize) -> Line<'static> {
@@ -635,6 +707,23 @@ fn fuzzy_match(query: &str, name: &str) -> Option<u32> {
         pos = at + 1;
     }
     Some((gaps * 16 + first * 2 + hay.len() / 8) as u32)
+}
+
+fn wrapped(text: &str, head: &str, cont: &str, style: Style, width: usize) -> Vec<Line<'static>> {
+    head_wrap(head, cont, text, width)
+        .into_iter()
+        .map(|row| Line::from(Span::styled(row, style)))
+        .collect()
+}
+
+/// Keep the tail of a long path: the leaf name matters more than the root.
+fn tail_fit(text: &str, width: usize) -> String {
+    let n = text.chars().count();
+    if n <= width {
+        return text.to_string();
+    }
+    let tail: String = text.chars().skip(n + 1 - width).collect();
+    format!("…{tail}")
 }
 
 fn display_dir(dir: &Path) -> String {
@@ -977,6 +1066,87 @@ mod tests {
         cursor_to(&mut p, "vault.hc");
         p.on_key(key(KeyCode::Char(' ')));
         assert!(p.fit_plan().unwrap().fits);
+    }
+
+    fn buffer_text(p: &Picker, width: u16, height: u16) -> String {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| p.render(f)).unwrap();
+        let mut text = String::new();
+        let buffer = terminal.backend().buffer();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                text.push_str(buffer[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        text
+    }
+
+    #[test]
+    fn tail_fit_keeps_the_leaf_end_of_long_paths() {
+        assert_eq!(tail_fit("short", 10), "short");
+        let cut = tail_fit("/very/long/path/to/vault.hc", 12);
+        assert_eq!(cut.chars().count(), 12);
+        assert!(cut.starts_with('…'));
+        assert!(cut.ends_with("vault.hc"));
+    }
+
+    #[test]
+    fn wrapped_splits_long_text_into_continuation_rows() {
+        let rows = wrapped(
+            "payload directory has no files and this message is long",
+            "  ! ",
+            "    ",
+            Style::new(),
+            24,
+        );
+        assert!(rows.len() > 1);
+        let first = format!("{}", rows[0]);
+        assert!(first.starts_with("  ! "), "{first}");
+    }
+
+    #[test]
+    fn selection_table_lists_path_size_and_budget_share() {
+        let dir = tree();
+        let mut p = picker(dir.path());
+        p.set_media(Some(bd25()));
+        cursor_to(&mut p, "vault.hc");
+        p.on_key(key(KeyCode::Char(' ')));
+        cursor_to(&mut p, "photos");
+        p.on_key(key(KeyCode::Char(' ')));
+        let text = buffer_text(&p, 100, 30);
+        assert!(text.contains("Selected"), "{text}");
+        assert!(text.contains("used"), "{text}");
+        assert!(text.contains("vault.hc"), "{text}");
+        assert!(text.contains("photos"), "{text}");
+        assert!(text.contains("4.00 KiB"), "{text}");
+        assert!(text.contains("0.0%"), "{text}");
+    }
+
+    #[test]
+    fn selection_table_share_is_dash_while_probing() {
+        let dir = tree();
+        let mut p = picker(dir.path());
+        cursor_to(&mut p, "vault.hc");
+        p.on_key(key(KeyCode::Char(' ')));
+        let rows = p.selection_rows(80);
+        let row = format!("{}", rows[1]);
+        assert!(row.contains("vault.hc"), "{row}");
+        assert!(row.contains('—'), "{row}");
+    }
+
+    #[test]
+    fn narrow_window_wraps_hints_and_status_instead_of_clipping() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("empty")).unwrap();
+        let mut p = picker(dir.path());
+        cursor_to(&mut p, "empty");
+        p.on_key(key(KeyCode::Char(' ')));
+        let text = buffer_text(&p, 44, 24);
+        let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(flat.contains("q cancel"), "{text}");
+        assert!(flat.contains("no files"), "{text}");
     }
 
     #[test]
