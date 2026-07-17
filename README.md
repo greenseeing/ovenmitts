@@ -97,11 +97,11 @@ ovenmitts plan ~/archive/vault.hc --media bd25
 
 Global flags: `--device <dev>`, `--config <path>`, `--no-tui`. When no device
 is given anywhere, `/dev/sr0` is tried first and, if it cannot be probed (no
-disc — or no such drive),
-`burn`/`burn-iso`/`info`/`plan` scan the other `/dev/sr*` drives — exactly one
-with a disc is auto-selected (announced in the output); more than one aborts
-with the list so you can pick with `--device`. `verify` and `check` never
-scan — they always use the configured device.
+disc — or no such drive), every subcommand scans the other `/dev/sr*` drives —
+exactly one with a disc is auto-selected (announced in the output); more than
+one aborts with the list so you can pick with `--device`. A mounted disc in a
+drive other than the configured one is invisible to the scan — pass
+`--device` for that case.
 
 `burn` flags: `--label` (A–Z 0–9 `_`, max 32 chars; default
 `ARCHIVE_YYYYMMDD`), `--speed`, `--redundancy` (par2 percent), `--staging`,

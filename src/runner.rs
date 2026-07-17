@@ -686,11 +686,13 @@ pub fn run_burn_iso(ctx: &RunnerCtx, iso: &Path, assume_yes: bool) -> Result<()>
 pub fn run_verify(ctx: &RunnerCtx, iso: Option<&Path>) -> Result<()> {
     with_failure(ctx, |stage| {
         let mut stages: Vec<(Stage, String)> = Vec::new();
-        let device = ctx.cfg.device.clone();
         let mut report_sha = None;
         let mut report_bytes = 0u64;
 
-        wait_ready(ctx, &device)?;
+        // probing needs exclusive access: unmount the configured drive first
+        // or an automounted disc would misroute resolution into the scan
+        verify::ensure_unmounted(&ctx.tools, &ctx.cfg.device)?;
+        let (device, _media) = resolve_device(ctx)?;
         verify::ensure_unmounted(&ctx.tools, &device)?;
 
         if let Some(iso) = iso {
@@ -796,10 +798,12 @@ pub fn run_verify(ctx: &RunnerCtx, iso: Option<&Path>) -> Result<()> {
 pub fn run_check(ctx: &RunnerCtx) -> Result<()> {
     with_failure(ctx, |stage| {
         let mut stages: Vec<(Stage, String)> = Vec::new();
-        let device = ctx.cfg.device.clone();
         *stage = Stage::CheckMedia;
         ctx.start(Stage::CheckMedia);
-        wait_ready(ctx, &device)?;
+        // probing needs exclusive access: unmount the configured drive first
+        // or an automounted disc would misroute resolution into the scan
+        verify::ensure_unmounted(&ctx.tools, &ctx.cfg.device)?;
+        let (device, _media) = resolve_device(ctx)?;
         verify::ensure_unmounted(&ctx.tools, &device)?;
         let clean = verify::check_media(&ctx.tools, &device, &mut |pct, line| {
             ctx.progress(Stage::CheckMedia, pct, line);
@@ -939,6 +943,14 @@ fn resolve_device_from(
     let configured = ctx.cfg.device.clone();
     let configured_err = match media::probe(&ctx.tools, &configured) {
         Ok(media) => return Ok((configured, media)),
+        // xorriso itself failed to launch: scanning with the same binary
+        // would fail identically and mask the real error
+        Err(e)
+            if e.chain()
+                .any(|c| c.downcast_ref::<std::io::Error>().is_some()) =>
+        {
+            return Err(e)
+        }
         Err(e) => e,
     };
     if ctx.cfg.device_explicit {
@@ -2335,6 +2347,36 @@ mod tests {
                 break;
             }
         }
+    }
+
+    #[test]
+    fn run_check_auto_detect_fails_fast_without_medium() {
+        let dir = tempfile::tempdir().unwrap();
+        let xorriso = dir.path().join("xorriso");
+        write_script(
+            &xorriso,
+            "#!/bin/sh\necho 'xorriso : FAILURE : Cannot acquire drive' >&2\nexit 1\n",
+        );
+        let tools = tools_with(xorriso, None, None, None);
+        let mut cfg = cfg_with(Path::new("/dev/sr9"), &dir.path().join("s"));
+        cfg.device_explicit = false;
+        let (ctx, rx, _ack) = ctx_pair(cfg, tools);
+        let start = std::time::Instant::now();
+        let err = run_check(&ctx).unwrap_err();
+        // the old code polled wait_ready for 180s before giving up
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(30),
+            "check must fail fast when no drive has a medium"
+        );
+        assert!(err.to_string().contains("probing"), "{err:#}");
+        let events: Vec<StageEvent> = rx.try_iter().collect();
+        assert!(matches!(
+            events.last(),
+            Some(StageEvent::Failed {
+                stage: Stage::CheckMedia,
+                ..
+            })
+        ));
     }
 
     #[test]

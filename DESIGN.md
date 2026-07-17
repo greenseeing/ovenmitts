@@ -146,9 +146,12 @@ Non-TTY or `--no-tui` → plain line output (same events).
 
 The configured device (`--device` / config `device`) is always used as-is.
 Only the built-in default `/dev/sr0` may be swapped: if it cannot be probed
-(no disc, or no such drive), `burn`/`burn-iso`/`info`/`plan` probe every
-`/dev/sr*` — one drive with media is auto-selected (announced in the event
-log), more than one refuses with the list (`plan` propagates that refusal
-instead of falling back to synthetic media). `verify`/`check` never scan:
-they operate on possibly-mounted discs where an exclusive-access probe could
-conflict with the mount.
+(no disc, or no such drive), every drive-touching subcommand
+(`burn`/`burn-iso`/`verify`/`check`/`info`/`plan`) probes every `/dev/sr*` —
+one drive with media is auto-selected (announced in the event log), more
+than one refuses with the list (`plan` propagates that refusal instead of
+falling back to synthetic media). Probing needs exclusive access, so
+`verify`/`check` unmount the configured device before resolving; a mounted
+disc sitting in a *different* drive is invisible to the scan — pass
+`--device` for that case. `check`/`verify` fail fast when no drive has a
+readable medium instead of polling for one.

@@ -7,7 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `check` and `verify` fail fast when no drive has a readable medium instead
+  of polling up to 180 s for one.
+
 ### Fixed
+
+- `check` and `verify` now auto-detect the drive like every other subcommand
+  (previously they used the configured/default device verbatim, so a machine
+  whose burner is not `/dev/sr0` always errored without `--device`).
 
 - TUI run screen: long warning/info lines in the event log now word-wrap
   (with the newest lines kept visible) instead of being clipped at the right
