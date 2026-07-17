@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
-use std::io::Read;
-use std::path::Path;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 
@@ -27,6 +27,7 @@ pub fn format_defect_management(
 
 /// Burn: `xorriso -as cdrecord -v dev=<dev> [speed=<n>] fs=64m blank=as_needed -eject <iso>`.
 /// Unformatted BD-R = stream recording at full speed (research decision #3).
+/// The full xorriso transcript tees to `burn_log_path(iso)`, best effort.
 pub fn burn_iso(
     tools: &Tools,
     device: &str,
@@ -38,9 +39,18 @@ pub fn burn_iso(
         .with_context(|| format!("stat ISO {}", iso.display()))?
         .len();
     let args = burn_args(device, iso, speed);
+    let mut log = std::fs::File::create(burn_log_path(iso)).ok();
     run_streaming(&tools.xorriso, &args, &mut |line| {
+        if let Some(f) = log.as_mut() {
+            let _ = writeln!(f, "{line}");
+        }
         forward(line, total_bytes, cb)
     })
+}
+
+/// Where the burn transcript lands: next to the ISO, `<stem>.burn.log`.
+pub fn burn_log_path(iso: &Path) -> PathBuf {
+    iso.with_extension("burn.log")
 }
 
 fn forward(line: &str, total_bytes: u64, cb: &mut dyn FnMut(Option<f32>, String)) {
@@ -124,6 +134,27 @@ fn pct_token(t: &str) -> Option<f32> {
 
 const STDERR_TAIL: usize = 12;
 
+// xorriso keeps emitting UPDATE keepalives to stderr while aborting; without
+// severity filtering they bury (or evict) the FATAL/FAILURE cause.
+fn is_diagnostic(line: &str) -> bool {
+    [
+        " FATAL : ",
+        " FAILURE : ",
+        " SORRY : ",
+        " ABORT : ",
+        " : aborting :",
+    ]
+    .iter()
+    .any(|needle| line.contains(needle))
+}
+
+fn push_capped(buf: &mut VecDeque<String>, line: String) {
+    if buf.len() == STDERR_TAIL {
+        buf.pop_front();
+    }
+    buf.push_back(line);
+}
+
 // Live child PIDs of long-running external tools, so an interactive
 // force-quit can terminate them instead of orphaning a burn in progress.
 static ACTIVE_CHILDREN: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
@@ -174,12 +205,13 @@ pub(crate) fn run_streaming(
     let t_err = std::thread::spawn(move || pump(stderr, true, tx_err));
 
     let mut tail: VecDeque<String> = VecDeque::with_capacity(STDERR_TAIL);
+    let mut diags: VecDeque<String> = VecDeque::with_capacity(STDERR_TAIL);
     for (is_err, line) in rx {
         if is_err {
-            if tail.len() == STDERR_TAIL {
-                tail.pop_front();
+            if is_diagnostic(&line) {
+                push_capped(&mut diags, line.clone());
             }
-            tail.push_back(line.clone());
+            push_capped(&mut tail, line.clone());
         }
         on_line(&line);
     }
@@ -189,8 +221,8 @@ pub(crate) fn run_streaming(
         .wait()
         .with_context(|| format!("wait for {}", bin.display()))?;
     if !status.success() {
-        let tail: Vec<String> = tail.into();
-        bail!("{} failed ({status}):\n{}", bin.display(), tail.join("\n"));
+        let lines: Vec<String> = if diags.is_empty() { tail } else { diags }.into();
+        bail!("{} failed ({status}): {}", bin.display(), lines.join("\n"));
     }
     Ok(())
 }
@@ -402,6 +434,76 @@ mod tests {
         assert!(events
             .iter()
             .any(|(p, l)| p.is_none() && l.contains("completed successfully")));
+        let log = std::fs::read_to_string(burn_log_path(&iso)).unwrap();
+        assert!(log.contains("completed successfully"), "{log}");
+    }
+
+    #[test]
+    fn burn_iso_failure_leads_with_diagnostic() {
+        let dir = tempfile::tempdir().unwrap();
+        let iso = dir.path().join("v.iso");
+        std::fs::write(&iso, b"x").unwrap();
+        // real Verbatim-43887 failure shape: keepalives precede the diagnostics
+        let script = "#!/bin/sh\n\
+                      i=267\n\
+                      while [ $i -le 273 ]; do\n\
+                        echo \"xorriso : UPDATE : Thank you for being patient. Working since $i seconds.\" >&2\n\
+                        i=$((i+1))\n\
+                      done\n\
+                      echo 'xorriso : FAILURE : libburn indicates failure with writing.' >&2\n\
+                      echo \"xorriso : NOTE : Gave up -outdev ''\" >&2\n\
+                      echo \"xorriso : NOTE : Giving up for -eject whole -dev ''\" >&2\n\
+                      echo 'xorriso : FAILURE : -as cdrecord: Job could not be performed properly.' >&2\n\
+                      echo \"xorriso : aborting : -abort_on 'FAILURE' encountered 'FATAL'\" >&2\n\
+                      exit 5\n";
+        let tools = fake_tools(script, dir.path());
+        let err = burn_iso(&tools, "/dev/sr0", &iso, None, &mut |_, _| {}).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.lines().next().unwrap().contains(" FAILURE : "), "{msg}");
+        assert!(msg.contains("aborting"), "{msg}");
+        assert!(!msg.contains("patient"), "{msg}");
+        let log = std::fs::read_to_string(burn_log_path(&iso)).unwrap();
+        assert!(log.contains("Working since 273 seconds"), "{log}");
+        assert!(
+            log.contains("libburn indicates failure with writing"),
+            "{log}"
+        );
+    }
+
+    #[test]
+    fn burn_iso_failure_survives_trailing_noise() {
+        let dir = tempfile::tempdir().unwrap();
+        let iso = dir.path().join("v.iso");
+        std::fs::write(&iso, b"x").unwrap();
+        let script = "#!/bin/sh\n\
+                      echo 'libburn : FATAL : SCSI error on write(2048,16): [3 0C 00] Medium error.' >&2\n\
+                      i=0\n\
+                      while [ $i -lt 14 ]; do\n\
+                        echo 'xorriso : UPDATE : Thank you for being patient.' >&2\n\
+                        i=$((i+1))\n\
+                      done\n\
+                      exit 5\n";
+        let tools = fake_tools(script, dir.path());
+        let err = burn_iso(&tools, "/dev/sr0", &iso, None, &mut |_, _| {}).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("Medium error"), "{msg}");
+        assert!(!msg.contains("patient"), "{msg}");
+    }
+
+    #[test]
+    fn burn_iso_failure_falls_back_to_raw_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let iso = dir.path().join("v.iso");
+        std::fs::write(&iso, b"x").unwrap();
+        let script = "#!/bin/sh\n\
+                      echo 'something went sideways' >&2\n\
+                      echo 'no severity markers here' >&2\n\
+                      exit 1\n";
+        let tools = fake_tools(script, dir.path());
+        let err = burn_iso(&tools, "/dev/sr0", &iso, None, &mut |_, _| {}).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("something went sideways"), "{msg}");
+        assert!(msg.contains("no severity markers here"), "{msg}");
     }
 
     #[test]

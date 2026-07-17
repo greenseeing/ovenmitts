@@ -7,11 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Every burn tees the full xorriso transcript to `<label>.burn.log` next to
+  the staged ISO, so a failed burn stays diagnosable after the run.
+- A failed burn prints the transcript path and, in the full pipeline, the
+  `ovenmitts burn-iso` retry hint (the staged ISO survives the failure).
+
 ### Changed
 
 - `check` on a blank disc now refuses immediately with "medium is blank -
   nothing to check yet" instead of surfacing a cryptic xorriso error (or,
   on 0.1.0, polling 180 s for a readable sector that a blank disc never has).
+
+### Fixed
+
+- Burn, format and master failures now report xorriso's diagnostic lines
+  (`FAILURE`/`FATAL`/`SORRY`/`aborting`) instead of the raw stderr tail,
+  where "Thank you for being patient" keepalives could bury or evict the
+  actual cause.
 
 ## [0.1.1] - 2026-07-17
 

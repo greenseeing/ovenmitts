@@ -41,6 +41,7 @@ impl Harness {
         let device = dir.path().join("fake-device");
         std::env::set_var("OVENMITTS_FAKE_DEVICE", &device);
         std::env::remove_var("OVENMITTS_FAKE_MOUNT");
+        std::env::remove_var("OVENMITTS_FAKE_BURN_FAIL");
         let staging = dir.path().join("staging");
         Self {
             _env: guard,
@@ -190,6 +191,47 @@ const BURN_STAGES: [Stage; 7] = [
     Stage::VerifyImage,
     Stage::VerifyFiles,
 ];
+
+#[test]
+fn burn_failure_reports_cause_and_retry_hint() {
+    let h = Harness::new();
+    std::env::set_var("OVENMITTS_FAKE_BURN_FAIL", "1");
+    let payload = h.payload("vault.hc", 8 * 1024 * 1024, 42);
+    let stage_dir = h.stage_dir("PIPE");
+    let iso = stage_dir.join("PIPE.iso");
+    h.set_mount_for(&iso);
+
+    let (ctx, rx, _ack) = h.ctx();
+    let err = runner::run_burn(&ctx, &burn_request(vec![payload], "PIPE")).unwrap_err();
+    std::env::remove_var("OVENMITTS_FAKE_BURN_FAIL");
+    let events = drain(ctx, rx);
+
+    assert!(format!("{err:#}").contains("libburn indicates failure"));
+    let Some(StageEvent::Failed { stage, error }) = events.last() else {
+        panic!("expected Failed last, got {:?}", events.last());
+    };
+    assert_eq!(*stage, Stage::Burn);
+    assert!(error.contains("libburn indicates failure"), "{error}");
+    assert!(!error.contains("patient"), "{error}");
+
+    let infos: Vec<&String> = events
+        .iter()
+        .filter_map(|ev| match ev {
+            StageEvent::Info(t) => Some(t),
+            _ => None,
+        })
+        .collect();
+    assert!(infos
+        .iter()
+        .any(|t| t.contains("burn transcript") && t.contains("PIPE.burn.log")));
+    assert!(infos
+        .iter()
+        .any(|t| t.contains(&format!("burn-iso {}", iso.display()))));
+
+    let log = std::fs::read_to_string(stage_dir.join("PIPE.burn.log")).unwrap();
+    assert!(log.contains("patient"), "transcript must keep keepalives");
+    assert!(log.contains("libburn indicates failure with writing"));
+}
 
 #[test]
 fn burn_pipeline_end_to_end() {

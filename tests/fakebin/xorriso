@@ -69,6 +69,20 @@ if [ "${1:-}" = "-as" ] && [ "${2:-}" = "cdrecord" ]; then
         echo "fake xorriso: -as cdrecord needs dev= and an ISO argument" >&2
         exit 2
     fi
+    if [ -n "${OVENMITTS_FAKE_BURN_FAIL:-}" ]; then
+        # real Verbatim-43887 failure transcript shape: keepalives, then cause
+        i=267
+        while [ "$i" -le 273 ]; do
+            printf 'xorriso : UPDATE : Thank you for being patient. Working since %s seconds.\n' "$i" >&2
+            i=$((i+1))
+        done
+        printf 'xorriso : FAILURE : libburn indicates failure with writing.\n' >&2
+        printf "xorriso : NOTE : Gave up -outdev ''\n" >&2
+        printf "xorriso : NOTE : Giving up for -eject whole -dev ''\n" >&2
+        printf 'xorriso : FAILURE : -as cdrecord: Job could not be performed properly.\n' >&2
+        printf "xorriso : aborting : -abort_on 'FAILURE' encountered 'FATAL'\n" >&2
+        exit 5
+    fi
     cp "$iso" "$OVENMITTS_FAKE_DEVICE"
     printf 'xorriso : UPDATE :  4 of 8 MB written (fifo 97%%) [buf  94%%]   4.0x.\n' >&2
     printf 'xorriso : UPDATE : Writing:    4096s  100.0%%   fifo   0%%  buf  99%%  4.0xD\n' >&2

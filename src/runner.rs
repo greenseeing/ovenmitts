@@ -501,6 +501,16 @@ fn burn_pipeline(ctx: &RunnerCtx, req: &BurnRequest, stage: &mut Stage) -> Resul
     ctx.start(Stage::Burn);
     burn::burn_iso(&ctx.tools, &device, &iso, params.speed, &mut |pct, line| {
         ctx.progress(Stage::Burn, pct, line);
+    })
+    .inspect_err(|_| {
+        ctx.info(format!(
+            "burn transcript: {}",
+            burn::burn_log_path(&iso).display()
+        ));
+        ctx.info(format!(
+            "staged ISO survives - insert a fresh disc and retry: ovenmitts burn-iso {}",
+            iso.display()
+        ));
     })?;
     ctx.done(
         &mut stages,
@@ -652,6 +662,12 @@ pub fn run_burn_iso(ctx: &RunnerCtx, iso: &Path, assume_yes: bool) -> Result<()>
         ctx.start(Stage::Burn);
         burn::burn_iso(&ctx.tools, &device, iso, ctx.cfg.speed, &mut |pct, line| {
             ctx.progress(Stage::Burn, pct, line);
+        })
+        .inspect_err(|_| {
+            ctx.info(format!(
+                "burn transcript: {}",
+                burn::burn_log_path(iso).display()
+            ));
         })?;
         ctx.done(
             &mut stages,
