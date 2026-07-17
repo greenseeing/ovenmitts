@@ -5,6 +5,20 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- TUI burn confirmation now guards against type-ahead: Enter typed before the
+  confirm prompt renders (shell autorepeat at launch or double-tapped from the
+  picker) no longer answers the prompt. Proceed is ignored until the prompt has
+  been visible for ≥500 ms; Abort (q/Esc) is never delayed. First render of the
+  prompt is tracked (later prompts in the amend loop are unaffected, arming
+  happens once). Input queue is flushed at TUI start and picker start, and again
+  when the first prompt renders. DESIGN.md TUI section documents the arming
+  contract. Tests: 3 new (Enter ignored before/within arm delay; abort works
+  unarmed); 226 total pass, clippy/fmt clean.
+
 ## [0.1.5] - 2026-07-18
 
 ### Added

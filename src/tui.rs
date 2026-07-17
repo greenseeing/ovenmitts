@@ -23,6 +23,10 @@ pub(crate) const ERR: Color = Color::Red;
 pub(crate) const DIM: Color = Color::DarkGray;
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const LOG_CAP: usize = 200;
+/// A burn confirm must be a deliberate keypress on a prompt the user has
+/// seen: Proceed is ignored until the prompt has been on screen this long
+/// (type-ahead Enter — double-tap, held key — must never answer it).
+const ACK_ARM_DELAY: Duration = Duration::from_millis(500);
 
 const STAGE_ORDER: [Stage; 9] = [
     Stage::Preflight,
@@ -55,6 +59,9 @@ pub fn run(cfg: Config, tools: Tools, req: BurnRequest) -> Result<()> {
     let worker = std::thread::spawn(move || runner::run_burn(&ctx, &req));
 
     let mut terminal = ratatui::init();
+    // keys queued before this screen existed (shell autorepeat, the picker's
+    // confirm Enter) must not leak into the wizard
+    flush_input();
     let mut app = App::new(cfg, payloads, params, ack_tx);
     let loop_result = app.event_loop(&mut terminal, &rx);
     ratatui::restore();
@@ -183,6 +190,10 @@ struct App {
     current: Option<(Stage, String)>,
     log: EventLog,
     pending_ack: Option<String>,
+    /// First render instant of the first prompt; Proceed stays dead before
+    /// it and for ACK_ARM_DELAY after it. Never reset: later prompts belong
+    /// to a user already at the screen.
+    ack_shown: Option<Instant>,
     report: Option<RunReport>,
     failure: Option<String>,
     aborted: bool,
@@ -222,6 +233,7 @@ impl App {
             current: None,
             log: EventLog::new(),
             pending_ack: None,
+            ack_shown: None,
             report: None,
             failure: None,
             aborted: false,
@@ -245,6 +257,10 @@ impl App {
         while !self.quit {
             self.drain(rx);
             terminal.draw(|frame| self.render(frame))?;
+            if self.pending_ack.is_some() && self.ack_shown.is_none() {
+                self.ack_shown = Some(Instant::now());
+                flush_input();
+            }
             if event::poll(Duration::from_millis(100))? {
                 if let Event::Key(key) = event::read()? {
                     if key.kind == KeyEventKind::Press {
@@ -383,7 +399,8 @@ impl App {
         }
         if self.pending_ack.is_some() {
             match key.code {
-                KeyCode::Enter => self.answer(Ack::Proceed),
+                KeyCode::Enter if self.ack_ready() => self.answer(Ack::Proceed),
+                // aborting is the safe direction: never delayed
                 KeyCode::Char('q') | KeyCode::Esc => self.answer(Ack::Abort),
                 _ => {}
             }
@@ -556,6 +573,11 @@ impl App {
         } else {
             self.edit_dirty = true;
         }
+    }
+
+    fn ack_ready(&self) -> bool {
+        self.ack_shown
+            .is_some_and(|shown| shown.elapsed() >= ACK_ARM_DELAY)
     }
 
     fn answer(&mut self, ack: Ack) {
@@ -1177,6 +1199,19 @@ fn log_row(warn: bool, row: String) -> Line<'static> {
     Line::from(Span::styled(row, style))
 }
 
+/// Discard queued terminal input. Bounded so a pathological stream cannot
+/// stall the UI; errors are moot (no input to flush is the goal state).
+pub(crate) fn flush_input() {
+    for _ in 0..1024 {
+        match event::poll(Duration::ZERO) {
+            Ok(true) => {
+                let _ = event::read();
+            }
+            _ => break,
+        }
+    }
+}
+
 pub(crate) fn pad(area: Rect) -> Rect {
     Rect {
         x: area.x + 1,
@@ -1241,10 +1276,13 @@ mod tests {
         )
     }
 
+    /// Prompt applied AND rendered long enough ago that Proceed is live —
+    /// the state every pre-existing ack test assumes.
     fn need_ack(app: &mut App) {
         app.apply(StageEvent::NeedAck {
             prompt: "burn?".into(),
         });
+        app.ack_shown = Some(Instant::now() - ACK_ARM_DELAY);
     }
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -1291,6 +1329,50 @@ mod tests {
             plan,
             params: sample_params(),
         }
+    }
+
+    #[test]
+    fn ack_enter_ignored_before_prompt_is_rendered() {
+        let (mut app, ack_rx) = test_app();
+        app.apply(plan_event());
+        app.apply(StageEvent::NeedAck {
+            prompt: "burn?".into(),
+        });
+        // type-ahead: no render has armed the prompt yet
+        app.on_key(key(KeyCode::Enter));
+        assert!(ack_rx.try_recv().is_err(), "stale Enter must not proceed");
+        assert!(app.pending_ack.is_some());
+        assert_eq!(app.screen, Screen::Plan);
+    }
+
+    #[test]
+    fn ack_enter_ignored_within_arm_delay_then_accepted() {
+        let (mut app, ack_rx) = test_app();
+        app.apply(plan_event());
+        app.apply(StageEvent::NeedAck {
+            prompt: "burn?".into(),
+        });
+        app.ack_shown = Some(Instant::now());
+        app.on_key(key(KeyCode::Enter));
+        assert!(
+            ack_rx.try_recv().is_err(),
+            "Enter inside the arm delay must not proceed"
+        );
+        app.ack_shown = Some(Instant::now() - ACK_ARM_DELAY);
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(ack_rx.try_recv().unwrap(), Ack::Proceed);
+        assert_eq!(app.screen, Screen::Run);
+    }
+
+    #[test]
+    fn ack_abort_works_even_before_arming() {
+        let (mut app, ack_rx) = test_app();
+        app.apply(plan_event());
+        app.apply(StageEvent::NeedAck {
+            prompt: "burn?".into(),
+        });
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(ack_rx.try_recv().unwrap(), Ack::Abort);
     }
 
     #[test]
@@ -1359,6 +1441,7 @@ mod tests {
         app.apply(StageEvent::NeedAck {
             prompt: "burn now?".into(),
         });
+        app.ack_shown = Some(Instant::now() - ACK_ARM_DELAY);
         assert_eq!(app.screen, Screen::Plan);
         app.on_key(key(KeyCode::Enter));
         assert_eq!(ack_rx.try_recv().unwrap(), Ack::Proceed);
@@ -1372,6 +1455,7 @@ mod tests {
         app.apply(StageEvent::NeedAck {
             prompt: "insert a disc".into(),
         });
+        app.ack_shown = Some(Instant::now() - ACK_ARM_DELAY);
         app.on_key(key(KeyCode::Enter));
         assert_eq!(ack_rx.try_recv().unwrap(), Ack::Proceed);
         assert_eq!(app.screen, Screen::Plan);

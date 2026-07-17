@@ -175,7 +175,12 @@ both sides: at most one ack per `NeedAck`, and everything the pipeline consumes
    select row, ←→/hl adjust or cycle, Space toggle, `e` inline edit for
    label/speed (Enter commits, Esc cancels), Enter burn (disabled while the
    plan does not fit), q/Esc abort. Every edit goes through the runner's amend
-   loop; the screen only ever shows runner-computed plans.
+   loop; the screen only ever shows runner-computed plans. Confirm arming:
+   type-ahead is flushed at TUI start and when the first prompt renders, and
+   Proceed is ignored until that prompt has been on screen ≥500 ms — a burn
+   confirm must be a deliberate keypress on a prompt the user has seen
+   (double-tapped/held Enter from the picker or shell must never answer it).
+   Abort (q/Esc) is never delayed.
 2. Run: per-stage progress gauges (parity/checksums/master/burn/verify1/verify2),
    scrolling event log, elapsed time. Parameters are locked once the run starts.
 3. Report: per-stage result, hashes, next-step reminders (second copy,

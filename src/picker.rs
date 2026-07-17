@@ -14,7 +14,7 @@ use ratatui::{DefaultTerminal, Frame};
 use crate::config::Config;
 use crate::plan::{build_plan, container_heuristic, human_bytes, MediaInfo, Payload, PlanInput};
 use crate::tools::Tools;
-use crate::tui::{app_title, body_block, head_wrap, pad, ACCENT, DIM, ERR, OK, WARN};
+use crate::tui::{app_title, body_block, flush_input, head_wrap, pad, ACCENT, DIM, ERR, OK, WARN};
 
 /// Interactive payload picker for bare `ovenmitts`: browse from `start`,
 /// checkbox-select files/directories, fuzzy-filter within the current
@@ -24,6 +24,7 @@ pub fn pick_payloads(cfg: &Config, tools: &Tools, start: PathBuf) -> Result<Opti
     let mut picker = Picker::new(cfg.clone(), start)?;
     let (probe, media_rx) = probe_in_background(cfg, tools);
     let mut terminal = ratatui::init();
+    flush_input();
     let loop_result = event_loop(&mut picker, &mut terminal, &media_rx);
     ratatui::restore();
     // the probe holds the drive exclusively; returning before it finishes
