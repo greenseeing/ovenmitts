@@ -198,18 +198,22 @@ fn hex(digest: &[u8]) -> String {
     digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// If the device is auto-mounted (udisks), unmount it before raw access.
-pub fn ensure_unmounted(tools: &Tools, device: &str) -> Result<()> {
+/// Mountpoint of the device (as given or canonicalized) per /proc/mounts.
+fn current_mountpoint(device: &str) -> Result<Option<String>> {
     let mounts = std::fs::read_to_string("/proc/mounts").context("reading /proc/mounts")?;
     let canonical = std::fs::canonicalize(device)
         .ok()
         .map(|p| p.display().to_string());
-    let hit = proc_mounts_mountpoint(&mounts, device).or_else(|| {
+    Ok(proc_mounts_mountpoint(&mounts, device).or_else(|| {
         canonical
             .as_deref()
             .and_then(|d| proc_mounts_mountpoint(&mounts, d))
-    });
-    let Some(mp) = hit else {
+    }))
+}
+
+/// If the device is auto-mounted (udisks), unmount it before raw access.
+pub fn ensure_unmounted(tools: &Tools, device: &str) -> Result<()> {
+    let Some(mp) = current_mountpoint(device)? else {
         return Ok(());
     };
     let Some(udisksctl) = &tools.udisksctl else {
@@ -263,8 +267,13 @@ fn unescape_proc_mounts(s: &str) -> String {
 }
 
 /// Mount read-only via udisksctl (no root); returns the mountpoint.
+/// Reuses an existing mount (GNOME auto-mounts the disc on insertion, and
+/// optical media mount read-only regardless).
 /// Errors with the manual `sudo mount -o ro` command when udisksctl is absent.
 pub fn mount_ro(tools: &Tools, device: &str) -> Result<PathBuf> {
+    if let Some(mp) = current_mountpoint(device)? {
+        return Ok(PathBuf::from(mp));
+    }
     let Some(udisksctl) = &tools.udisksctl else {
         bail!("udisksctl not found; mount manually: sudo mount -o ro {device} /mnt");
     };
@@ -281,6 +290,10 @@ pub fn mount_ro(tools: &Tools, device: &str) -> Result<PathBuf> {
             .output()
             .context("running udisksctl mount")?;
         if !plain.status.success() {
+            // the automounter may have won the race since the pre-check
+            if let Some(mp) = current_mountpoint(device)? {
+                return Ok(PathBuf::from(mp));
+            }
             bail!(
                 "udisksctl mount -b {device} failed: {}",
                 String::from_utf8_lossy(&plain.stderr).trim()
@@ -631,7 +644,26 @@ proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0
 
     #[test]
     fn mount_ro_errors_without_udisksctl() {
-        let err = mount_ro(&no_tools(), "/dev/sr0").unwrap_err();
+        // a path that can never appear in /proc/mounts, so the pre-check misses
+        let err = mount_ro(&no_tools(), "/dev/ovenmitts-test-nonexistent").unwrap_err();
         assert!(err.to_string().contains("sudo mount -o ro"));
+    }
+
+    #[test]
+    fn mount_ro_reuses_existing_mount_without_udisksctl() {
+        // anchor on the root mount: it cannot vanish between the snapshot here
+        // and mount_ro's own /proc/mounts read
+        let mounts = std::fs::read_to_string("/proc/mounts").unwrap();
+        let dev = mounts
+            .lines()
+            .find_map(|l| {
+                let mut f = l.split_ascii_whitespace();
+                let (dev, mp) = (f.next()?, f.next()?);
+                (mp == "/").then(|| dev.to_string())
+            })
+            .unwrap();
+        let expected = proc_mounts_mountpoint(&mounts, &dev).unwrap();
+        let got = mount_ro(&no_tools(), &dev).unwrap();
+        assert_eq!(got, PathBuf::from(expected));
     }
 }
