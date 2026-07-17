@@ -875,10 +875,18 @@ impl App {
         frame.render_widget(block, area);
 
         let stages = self.visible_stages();
+        let banner_rows = self
+            .failure
+            .as_deref()
+            .map(|msg| head_wrap("  ✗ ", "    ", msg, inner.width as usize))
+            .unwrap_or_default();
+        // cap 5: a huge error chain must not evict the log; main reprints the
+        // full error after the terminal is restored
+        let banner_h = banner_rows.len().clamp(1, 5) as u16;
         let mut constraints: Vec<Constraint> =
             stages.iter().map(|_| Constraint::Length(1)).collect();
         constraints.push(Constraint::Length(1)); // current detail
-        constraints.push(Constraint::Length(1)); // failure banner / spacer
+        constraints.push(Constraint::Length(banner_h)); // failure banner / spacer
         constraints.push(Constraint::Fill(1)); // log
         let rows = Layout::vertical(constraints).split(inner);
 
@@ -901,22 +909,25 @@ impl App {
         }
 
         let banner_area = rows[stages.len() + 1];
-        if let Some(msg) = &self.failure {
-            frame.render_widget(
-                Paragraph::new(Span::styled(
-                    format!("  ✗ {msg}"),
-                    Style::new().fg(ERR).add_modifier(Modifier::BOLD),
-                )),
-                banner_area,
-            );
+        if !banner_rows.is_empty() {
+            let lines: Vec<Line> = banner_rows
+                .into_iter()
+                .take(banner_area.height as usize)
+                .map(|row| {
+                    Line::from(Span::styled(
+                        row,
+                        Style::new().fg(ERR).add_modifier(Modifier::BOLD),
+                    ))
+                })
+                .collect();
+            frame.render_widget(Paragraph::new(lines), banner_area);
         }
 
         let log_area = rows[stages.len() + 2];
         let room = log_area.height as usize;
-        let lines: Vec<Line> = self
-            .log
-            .tail(room)
-            .map(|(warn, text)| log_line(*warn, text))
+        let lines: Vec<Line> = layout_log(self.log.tail(room), log_area.width as usize, room)
+            .into_iter()
+            .map(|(warn, row)| log_row(warn, row))
             .collect();
         frame.render_widget(Paragraph::new(lines), log_area);
     }
@@ -1093,6 +1104,74 @@ fn log_line(warn: bool, text: &str) -> Line<'static> {
             Style::new().fg(Color::Gray),
         ))
     }
+}
+
+/// Greedy word wrap by char count: `head` starts row one, `cont` starts every
+/// continuation row; no row exceeds `width` chars. Words longer than a row's
+/// content width hard-split; empty text still yields the head row.
+fn head_wrap(head: &str, cont: &str, text: &str, width: usize) -> Vec<String> {
+    // content width clamps to 1 so a pathologically narrow area cannot stall
+    let content = |prefix: &str| width.saturating_sub(prefix.chars().count()).max(1);
+    let mut rows: Vec<String> = Vec::new();
+    let mut line = String::from(head);
+    let mut left = content(head);
+    let mut bare = true;
+    for word in text.split_whitespace() {
+        let mut chars = word.chars().peekable();
+        while chars.peek().is_some() {
+            let len = chars.clone().count();
+            let need = if bare { len } else { len + 1 };
+            if need <= left {
+                if !bare {
+                    line.push(' ');
+                    left -= 1;
+                }
+                line.extend(chars.by_ref());
+                left -= len;
+                bare = false;
+            } else if bare {
+                for _ in 0..left {
+                    line.push(chars.next().unwrap());
+                }
+                rows.push(std::mem::replace(&mut line, String::from(cont)));
+                left = content(cont);
+            } else {
+                rows.push(std::mem::replace(&mut line, String::from(cont)));
+                left = content(cont);
+                bare = true;
+            }
+        }
+    }
+    rows.push(line);
+    rows
+}
+
+/// Pre-wrapped visual rows for the run-screen log, trimmed to the newest
+/// `room` rows so wrapping can never push the latest entries off-screen.
+fn layout_log<'a>(
+    entries: impl Iterator<Item = &'a (bool, String)>,
+    width: usize,
+    room: usize,
+) -> Vec<(bool, String)> {
+    let mut rows: Vec<(bool, String)> = Vec::new();
+    for (warn, text) in entries {
+        let head = if *warn { "  ! " } else { "  · " };
+        rows.extend(
+            head_wrap(head, "    ", text, width)
+                .into_iter()
+                .map(|r| (*warn, r)),
+        );
+    }
+    rows.split_off(rows.len().saturating_sub(room))
+}
+
+fn log_row(warn: bool, row: String) -> Line<'static> {
+    let style = if warn {
+        Style::new().fg(WARN)
+    } else {
+        Style::new().fg(Color::Gray)
+    };
+    Line::from(Span::styled(row, style))
 }
 
 fn pad(area: Rect) -> Rect {
@@ -1563,5 +1642,54 @@ mod tests {
             matches!(ack_rx.try_recv(), Err(TryRecvError::Empty)),
             "param keys must be inert once the run starts"
         );
+    }
+
+    #[test]
+    fn head_wrap_wraps_at_word_boundaries() {
+        let rows = head_wrap("  ! ", "    ", "organic dye lasts five years", 20);
+        assert_eq!(rows, vec!["  ! organic dye", "    lasts five years"]);
+        assert!(rows.iter().all(|r| r.chars().count() <= 20));
+    }
+
+    #[test]
+    fn head_wrap_hard_splits_overlong_word() {
+        let rows = head_wrap("  ! ", "    ", "abcdefghijklmnop", 10);
+        assert_eq!(rows, vec!["  ! abcdef", "    ghijkl", "    mnop"]);
+    }
+
+    #[test]
+    fn head_wrap_empty_text_yields_head_row() {
+        assert_eq!(head_wrap("  · ", "    ", "", 40), vec!["  · "]);
+    }
+
+    #[test]
+    fn head_wrap_survives_width_smaller_than_head() {
+        let rows = head_wrap("  ! ", "    ", "ab cd", 2);
+        assert!(!rows.is_empty());
+        assert!(rows.iter().map(|r| r.chars().count()).sum::<usize>() >= 4 + 4);
+    }
+
+    #[test]
+    fn layout_log_keeps_newest_rows_when_wrapping_overflows() {
+        let entries = [
+            (false, "one two three four five six seven".to_string()),
+            (true, "eight nine ten eleven twelve".to_string()),
+            (false, "final entry".to_string()),
+        ];
+        let rows = layout_log(entries.iter(), 16, 4);
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows.last().unwrap().1, "  · final entry");
+    }
+
+    #[test]
+    fn layout_log_indents_continuations_under_prefix() {
+        let entries = [(
+            true,
+            "a warning long enough to wrap onto more rows".to_string(),
+        )];
+        let rows = layout_log(entries.iter(), 20, 10);
+        assert!(rows.len() > 1);
+        assert!(rows[0].1.starts_with("  ! "));
+        assert!(rows[1..].iter().all(|(_, r)| r.starts_with("    ")));
     }
 }
