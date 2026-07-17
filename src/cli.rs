@@ -82,6 +82,8 @@ pub enum Command {
         #[arg(long)]
         save: bool,
     },
+    /// Update ovenmitts to the latest release (re-runs the installer)
+    Update,
     /// Capacity math without a disc: does the payload + parity fit?
     Plan {
         payloads: Vec<PathBuf>,
@@ -109,5 +111,12 @@ mod tests {
         assert!(matches!(cli.command, Some(Command::Check { save: true })));
         let cli = Cli::try_parse_from(["ovenmitts", "info"]).unwrap();
         assert!(matches!(cli.command, Some(Command::Info { save: false })));
+    }
+
+    #[test]
+    fn update_parses_as_a_subcommand_not_a_payload() {
+        let cli = Cli::try_parse_from(["ovenmitts", "update"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Update)));
+        assert!(cli.payloads.is_empty());
     }
 }

@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `ovenmitts update`: upgrade to the latest release by re-running the
+  published installer (checksum-verified; `OVENMITTS_VERSION` pins).
 - `ovenmitts info --save` and `ovenmitts check --save` write the
   auto-detected device to the config file (created if absent; comments,
   formatting and other keys survive).

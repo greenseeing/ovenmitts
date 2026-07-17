@@ -36,6 +36,11 @@ impl std::fmt::Display for AlreadyReported {
 }
 
 fn dispatch(cli: Cli) -> anyhow::Result<()> {
+    // the updater must run even when the config is broken or xorriso is
+    // missing — it is how both get fixed
+    if matches!(cli.command, Some(Command::Update)) {
+        return ovenmitts::update::run();
+    }
     let file_cfg = ovenmitts::config::load(cli.config.as_deref())?;
     let mut cfg = ovenmitts::config::Config::resolve(file_cfg)?;
     if let Some(dev) = &cli.device {
@@ -129,6 +134,7 @@ fn run_command(mut cfg: Config, cmd: Command, config_path: PathBuf) -> anyhow::R
         Command::Verify { iso } => drive(cfg, tools, move |ctx| {
             runner::run_verify(ctx, iso.as_deref())
         }),
+        Command::Update => unreachable!("handled in dispatch before config load"),
         Command::Check { save } => {
             let save_to = save.then_some(config_path);
             drive(cfg, tools, move |ctx| {

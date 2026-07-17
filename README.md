@@ -26,9 +26,10 @@ curl -fsSL https://codeberg.org/greenseer/ovenmitts/raw/branch/main/install.sh |
 The installer detects `apt`/`dnf`/`zypper`/`pacman`, installs the burn
 backends (xorriso required; par2, udisks2, eject recommended), and drops a
 single `ovenmitts` binary in place (verifying its published SHA-256 checksum
-first). **Re-run it any time to upgrade** — when the installed version already
-matches the latest release and the backends are present, it does nothing. To
-pin a version, set `OVENMITTS_VERSION=0.1.0` before the command.
+first). **To upgrade later, run `ovenmitts update`** — it re-runs this
+installer, which does nothing when the installed version already matches the
+latest release and the backends are present. To pin a version, set
+`OVENMITTS_VERSION=0.1.0` before either command.
 
 Or build from source:
 
@@ -96,6 +97,9 @@ ovenmitts info --save
 
 # Will it fit? No disc needed
 ovenmitts plan ~/archive/vault.hc --media bd25
+
+# Upgrade ovenmitts to the latest release
+ovenmitts update
 ```
 
 Global flags: `--device <dev>`, `--config <path>`, `--no-tui`. A `--device`

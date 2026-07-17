@@ -9,4 +9,5 @@ pub mod plan;
 pub mod runner;
 pub mod tools;
 pub mod tui;
+pub mod update;
 pub mod verify;
