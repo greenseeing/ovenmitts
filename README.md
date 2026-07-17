@@ -91,6 +91,9 @@ ovenmitts check
 # What is in the drive: type, capacity, formatted state, speeds, media ID
 ovenmitts info
 
+# Same, and remember the detected drive in the config file
+ovenmitts info --save
+
 # Will it fit? No disc needed
 ovenmitts plan ~/archive/vault.hc --media bd25
 ```
@@ -111,6 +114,8 @@ drive other than the configured one is invisible to the scan — pass
 keeps it for copy 2).
 
 `burn-iso` flags: `--speed`, `-y`/`--yes`.
+`check`/`info` flags: `--save` (write the auto-detected device to the config
+file; comments and other keys survive).
 `plan` flags: `--media` (`bd25` | `bd50` | `bd100` | `bd128` | `dvdr`; default
 `bd25` when no disc can be probed), `--redundancy`.
 
@@ -148,6 +153,7 @@ key forces either behavior.
 ## Configuration
 
 `~/.config/ovenmitts/config.toml` (or `$XDG_CONFIG_HOME/ovenmitts/config.toml`;
+`ovenmitts info --save` writes the auto-detected device here for you —
 override with `--config`). Every key is optional, unknown keys are rejected,
 CLI flags win over the file:
 

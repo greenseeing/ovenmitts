@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `ovenmitts info --save` and `ovenmitts check --save` write the
+  auto-detected device to the config file (created if absent; comments,
+  formatting and other keys survive).
+
 ### Changed
 
 - Line-mode output now uses one severity vocabulary: `info:` for

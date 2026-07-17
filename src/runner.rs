@@ -802,7 +802,7 @@ pub fn run_verify(ctx: &RunnerCtx, iso: Option<&Path>) -> Result<()> {
 }
 
 /// Source-free periodic health check (xorriso -check_media using MD5 tags).
-pub fn run_check(ctx: &RunnerCtx) -> Result<()> {
+pub fn run_check(ctx: &RunnerCtx, save_to: Option<&Path>) -> Result<()> {
     with_failure(ctx, |stage| {
         let mut stages: Vec<(Stage, String)> = Vec::new();
         *stage = Stage::CheckMedia;
@@ -811,6 +811,7 @@ pub fn run_check(ctx: &RunnerCtx) -> Result<()> {
         // or an automounted disc would misroute resolution into the scan
         verify::ensure_unmounted(&ctx.tools, &ctx.cfg.device)?;
         let (device, _media) = resolve_device(ctx)?;
+        save_device_if(ctx, save_to, &device)?;
         verify::ensure_unmounted(&ctx.tools, &device)?;
         let clean = verify::check_media(&ctx.tools, &device, &mut |pct, line| {
             ctx.progress(Stage::CheckMedia, pct, line);
@@ -831,9 +832,10 @@ pub fn run_check(ctx: &RunnerCtx) -> Result<()> {
 }
 
 /// Print media info to events.
-pub fn run_info(ctx: &RunnerCtx) -> Result<()> {
+pub fn run_info(ctx: &RunnerCtx, save_to: Option<&Path>) -> Result<()> {
     with_failure(ctx, |_stage| {
         let (device, media) = resolve_device(ctx)?;
+        save_device_if(ctx, save_to, &device)?;
         ctx.out(format!("device : {device}"));
         ctx.out(format!("profile: {}", media.profile));
         ctx.out(format!("type   : {}", media.kind.label()));
@@ -942,6 +944,16 @@ impl std::error::Error for AmbiguousDrives {}
 /// media wins, ambiguity refuses.
 fn resolve_device(ctx: &RunnerCtx) -> Result<(String, MediaInfo)> {
     resolve_device_from(ctx, media::list_drives)
+}
+
+/// --save support: persist the resolved device, loudly. A failed write is a
+/// stage failure — silently continuing would fake the persistence.
+fn save_device_if(ctx: &RunnerCtx, save_to: Option<&Path>, device: &str) -> Result<()> {
+    if let Some(path) = save_to {
+        crate::config::save_device(path, device)?;
+        ctx.info(format!("saved device = {device} to {}", path.display()));
+    }
+    Ok(())
 }
 
 fn resolve_device_from(
@@ -2342,7 +2354,7 @@ mod tests {
                 let tools = tools_with(xorriso, None, None, None);
                 let (ctx, rx, _ack) =
                     ctx_pair(cfg_with(&device, &dir.path().join("staging")), tools);
-                let res = run_check(&ctx);
+                let res = run_check(&ctx, None);
                 match (&res, want_clean) {
                     (Err(e), _) if is_busy(e) => continue,
                     (Ok(()), true) => {
@@ -2354,6 +2366,51 @@ mod tests {
                 }
                 break;
             }
+        }
+    }
+
+    #[test]
+    fn run_info_save_persists_resolved_device() {
+        loop {
+            let dir = tempfile::tempdir().unwrap();
+            let device = dir.path().join("device");
+            let xorriso = fake_xorriso(dir.path(), &device, CHECK_CLEAN_FIXTURE);
+            let tools = tools_with(xorriso, None, None, None);
+            let (ctx, rx, _ack) = ctx_pair(cfg_with(&device, &dir.path().join("staging")), tools);
+            let cfg_path = dir.path().join("cfg").join("config.toml");
+            match run_info(&ctx, Some(&cfg_path)) {
+                Err(e) if is_busy(&e) => continue,
+                Err(e) => panic!("{e:#}"),
+                Ok(()) => {}
+            }
+            let text = std::fs::read_to_string(&cfg_path).unwrap();
+            assert!(text.contains(&device.display().to_string()));
+            let events: Vec<StageEvent> = rx.try_iter().collect();
+            assert!(events
+                .iter()
+                .any(|ev| matches!(ev, StageEvent::Info(t) if t.contains("saved device"))));
+            return;
+        }
+    }
+
+    #[test]
+    fn run_check_save_persists_resolved_device() {
+        loop {
+            let dir = tempfile::tempdir().unwrap();
+            let device = dir.path().join("device");
+            std::fs::write(&device, vec![0u8; 4096]).unwrap();
+            let xorriso = fake_xorriso(dir.path(), &device, CHECK_CLEAN_FIXTURE);
+            let tools = tools_with(xorriso, None, None, None);
+            let (ctx, _rx, _ack) = ctx_pair(cfg_with(&device, &dir.path().join("staging")), tools);
+            let cfg_path = dir.path().join("config.toml");
+            match run_check(&ctx, Some(&cfg_path)) {
+                Err(e) if is_busy(&e) => continue,
+                Err(e) => panic!("{e:#}"),
+                Ok(()) => {}
+            }
+            let text = std::fs::read_to_string(&cfg_path).unwrap();
+            assert!(text.contains(&device.display().to_string()));
+            return;
         }
     }
 
@@ -2370,7 +2427,7 @@ mod tests {
         cfg.device_explicit = false;
         let (ctx, rx, _ack) = ctx_pair(cfg, tools);
         let start = std::time::Instant::now();
-        let err = run_check(&ctx).unwrap_err();
+        let err = run_check(&ctx, None).unwrap_err();
         // the old code polled wait_ready for 180s before giving up
         assert!(
             start.elapsed() < std::time::Duration::from_secs(30),
@@ -2395,7 +2452,7 @@ mod tests {
             let xorriso = fake_xorriso(dir.path(), &device, CHECK_CLEAN_FIXTURE);
             let tools = tools_with(xorriso, None, None, None);
             let (ctx, rx, _ack) = ctx_pair(cfg_with(&device, &dir.path().join("staging")), tools);
-            match run_info(&ctx) {
+            match run_info(&ctx, None) {
                 Err(e) if is_busy(&e) => continue,
                 Err(e) => panic!("{e:#}"),
                 Ok(()) => {}

@@ -71,6 +71,33 @@ fn info_kv_lines_stay_bare() {
 }
 
 #[test]
+fn info_save_writes_config_and_reports() {
+    let dir = tempfile::tempdir().unwrap();
+    let device = dir.path().join("fake-device");
+    let cfg = dir.path().join("config.toml");
+    let out = run(
+        dir.path(),
+        &[
+            "--device",
+            device.to_str().unwrap(),
+            "--config",
+            cfg.to_str().unwrap(),
+            "info",
+            "--save",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = std::fs::read_to_string(&cfg).unwrap();
+    assert!(text.contains(device.to_str().unwrap()), "config:\n{text}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("info: saved device"), "stdout:\n{stdout}");
+}
+
+#[test]
 fn config_error_prints_top_level_error_line() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = dir.path().join("config.toml");

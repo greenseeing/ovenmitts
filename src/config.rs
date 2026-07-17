@@ -63,6 +63,29 @@ pub fn load(path: Option<&Path>) -> Result<FileConfig> {
     toml::from_str(&text).with_context(|| format!("parsing config {}", path.display()))
 }
 
+/// Persist `device` into the config file, creating parent dirs and the file
+/// if absent. toml_edit keeps comments, formatting and all other keys; a
+/// parse failure propagates instead of clobbering a hand-edited file.
+pub fn save_device(path: &Path, device: &str) -> Result<()> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e).with_context(|| format!("reading config {}", path.display())),
+    };
+    let mut doc: toml_edit::DocumentMut = text
+        .parse()
+        .with_context(|| format!("parsing config {}", path.display()))?;
+    doc["device"] = toml_edit::value(device);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    // write-then-rename: a torn write would brick every later load
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, doc.to_string()).with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("replacing config {}", path.display()))
+}
+
 impl Config {
     pub fn resolve(file: FileConfig) -> Result<Self> {
         let redundancy_pct = file.redundancy_pct.unwrap_or(15);
@@ -135,5 +158,44 @@ mod tests {
     #[test]
     fn unknown_keys_rejected() {
         assert!(toml::from_str::<FileConfig>("nope = 1\n").is_err());
+    }
+
+    #[test]
+    fn save_device_creates_file_and_parent_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("config.toml");
+        save_device(&path, "/dev/sr1").unwrap();
+        let c = Config::resolve(load(Some(&path)).unwrap()).unwrap();
+        assert_eq!(c.device, "/dev/sr1");
+        assert!(!c.device_explicit);
+    }
+
+    #[test]
+    fn save_device_preserves_comments_and_other_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "# my burner\ndevice = \"/dev/sr9\"\nredundancy_pct = 20\n",
+        )
+        .unwrap();
+        save_device(&path, "/dev/sr1").unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# my burner"));
+        assert!(text.contains("redundancy_pct = 20"));
+        assert!(text.contains("device = \"/dev/sr1\""));
+        assert!(!text.contains("/dev/sr9"));
+    }
+
+    #[test]
+    fn save_device_errors_on_invalid_toml_without_clobbering() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "device = [broken\n").unwrap();
+        assert!(save_device(&path, "/dev/sr1").is_err());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "device = [broken\n"
+        );
     }
 }

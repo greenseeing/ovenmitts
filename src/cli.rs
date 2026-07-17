@@ -71,9 +71,17 @@ pub enum Command {
         iso: Option<PathBuf>,
     },
     /// Periodic disc health check via embedded MD5 tags (no source ISO needed)
-    Check,
+    Check {
+        /// Write the auto-detected device to the config file
+        #[arg(long)]
+        save: bool,
+    },
     /// Show drive and media info (type, capacity, formatted state, speeds, media ID)
-    Info,
+    Info {
+        /// Write the auto-detected device to the config file
+        #[arg(long)]
+        save: bool,
+    },
     /// Capacity math without a disc: does the payload + parity fit?
     Plan {
         payloads: Vec<PathBuf>,
@@ -83,4 +91,23 @@ pub enum Command {
         #[arg(long, value_parser = clap::value_parser!(u32).range(1..=100))]
         redundancy: Option<u32>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn cli_definition_is_consistent() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn check_and_info_accept_save() {
+        let cli = Cli::try_parse_from(["ovenmitts", "check", "--save"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Check { save: true })));
+        let cli = Cli::try_parse_from(["ovenmitts", "info"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Info { save: false })));
+    }
 }

@@ -1,4 +1,5 @@
 use std::io::{BufRead, IsTerminal, Write};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::mpsc;
 
@@ -64,11 +65,17 @@ fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 ovenmitts::tui::run(cfg, tools, req)
             }
         }
-        Some(cmd) => run_command(cfg, cmd),
+        Some(cmd) => {
+            let config_path = cli
+                .config
+                .clone()
+                .unwrap_or_else(ovenmitts::config::default_path);
+            run_command(cfg, cmd, config_path)
+        }
     }
 }
 
-fn run_command(mut cfg: Config, cmd: Command) -> anyhow::Result<()> {
+fn run_command(mut cfg: Config, cmd: Command, config_path: PathBuf) -> anyhow::Result<()> {
     // plan must work on a machine without xorriso: probe failure already
     // falls back to synthetic media inside run_plan
     let tools = match &cmd {
@@ -122,8 +129,18 @@ fn run_command(mut cfg: Config, cmd: Command) -> anyhow::Result<()> {
         Command::Verify { iso } => drive(cfg, tools, move |ctx| {
             runner::run_verify(ctx, iso.as_deref())
         }),
-        Command::Check => drive(cfg, tools, runner::run_check),
-        Command::Info => drive(cfg, tools, runner::run_info),
+        Command::Check { save } => {
+            let save_to = save.then_some(config_path);
+            drive(cfg, tools, move |ctx| {
+                runner::run_check(ctx, save_to.as_deref())
+            })
+        }
+        Command::Info { save } => {
+            let save_to = save.then_some(config_path);
+            drive(cfg, tools, move |ctx| {
+                runner::run_info(ctx, save_to.as_deref())
+            })
+        }
         Command::Plan {
             payloads,
             media,
