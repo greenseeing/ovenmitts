@@ -182,6 +182,10 @@ where
                 line.close();
                 println!("{text}");
             }
+            StageEvent::Out(text) => {
+                line.close();
+                println!("{text}");
+            }
             StageEvent::Warn(text) => {
                 line.close();
                 eprintln!("warning: {text}");

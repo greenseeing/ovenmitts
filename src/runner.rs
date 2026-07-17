@@ -61,6 +61,9 @@ pub enum StageEvent {
     },
     Info(String),
     Warn(String),
+    /// Primary command output (info listings): rendered bare, severity
+    /// prefixes never apply.
+    Out(String),
     /// Runner blocks until an Ack arrives (reinsert disc, confirm burn, ...)
     NeedAck {
         prompt: String,
@@ -214,6 +217,10 @@ impl RunnerCtx {
 
     fn warn(&self, text: String) {
         self.send(StageEvent::Warn(text));
+    }
+
+    fn out(&self, text: String) {
+        self.send(StageEvent::Out(text));
     }
 }
 
@@ -827,34 +834,34 @@ pub fn run_check(ctx: &RunnerCtx) -> Result<()> {
 pub fn run_info(ctx: &RunnerCtx) -> Result<()> {
     with_failure(ctx, |_stage| {
         let (device, media) = resolve_device(ctx)?;
-        ctx.info(format!("device : {device}"));
-        ctx.info(format!("profile: {}", media.profile));
-        ctx.info(format!("type   : {}", media.kind.label()));
-        ctx.info(format!(
+        ctx.out(format!("device : {device}"));
+        ctx.out(format!("profile: {}", media.profile));
+        ctx.out(format!("type   : {}", media.kind.label()));
+        ctx.out(format!(
             "status : {}{}",
             if media.blank { "blank" } else { "written" },
             if media.formatted { ", formatted" } else { "" }
         ));
-        ctx.info(format!(
+        ctx.out(format!(
             "free   : {} ({} bytes)",
             human_bytes(media.free_bytes),
             media.free_bytes
         ));
         match media.formatted_capacity {
-            Some(cap) => ctx.info(format!(
+            Some(cap) => ctx.out(format!(
                 "capacity after defect-management format: {} ({cap} bytes)",
                 human_bytes(cap)
             )),
-            None => ctx.info("capacity after defect-management format: unknown".into()),
+            None => ctx.out("capacity after defect-management format: unknown".into()),
         }
         if media.speeds.is_empty() {
-            ctx.info("write speeds: none reported".into());
+            ctx.out("write speeds: none reported".into());
         } else {
             let speeds: Vec<String> = media.speeds.iter().map(|s| format!("{s}x")).collect();
-            ctx.info(format!("write speeds: {}", speeds.join(", ")));
+            ctx.out(format!("write speeds: {}", speeds.join(", ")));
         }
         if let Some(id) = &media.media_id {
-            ctx.info(format!("media id: {id}"));
+            ctx.out(format!("media id: {id}"));
         }
         ctx.send(StageEvent::Finished {
             report: RunReport::default(),
@@ -2394,16 +2401,16 @@ mod tests {
                 Ok(()) => {}
             }
             let events: Vec<StageEvent> = rx.try_iter().collect();
-            let infos: Vec<&String> = events
+            let outs: Vec<&String> = events
                 .iter()
                 .filter_map(|ev| match ev {
-                    StageEvent::Info(t) => Some(t),
+                    StageEvent::Out(t) => Some(t),
                     _ => None,
                 })
                 .collect();
-            assert!(infos.iter().any(|t| t.contains("BD-R 25 GB")));
-            assert!(infos.iter().any(|t| t.contains("free")));
-            assert!(infos.iter().any(|t| t.contains("write speeds")));
+            assert!(outs.iter().any(|t| t.contains("BD-R 25 GB")));
+            assert!(outs.iter().any(|t| t.contains("free")));
+            assert!(outs.iter().any(|t| t.contains("write speeds")));
             assert!(matches!(events.last(), Some(StageEvent::Finished { .. })));
             return;
         }

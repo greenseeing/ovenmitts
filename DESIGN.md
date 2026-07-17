@@ -105,6 +105,8 @@ final report. `todo!()` bodies mark what to implement.
 `std::sync::mpsc::Sender`. CLI mode prints events as lines; TUI renders them.
 Subprocess stdout/stderr are pumped by reader threads; progress lines are
 parsed in burn.rs/master.rs and forwarded as `StageEvent::Progress`.
+`Out` carries a command's primary output (the `info` listing) and renders
+bare; `Info`/`Warn`/`Failed` are diagnostics and carry severity.
 
 Confirmation is a loop, not a gate: `NeedAck` grants the UI exactly one reply —
 `Proceed`, `Abort`, or `Amend(BurnParams)`. On `Amend` the runner re-plans

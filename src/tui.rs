@@ -320,6 +320,7 @@ impl App {
                     .push(false, format!("{}: {summary}", stage.label()));
             }
             StageEvent::Info(text) => self.log.push(false, text),
+            StageEvent::Out(text) => self.log.push(false, text),
             StageEvent::Warn(text) => self.log.push(true, text),
             StageEvent::NeedAck { prompt } => {
                 // the runner grants one ack slot per NeedAck: spend it on queued
