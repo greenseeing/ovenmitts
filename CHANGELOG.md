@@ -19,6 +19,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   contract. Tests: 3 new (Enter ignored before/within arm delay; abort works
   unarmed); 226 total pass, clippy/fmt clean.
 
+- Preflight failures before any plan exists (no disc, probe error) no longer
+  switch to the Run screen, which would read as "it skipped the plan and went
+  straight to burning". The failure now renders on the Plan screen's probing
+  view as a wrapped error banner, with a "q quit" footer. Post-plan failures
+  and pipeline-thread-disconnect still switch to Run as before. Tests: 1 new
+  (preflight failure stays on Plan, shows banner); 227 total pass, clippy/fmt
+  clean.
+
 ## [0.1.5] - 2026-07-18
 
 ### Added

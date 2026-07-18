@@ -287,7 +287,7 @@ impl App {
                         self.quit = true;
                     } else if self.failure.is_none() && self.report.is_none() {
                         self.failure = Some("pipeline thread exited unexpectedly".into());
-                        if self.screen == Screen::Plan {
+                        if self.screen == Screen::Plan && self.plan.is_some() {
                             self.screen = Screen::Run;
                         }
                     }
@@ -358,7 +358,10 @@ impl App {
             StageEvent::Failed { stage, error } => {
                 self.set_stage(stage, StageState::Failed);
                 self.failure = Some(format!("{} failed: {error}", stage.label()));
-                if self.screen == Screen::Plan {
+                // a failure before any plan exists (no disc, probe error) is
+                // not a pipeline event: the Run screen would read as "it
+                // started burning" — show it where the user is looking
+                if self.screen == Screen::Plan && self.plan.is_some() {
                     self.screen = Screen::Run;
                 }
             }
@@ -640,6 +643,7 @@ impl App {
             };
         }
         match self.screen {
+            Screen::Plan if self.failure.is_some() => "q quit".into(),
             Screen::Plan if self.replanning || self.edit_dirty => "re-planning…".into(),
             Screen::Plan => "probing… · q quit".into(),
             Screen::Run => {
@@ -859,15 +863,25 @@ impl App {
     }
 
     fn probing_view(&self, frame: &mut Frame, area: Rect) {
-        let spin = SPINNER[((self.tick / 2) % SPINNER.len() as u64) as usize];
-        let mut lines = vec![
-            Line::from(""),
-            Line::from(Span::styled(
-                format!("  {spin}  probing drive and media, inspecting payload…"),
-                Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
-            )),
-            Line::from(""),
-        ];
+        let mut lines = vec![Line::from("")];
+        match &self.failure {
+            Some(msg) => {
+                for row in head_wrap("  ✗ ", "    ", msg, area.width as usize) {
+                    lines.push(Line::from(Span::styled(
+                        row,
+                        Style::new().fg(ERR).add_modifier(Modifier::BOLD),
+                    )));
+                }
+            }
+            None => {
+                let spin = SPINNER[((self.tick / 2) % SPINNER.len() as u64) as usize];
+                lines.push(Line::from(Span::styled(
+                    format!("  {spin}  probing drive and media, inspecting payload…"),
+                    Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+                )));
+            }
+        }
+        lines.push(Line::from(""));
         if let Some(prompt) = &self.pending_ack {
             lines.push(Line::from(vec![
                 Span::styled(
@@ -1475,6 +1489,7 @@ mod tests {
     #[test]
     fn failed_event_marks_stage_and_shows_banner() {
         let (mut app, _rx) = test_app();
+        app.apply(plan_event());
         app.apply(StageEvent::Failed {
             stage: Stage::Burn,
             error: "no disc".into(),
@@ -1482,6 +1497,37 @@ mod tests {
         assert_eq!(app.screen, Screen::Run);
         assert!(app.failure.as_deref().unwrap().contains("burn failed"));
         assert!(!app.quit);
+        app.on_key(key(KeyCode::Char('q')));
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn preflight_failure_before_plan_stays_on_plan_screen() {
+        let (mut app, _rx) = test_app();
+        app.apply(StageEvent::Failed {
+            stage: Stage::Preflight,
+            error: "probing /dev/sr0: no medium present".into(),
+        });
+        assert_eq!(
+            app.screen,
+            Screen::Plan,
+            "no plan yet: Run would read as burning"
+        );
+        let backend = ratatui::backend::TestBackend::new(100, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.render(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut text = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                text.push_str(buffer[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        assert!(text.contains("✗ preflight failed"), "{text}");
+        assert!(text.contains("no medium present"), "{text}");
+        assert!(text.contains("q quit"), "{text}");
+        assert!(!text.contains("probing drive and media"), "{text}");
         app.on_key(key(KeyCode::Char('q')));
         assert!(app.quit);
     }
