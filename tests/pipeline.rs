@@ -465,6 +465,22 @@ fn burn_pipeline_end_to_end() {
     assert!(report.reminders.iter().any(|r| r.contains("off-disc")));
     assert!(report.reminders.iter().any(|r| r.contains("VeraCrypt")));
 
+    let expected_written = vec![
+        stage_dir.join("parity").join("vault.hc.par2"),
+        stage_dir.join("parity").join("vault.hc.vol000+01.par2"),
+        stage_dir.join("checksums.sha256"),
+        stage_dir.join("MANIFEST.txt"),
+        stage_dir.join("RECOVERY.txt"),
+        iso.clone(),
+        stage_dir.join("PIPE.lba.txt"),
+        stage_dir.join("PIPE.iso.sha256"),
+        stage_dir.join("PIPE.burn.log"),
+    ];
+    assert_eq!(report.written_files, expected_written);
+    for f in &report.written_files {
+        assert!(f.is_file(), "reported file missing: {}", f.display());
+    }
+
     assert!(events.iter().any(|ev| matches!(
         ev,
         StageEvent::Progress { stage: Stage::Master, pct: Some(p), .. } if (*p - 50.0).abs() < 0.01
@@ -545,6 +561,7 @@ fn amended_params_flow_through_whole_pipeline() {
             redundancy_pct: 30,
             parity: true,
             defect_management: false,
+            staging: h.staging.clone(),
         }))
         .unwrap();
     ack_tx.send(Ack::Proceed).unwrap();
@@ -581,6 +598,75 @@ fn amended_params_flow_through_whole_pipeline() {
         cdrecord.lines().any(|l| l == "speed=8"),
         "cdrecord argv: {cdrecord}"
     );
+}
+
+#[test]
+fn amended_staging_redirects_stage_dir() {
+    let h = Harness::new();
+    let payload = h.payload("vault.hc", 8 * 1024 * 1024, 99);
+    let alt = h.dir.path().join("alt-staging");
+    let stage_dir = alt.join("MOVED");
+    let iso = stage_dir.join("MOVED.iso");
+    h.set_mount_for(&iso);
+
+    let (ctx, rx, ack_tx) = h.ctx();
+    ack_tx
+        .send(Ack::Amend(BurnParams {
+            label: "MOVED".into(),
+            speed: Some(4),
+            redundancy_pct: 15,
+            parity: true,
+            defect_management: false,
+            staging: alt.clone(),
+        }))
+        .unwrap();
+    ack_tx.send(Ack::Proceed).unwrap();
+    let mut req = burn_request(vec![payload], "MOVED");
+    req.assume_yes = false;
+    req.amend = true;
+    runner::run_burn(&ctx, &req).unwrap();
+    let events = drain(ctx, rx);
+
+    assert!(matches!(events.last(), Some(StageEvent::Finished { .. })));
+    assert!(iso.is_file(), "ISO must land in the amended staging dir");
+    assert!(
+        !h.stage_dir("MOVED").exists(),
+        "the config staging dir must stay untouched"
+    );
+}
+
+#[test]
+fn discard_iso_drops_iso_from_written_files_but_keeps_sidecars() {
+    let h = Harness::new();
+    let payload = h.payload("vault.hc", 8 * 1024 * 1024, 7);
+    let stage_dir = h.stage_dir("TOSS");
+    let iso = stage_dir.join("TOSS.iso");
+    h.set_mount_for(&iso);
+
+    let (ctx, rx, _ack) = h.ctx();
+    let mut req = burn_request(vec![payload], "TOSS");
+    req.discard_iso = true;
+    runner::run_burn(&ctx, &req).unwrap();
+    let events = drain(ctx, rx);
+
+    let Some(StageEvent::Finished { report }) = events.last() else {
+        panic!("expected Finished last, got {:?}", events.last());
+    };
+    assert!(!iso.exists(), "discard_iso must remove the staged ISO");
+    assert_eq!(report.iso_path, None);
+    assert!(
+        !report.written_files.contains(&iso),
+        "a discarded ISO must not be reported as written"
+    );
+    assert!(report
+        .written_files
+        .contains(&stage_dir.join("TOSS.iso.sha256")));
+    assert!(report
+        .written_files
+        .contains(&stage_dir.join("TOSS.burn.log")));
+    for f in &report.written_files {
+        assert!(f.is_file(), "reported file missing: {}", f.display());
+    }
 }
 
 #[test]

@@ -46,6 +46,15 @@ fn home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// `~` / `~/...` → $HOME-based path; anything else passes through unchanged.
+pub fn expand_tilde(p: &Path) -> PathBuf {
+    let mut comps = p.components();
+    match comps.next() {
+        Some(std::path::Component::Normal(c)) if c == "~" => home().join(comps.as_path()),
+        _ => p.to_path_buf(),
+    }
+}
+
 fn default_staging() -> PathBuf {
     let base = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
@@ -104,7 +113,10 @@ impl Config {
             // swapped by auto-detection); only --device pins, set in main
             device_explicit: false,
             device: file.device.unwrap_or_else(|| "/dev/sr0".into()),
-            staging: file.staging.unwrap_or_else(default_staging),
+            staging: file
+                .staging
+                .map(|p| expand_tilde(&p))
+                .unwrap_or_else(default_staging),
             speed: file.speed,
             redundancy_pct,
             headroom_pct,
@@ -139,6 +151,19 @@ mod tests {
         assert!(!c.device_explicit, "config device is a soft preference");
         assert_eq!(c.redundancy_pct, 20);
         assert_eq!(c.headroom_pct, 5);
+    }
+
+    #[test]
+    fn staging_tilde_in_config_expands_to_home() {
+        let f: FileConfig = toml::from_str("staging = \"~/burns\"\n").unwrap();
+        let c = Config::resolve(f).unwrap();
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        assert_eq!(c.staging, home.join("burns"));
+        let f: FileConfig = toml::from_str("staging = \"/abs/path\"\n").unwrap();
+        let c = Config::resolve(f).unwrap();
+        assert_eq!(c.staging, PathBuf::from("/abs/path"));
     }
 
     #[test]

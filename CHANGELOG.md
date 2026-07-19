@@ -5,6 +5,25 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Staging directory is editable on the TUI plan screen: new "Staging" row
+  (`e` to edit; empty input resets to the config/CLI default). The path rides
+  `BurnParams` through the amend loop, so the staging free-space preflight
+  re-checks the typed path as a plan-screen warning and hard-gates on Proceed.
+  `~/…` now expands to `$HOME` in typed paths, the config `staging` key, and
+  `--staging`. Tests: 4 new (edit commit/empty-reset, amended staging redirects
+  the whole pipeline, tilde expansion in canonicalize and config).
+
+- Every burn now reports the exact paths of every file it wrote: `wrote:`
+  lines in line mode, and a scrollable (↑↓/j/k) "Files written" section on the
+  TUI report screen. Covers parity files, checksums.sha256, MANIFEST.txt,
+  RECOVERY.txt, the ISO (omitted when discarded after verification), the LBA
+  map, the ISO sha256 sidecar, and the burn transcript; `burn-iso` reports its
+  transcript too. Tests: 3 new/3 extended; 234 total pass, clippy/fmt clean.
+
 ## [0.1.6] - 2026-07-18
 
 ### Fixed

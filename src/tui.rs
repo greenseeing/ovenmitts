@@ -109,17 +109,19 @@ enum Screen {
 }
 
 /// Plan-screen rows, in display order; indices drive `App::selected`.
-const PARAM_ROWS: usize = 5;
+const PARAM_ROWS: usize = 6;
 const ROW_LABEL: usize = 0;
 const ROW_SPEED: usize = 1;
 const ROW_REDUNDANCY: usize = 2;
 const ROW_PARITY: usize = 3;
 const ROW_DEFECT_MGMT: usize = 4;
+const ROW_STAGING: usize = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EditField {
     Label,
     Speed,
+    Staging,
 }
 
 #[derive(Debug, Clone)]
@@ -195,6 +197,7 @@ struct App {
     /// to a user already at the screen.
     ack_shown: Option<Instant>,
     report: Option<RunReport>,
+    report_scroll: u16,
     failure: Option<String>,
     aborted: bool,
     disconnected: bool,
@@ -235,6 +238,7 @@ impl App {
             pending_ack: None,
             ack_shown: None,
             report: None,
+            report_scroll: 0,
             failure: None,
             aborted: false,
             disconnected: false,
@@ -421,11 +425,16 @@ impl App {
                     self.quit = true;
                 }
             }
-            Screen::Report => {
-                if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
-                    self.quit = true;
+            Screen::Report => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.report_scroll = self.report_scroll.saturating_sub(1);
                 }
-            }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.report_scroll = self.report_scroll.saturating_add(1);
+                }
+                KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
+                _ => {}
+            },
         }
     }
 
@@ -450,6 +459,11 @@ impl App {
                     }
                     EditField::Speed => {
                         if c.is_ascii_digit() && self.input.len() < 3 {
+                            self.input.push(c);
+                        }
+                    }
+                    EditField::Staging => {
+                        if self.input.len() < 256 {
                             self.input.push(c);
                         }
                     }
@@ -534,6 +548,7 @@ impl App {
         let field = match self.selected {
             ROW_LABEL => EditField::Label,
             ROW_SPEED => EditField::Speed,
+            ROW_STAGING => EditField::Staging,
             _ => return,
         };
         self.input = match field {
@@ -543,6 +558,7 @@ impl App {
                 .speed
                 .map(|s| s.to_string())
                 .unwrap_or_default(),
+            EditField::Staging => self.shown_params().staging.display().to_string(),
         };
         self.editing = Some(field);
     }
@@ -555,6 +571,15 @@ impl App {
             EditField::Speed => {
                 let speed = input.parse::<u32>().ok().filter(|s| *s > 0);
                 self.amend_with(|p| p.speed = speed);
+            }
+            EditField::Staging => {
+                let trimmed = input.trim();
+                let staging = if trimmed.is_empty() {
+                    self.cfg.staging.clone()
+                } else {
+                    PathBuf::from(trimmed)
+                };
+                self.amend_with(|p| p.staging = staging);
             }
         }
     }
@@ -657,7 +682,7 @@ impl App {
                     format!("elapsed {elapsed} · Ctrl-C force-quit")
                 }
             }
-            Screen::Report => "q quit".into(),
+            Screen::Report => "↑↓ scroll · q quit".into(),
         }
     }
 
@@ -838,6 +863,15 @@ impl App {
                 })
                 .into(),
                 "Space toggle",
+            ),
+            (
+                "Staging    ",
+                if self.editing == Some(EditField::Staging) {
+                    format!("{}▏", self.input)
+                } else {
+                    params.staging.display().to_string()
+                },
+                "e edit · empty resets to default",
             ),
         ];
         rows.iter()
@@ -1035,6 +1069,16 @@ impl App {
         if report.iso_bytes > 0 {
             lines.push(kv("size   ", &human_bytes(report.iso_bytes)));
         }
+        if !report.written_files.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(heading("Files written"));
+            for f in &report.written_files {
+                lines.push(Line::from(Span::styled(
+                    format!("    {}", f.display()),
+                    Style::new().fg(Color::Gray),
+                )));
+            }
+        }
         lines.push(Line::from(""));
         lines.push(heading("Reminders"));
         for r in &report.reminders {
@@ -1043,7 +1087,16 @@ impl App {
                 Style::new().fg(WARN),
             )));
         }
-        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+        // logical-line clamp: wrapped lines under-scroll slightly, accepted
+        // over the feature-gated Paragraph::line_count
+        let max = lines.len().saturating_sub(inner.height as usize) as u16;
+        let offset = self.report_scroll.min(max);
+        frame.render_widget(
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .scroll((offset, 0)),
+            inner,
+        );
     }
 }
 
@@ -1310,6 +1363,7 @@ mod tests {
             redundancy_pct: 15,
             parity: true,
             defect_management: false,
+            staging: "/staging".into(),
         }
     }
 
@@ -1572,11 +1626,11 @@ mod tests {
             app.on_key(key(KeyCode::Down));
         }
         assert_eq!(
-            app.selected, ROW_DEFECT_MGMT,
+            app.selected, ROW_STAGING,
             "selection clamps to the last row"
         );
         app.on_key(key(KeyCode::Up));
-        assert_eq!(app.selected, ROW_PARITY);
+        assert_eq!(app.selected, ROW_DEFECT_MGMT);
         for _ in 0..9 {
             app.on_key(key(KeyCode::Char('k')));
         }
@@ -1789,6 +1843,7 @@ mod tests {
                 reminders: vec![
                     "second copy: insert a fresh disc and run `ovenmitts burn-iso /staging/ARCHIVE/ARCHIVE.iso`".into(),
                 ],
+                written_files: vec![],
             },
         });
         let backend = ratatui::backend::TestBackend::new(120, 30);
@@ -1804,6 +1859,120 @@ mod tests {
             .filter(|row| row.contains("second copy"))
             .count();
         assert_eq!(hits, 1, "the second-copy reminder must render exactly once");
+    }
+
+    #[test]
+    fn staging_edit_commits_on_enter_and_empty_resets_to_default() {
+        let (mut app, ack_rx) = test_app();
+        app.apply(plan_event());
+        need_ack(&mut app);
+        app.selected = ROW_STAGING;
+        app.on_key(key(KeyCode::Char('e')));
+        assert_eq!(app.editing, Some(EditField::Staging));
+        assert_eq!(app.input, "/staging", "edit seeds with the current path");
+        for _ in 0.."/staging".len() {
+            app.on_key(key(KeyCode::Backspace));
+        }
+        for c in "/alt/stage ".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.editing, None);
+        let Ok(Ack::Amend(p)) = ack_rx.try_recv() else {
+            panic!("Enter must commit the staging edit");
+        };
+        assert_eq!(
+            p.staging,
+            PathBuf::from("/alt/stage"),
+            "commit trims whitespace"
+        );
+
+        app.on_key(key(KeyCode::Char('e')));
+        for _ in 0.."/alt/stage".len() {
+            app.on_key(key(KeyCode::Backspace));
+        }
+        app.on_key(key(KeyCode::Enter));
+        need_ack(&mut app);
+        let Ok(Ack::Amend(p)) = ack_rx.try_recv() else {
+            panic!("queued empty-reset must flush on NeedAck");
+        };
+        assert_eq!(
+            p.staging, app.cfg.staging,
+            "empty input resets to the session default"
+        );
+    }
+
+    #[test]
+    fn report_screen_lists_written_files() {
+        let (mut app, _ack_rx) = test_app();
+        app.apply(StageEvent::Finished {
+            report: RunReport {
+                written_files: vec![
+                    PathBuf::from("/staging/PIPE/parity/vault.hc.par2"),
+                    PathBuf::from("/staging/PIPE/checksums.sha256"),
+                ],
+                ..RunReport::default()
+            },
+        });
+        let backend = ratatui::backend::TestBackend::new(120, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.render(f)).unwrap();
+        let buf = terminal.backend().buffer();
+        let rows: Vec<String> = (0..30)
+            .map(|y| {
+                (0..120)
+                    .map(|x| buf.cell((x, y)).unwrap().symbol())
+                    .collect()
+            })
+            .collect();
+        assert!(rows.iter().any(|r| r.contains("Files written")));
+        assert!(rows
+            .iter()
+            .any(|r| r.contains("/staging/PIPE/parity/vault.hc.par2")));
+        assert!(rows
+            .iter()
+            .any(|r| r.contains("/staging/PIPE/checksums.sha256")));
+    }
+
+    #[test]
+    fn report_screen_scrolls_long_file_list() {
+        let (mut app, _ack_rx) = test_app();
+        app.apply(StageEvent::Finished {
+            report: RunReport {
+                written_files: (0..40)
+                    .map(|i| PathBuf::from(format!("/staging/X/file{i:02}")))
+                    .collect(),
+                ..RunReport::default()
+            },
+        });
+        let backend = ratatui::backend::TestBackend::new(80, 12);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let screen_text = |t: &ratatui::Terminal<ratatui::backend::TestBackend>| -> String {
+            let buf = t.backend().buffer();
+            (0..12)
+                .map(|y| {
+                    (0..80)
+                        .map(|x| buf.cell((x, y)).unwrap().symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        terminal.draw(|f| app.render(f)).unwrap();
+        let top = screen_text(&terminal);
+        assert!(top.contains("file00"), "unscrolled report shows the head");
+        assert!(!top.contains("file39"));
+        for _ in 0..100 {
+            app.on_key(key(KeyCode::Down));
+        }
+        terminal.draw(|f| app.render(f)).unwrap();
+        let bottom = screen_text(&terminal);
+        assert!(
+            bottom.contains("file39"),
+            "scrolling must reach the tail (clamped)"
+        );
+        assert!(!bottom.contains("file00"));
+        assert!(!app.quit, "scroll keys must not quit the report screen");
     }
 
     #[test]

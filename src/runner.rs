@@ -93,6 +93,8 @@ pub struct RunReport {
     pub iso_bytes: u64,
     pub stages: Vec<(Stage, String)>,
     pub reminders: Vec<String>,
+    /// Every file the run left on disk, in write order.
+    pub written_files: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -117,6 +119,7 @@ pub struct BurnParams {
     pub redundancy_pct: u32,
     pub parity: bool,
     pub defect_management: bool,
+    pub staging: PathBuf,
 }
 
 impl BurnParams {
@@ -127,6 +130,7 @@ impl BurnParams {
             redundancy_pct: cfg.redundancy_pct,
             parity: req.parity,
             defect_management: cfg.defect_management,
+            staging: cfg.staging.clone(),
         }
     }
 
@@ -148,6 +152,11 @@ impl BurnParams {
         if self.speed == Some(0) {
             warns.push("speed 0 treated as drive default".into());
             self.speed = None;
+        }
+        let expanded = crate::config::expand_tilde(&self.staging);
+        if expanded != self.staging {
+            warns.push(format!("staging expanded to {}", expanded.display()));
+            self.staging = expanded;
         }
         (self, warns)
     }
@@ -268,7 +277,7 @@ fn burn_pipeline(ctx: &RunnerCtx, req: &BurnRequest, stage: &mut Stage) -> Resul
         });
 
         if req.dry_run {
-            confirm_gate(ctx, &plan)?;
+            confirm_gate(ctx, &plan, &params.staging)?;
             ctx.info("dry run - stopping after plan".into());
             ctx.send(StageEvent::Finished {
                 report: RunReport::default(),
@@ -276,12 +285,12 @@ fn burn_pipeline(ctx: &RunnerCtx, req: &BurnRequest, stage: &mut Stage) -> Resul
             return Ok(());
         }
         if req.assume_yes {
-            confirm_gate(ctx, &plan)?;
+            confirm_gate(ctx, &plan, &params.staging)?;
             break (params, plan);
         }
         if !req.amend {
-            confirm_gate(ctx, &plan)?;
-        } else if let Err(e) = check_staging_space(ctx, &plan) {
+            confirm_gate(ctx, &plan, &params.staging)?;
+        } else if let Err(e) = check_staging_space(&plan, &params.staging) {
             // surfaced pre-confirm: lowering redundancy shrinks the need
             let msg = format!("{e:#}");
             if prev_staging_warn.as_deref() != Some(msg.as_str()) {
@@ -306,7 +315,7 @@ fn burn_pipeline(ctx: &RunnerCtx, req: &BurnRequest, stage: &mut Stage) -> Resul
         };
         match ctx.ask_raw(&prompt)? {
             Ack::Proceed => {
-                confirm_gate(ctx, &plan)?;
+                confirm_gate(ctx, &plan, &params.staging)?;
                 break (params, plan);
             }
             Ack::Abort => anyhow::bail!("aborted by user"),
@@ -339,8 +348,8 @@ fn burn_pipeline(ctx: &RunnerCtx, req: &BurnRequest, stage: &mut Stage) -> Resul
         ),
     );
 
-    let label = unique_label(&ctx.cfg.staging, &params.label);
-    let stage_dir = ctx.cfg.staging.join(&label);
+    let label = unique_label(&params.staging, &params.label);
+    let stage_dir = params.staging.join(&label);
     std::fs::create_dir_all(stage_dir.join("parity"))
         .with_context(|| format!("create staging dir {}", stage_dir.display()))?;
     ctx.info(format!("staging into {}", stage_dir.display()));
@@ -461,21 +470,16 @@ fn burn_pipeline(ctx: &RunnerCtx, req: &BurnRequest, stage: &mut Stage) -> Resul
     let iso_bytes = master::build_iso(&ctx.tools, &input, &mut |pct, line| {
         ctx.progress(Stage::Master, pct, line);
     })?;
-    master::report_lba(
-        &ctx.tools,
-        &iso,
-        &stage_dir.join(format!("{label}.lba.txt")),
-    )?;
+    let lba_path = stage_dir.join(format!("{label}.lba.txt"));
+    master::report_lba(&ctx.tools, &iso, &lba_path)?;
     let iso_sha = {
         let mut th = Throttle::default();
         hashing::sha256_file(&iso, &mut |done, total| {
             emit_pct(ctx, Stage::Master, &mut th, done, total, "hashing ISO");
         })?
     };
-    hashing::write_checksums(
-        &[(iso_sha.clone(), format!("{label}.iso"))],
-        &stage_dir.join(format!("{label}.iso.sha256")),
-    )?;
+    let iso_sha_path = stage_dir.join(format!("{label}.iso.sha256"));
+    hashing::write_checksums(&[(iso_sha.clone(), format!("{label}.iso"))], &iso_sha_path)?;
     ctx.done(
         &mut stages,
         Stage::Master,
@@ -605,6 +609,19 @@ fn burn_pipeline(ctx: &RunnerCtx, req: &BurnRequest, stage: &mut Stage) -> Resul
                 .into(),
         );
     }
+    let mut written_files = parity_files;
+    written_files.push(checksums_path);
+    written_files.push(manifest_path);
+    written_files.push(recovery_path);
+    let burn_log = burn::burn_log_path(&iso);
+    if keep_iso {
+        written_files.push(iso.clone());
+    }
+    written_files.push(lba_path);
+    written_files.push(iso_sha_path);
+    if burn_log.is_file() {
+        written_files.push(burn_log);
+    }
     ctx.send(StageEvent::Finished {
         report: RunReport {
             iso_path: keep_iso.then_some(iso),
@@ -612,6 +629,7 @@ fn burn_pipeline(ctx: &RunnerCtx, req: &BurnRequest, stage: &mut Stage) -> Resul
             iso_bytes,
             stages,
             reminders,
+            written_files,
         },
     });
     Ok(())
@@ -701,6 +719,7 @@ pub fn run_burn_iso(ctx: &RunnerCtx, iso: &Path, assume_yes: bool) -> Result<()>
         // burn-iso is always line mode; only an explicit config opt-in ejects
         eject_if_configured(ctx, &device, false);
 
+        let burn_log = burn::burn_log_path(iso);
         ctx.send(StageEvent::Finished {
             report: RunReport {
                 iso_path: Some(iso.to_path_buf()),
@@ -708,6 +727,11 @@ pub fn run_burn_iso(ctx: &RunnerCtx, iso: &Path, assume_yes: bool) -> Result<()>
                 iso_bytes,
                 stages,
                 reminders: Vec::new(),
+                written_files: if burn_log.is_file() {
+                    vec![burn_log]
+                } else {
+                    Vec::new()
+                },
             },
         });
         Ok(())
@@ -820,6 +844,7 @@ pub fn run_verify(ctx: &RunnerCtx, iso: Option<&Path>) -> Result<()> {
                 iso_bytes: report_bytes,
                 stages,
                 reminders: Vec::new(),
+                written_files: Vec::new(),
             },
         });
         Ok(())
@@ -934,6 +959,7 @@ pub fn run_plan(
             redundancy_pct: ctx.cfg.redundancy_pct,
             parity: true,
             defect_management: ctx.cfg.defect_management,
+            staging: ctx.cfg.staging.clone(),
         };
         let plan = plan::build_plan(&params.plan_input(&payloads, ctx.cfg.headroom_pct), &media);
         for w in &plan.warnings {
@@ -1114,9 +1140,9 @@ fn eject_if_configured(ctx: &RunnerCtx, device: &str, default: bool) {
 
 /// Everything that must hold before a burn is committed to; runs before the
 /// prompt in non-amend paths and again on Proceed.
-fn confirm_gate(ctx: &RunnerCtx, plan: &ArchivePlan) -> Result<()> {
+fn confirm_gate(ctx: &RunnerCtx, plan: &ArchivePlan, staging: &Path) -> Result<()> {
     ensure_fits(plan, ctx.cfg.headroom_pct)?;
-    check_staging_space(ctx, plan)
+    check_staging_space(plan, staging)
 }
 
 fn ensure_fits(plan: &ArchivePlan, headroom_pct: u32) -> Result<()> {
@@ -1134,15 +1160,15 @@ fn ensure_fits(plan: &ArchivePlan, headroom_pct: u32) -> Result<()> {
 }
 
 // payloads stay in place; staging holds parity + the ISO (which contains both)
-fn check_staging_space(ctx: &RunnerCtx, plan: &ArchivePlan) -> Result<()> {
+fn check_staging_space(plan: &ArchivePlan, staging: &Path) -> Result<()> {
     let needed = plan.parity_bytes_est + plan.total_bytes_est;
-    std::fs::create_dir_all(&ctx.cfg.staging)
-        .with_context(|| format!("create staging dir {}", ctx.cfg.staging.display()))?;
-    let free = staging_free_bytes(&ctx.cfg.staging)?;
+    std::fs::create_dir_all(staging)
+        .with_context(|| format!("create staging dir {}", staging.display()))?;
+    let free = staging_free_bytes(staging)?;
     ensure!(
         free >= needed,
         "staging {} has {} free but needs ~{} (parity {} + ISO {})",
-        ctx.cfg.staging.display(),
+        staging.display(),
         human_bytes(free),
         human_bytes(needed),
         human_bytes(plan.parity_bytes_est),
@@ -1603,6 +1629,27 @@ mod tests {
     }
 
     #[test]
+    fn canonicalize_expands_tilde_in_staging() {
+        let (p, warns) = BurnParams {
+            label: "T1".into(),
+            speed: None,
+            redundancy_pct: 15,
+            parity: true,
+            defect_management: false,
+            staging: PathBuf::from("~/burns"),
+        }
+        .canonicalize();
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        assert_eq!(p.staging, home.join("burns"));
+        assert!(
+            warns.iter().any(|w| w.contains("staging")),
+            "expansion must be surfaced as a warning, got {warns:?}"
+        );
+    }
+
+    #[test]
     fn unique_label_dedupes_with_numeric_suffix() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(unique_label(dir.path(), "T1"), "T1");
@@ -1627,11 +1674,7 @@ mod tests {
     #[test]
     fn staging_space_check_rejects_shortfall() {
         let dir = tempfile::tempdir().unwrap();
-        let tools = tools_with("/bin/true".into(), None, None, None);
-        let (ctx, _rx, _ack) = ctx_pair(
-            cfg_with(Path::new("/dev/null"), &dir.path().join("staging")),
-            tools,
-        );
+        let staging = dir.path().join("staging");
         let mut plan = ArchivePlan {
             payload_bytes: 0,
             parity_bytes_est: u64::MAX / 4,
@@ -1642,11 +1685,11 @@ mod tests {
             fits: true,
             warnings: vec![],
         };
-        let err = check_staging_space(&ctx, &plan).unwrap_err();
+        let err = check_staging_space(&plan, &staging).unwrap_err();
         assert!(err.to_string().contains("staging"), "{err:#}");
         plan.parity_bytes_est = 0;
         plan.total_bytes_est = 0;
-        assert!(check_staging_space(&ctx, &plan).is_ok());
+        assert!(check_staging_space(&plan, &staging).is_ok());
     }
 
     #[test]
@@ -1993,6 +2036,7 @@ mod tests {
                 redundancy_pct: 15,
                 parity: true,
                 defect_management: false,
+                staging: "/tmp/s".into(),
             }))
             .unwrap();
         let err = ctx.ask("proceed?").unwrap_err();
@@ -2022,6 +2066,7 @@ mod tests {
                     redundancy_pct: 25,
                     parity: true,
                     defect_management: false,
+                    staging: staging.clone(),
                 }))
                 .unwrap();
             ack_tx.send(Ack::Proceed).unwrap();
@@ -2094,6 +2139,7 @@ mod tests {
                     redundancy_pct: 15,
                     parity: true,
                     defect_management: true,
+                    staging: staging.clone(),
                 }))
                 .unwrap();
             ack_tx.send(Ack::Proceed).unwrap();
@@ -2148,6 +2194,7 @@ mod tests {
                     redundancy_pct: 0,
                     parity: true,
                     defect_management: false,
+                    staging: dir.path().join("staging"),
                 }))
                 .unwrap();
             ack_tx.send(Ack::Abort).unwrap();
@@ -2387,6 +2434,9 @@ mod tests {
                 panic!("expected Finished, got {:?}", events.last());
             };
             assert_eq!(report.iso_sha256.as_deref(), Some(sha.as_str()));
+            let log = dir.path().join("copy.burn.log");
+            assert_eq!(report.written_files, vec![log.clone()]);
+            assert!(log.is_file());
             assert!(events
                 .iter()
                 .any(|ev| matches!(ev, StageEvent::Info(t) if t.contains("recorded sha256"))));

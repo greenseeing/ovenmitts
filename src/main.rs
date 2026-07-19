@@ -48,7 +48,7 @@ fn dispatch(cli: Cli) -> anyhow::Result<()> {
         cfg.device_explicit = true;
     }
     if let Some(staging) = &cli.staging {
-        cfg.staging = staging.clone();
+        cfg.staging = ovenmitts::config::expand_tilde(staging);
     }
 
     match cli.command {
@@ -337,7 +337,8 @@ fn print_report(report: &RunReport) {
     let empty = report.stages.is_empty()
         && report.iso_path.is_none()
         && report.iso_sha256.is_none()
-        && report.reminders.is_empty();
+        && report.reminders.is_empty()
+        && report.written_files.is_empty();
     if empty {
         return;
     }
@@ -357,6 +358,9 @@ fn print_report(report: &RunReport) {
             human_bytes(report.iso_bytes),
             report.iso_bytes
         );
+    }
+    for f in &report.written_files {
+        println!("  wrote: {}", f.display());
     }
     for r in &report.reminders {
         println!("  reminder: {r}");
