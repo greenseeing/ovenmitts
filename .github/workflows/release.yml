@@ -1,0 +1,41 @@
+# On a v* tag: cross-compile static musl amd64+arm64 binaries and publish them
+# (with SHA-256 sums and install.sh) to a GitHub release. No one-time setup:
+# the workflow's own token may write releases via `permissions` below.
+#
+# Image tags on cargo-zigbuild are the tool version, not the Rust version —
+# 0.23.0 ships Rust 1.93.0; older-looking tags can carry a Rust below this
+# crate's 1.80 MSRV. GitHub's runners are amd64-only; the arm64 binary is
+# cross-compiled, exactly as it was on Codeberg's.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    container: ghcr.io/rust-cross/cargo-zigbuild:0.23.0
+    defaults:
+      run:
+        # Container jobs default to sh; the build step below is written for bash.
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - name: build
+        run: |
+          rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+          cargo zigbuild --release --locked --target x86_64-unknown-linux-musl --target aarch64-unknown-linux-musl --bin ovenmitts
+          mkdir -p dist
+          cp target/x86_64-unknown-linux-musl/release/ovenmitts dist/ovenmitts-linux-amd64
+          cp target/aarch64-unknown-linux-musl/release/ovenmitts dist/ovenmitts-linux-arm64
+          cp install.sh dist/install.sh
+          # Per-file sidecars, not one combined sum file: install.sh fetches `<asset>.sha256`.
+          cd dist && for f in ovenmitts-linux-amd64 ovenmitts-linux-arm64; do sha256sum "$f" > "$f.sha256"; done
+      - name: publish
+        uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*

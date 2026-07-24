@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # ovenmitts installer — safe to re-run; upgrades in place when a newer release exists.
 #
-#   curl -fsSL https://codeberg.org/greenseer/ovenmitts/raw/branch/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/greenseeing/ovenmitts/main/install.sh | bash
 #
 set -euo pipefail
 
-REPO="greenseer/ovenmitts"
+REPO="greenseeing/ovenmitts"
 BIN="ovenmitts"
 
 # --- output helpers -------------------------------------------------------
@@ -102,9 +102,9 @@ latest_version() {
     printf '%s' "${OVENMITTS_VERSION#v}"
     return 0
   fi
-  # Resolve the newest release tag (e.g. v0.1.0 -> 0.1.0) via the Codeberg API.
+  # Resolve the newest release tag (e.g. v0.1.0 -> 0.1.0) via the GitHub API.
   local body
-  body="$(curl -sSL "https://codeberg.org/api/v1/repos/$REPO/releases/latest" 2>/dev/null || true)"
+  body="$(curl -sSL "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null || true)"
   printf '%s' "$body" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"v\{0,1\}\([^"]*\)".*/\1/p' | head -n1
 }
 
@@ -156,7 +156,7 @@ verify_checksum() {
 # sidesteps ETXTBSY ("Text file busy") when replacing a running binary.
 install_binary() {
   local version="$1" arch="$2" bindir="$3"
-  local url="https://codeberg.org/$REPO/releases/download/v${version}/${BIN}-linux-${arch}"
+  local url="https://github.com/$REPO/releases/download/v${version}/${BIN}-linux-${arch}"
   step "Downloading $BIN v$version ($arch)"
 
   mkdir -p "$bindir" 2>/dev/null || as_root mkdir -p "$bindir"

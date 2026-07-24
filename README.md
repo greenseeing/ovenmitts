@@ -21,7 +21,7 @@ research in [`mdisc-archival-claims_2026-07-16/`](mdisc-archival-claims_2026-07-
 ## Install
 
 ```sh
-curl -fsSL https://codeberg.org/greenseer/ovenmitts/raw/branch/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/greenseeing/ovenmitts/main/install.sh | bash
 ```
 
 The installer detects `apt`/`dnf`/`zypper`/`pacman`, installs the burn
@@ -35,7 +35,7 @@ latest release and the backends are present. To pin a version, set
 Or build from source:
 
 ```sh
-git clone https://codeberg.org/greenseer/ovenmitts
+git clone https://github.com/greenseeing/ovenmitts
 cd ovenmitts
 cargo build --release
 # binary at target/release/ovenmitts

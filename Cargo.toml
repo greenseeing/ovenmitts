@@ -1,10 +1,10 @@
 [package]
 name = "ovenmitts"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2021"
 description = "Archival burning of large files (VeraCrypt containers) to BD-R / M-DISC with parity and cache-proof verification."
 license = "MIT"
-repository = "https://codeberg.org/greenseer/ovenmitts"
+repository = "https://github.com/greenseeing/ovenmitts"
 readme = "README.md"
 rust-version = "1.80"
 

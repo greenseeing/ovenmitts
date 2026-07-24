@@ -11,7 +11,7 @@ use anyhow::{bail, Context, Result};
 use crate::tools::which;
 
 fn installer_url() -> String {
-    "https://codeberg.org/greenseer/ovenmitts/raw/branch/main/install.sh".to_string()
+    "https://raw.githubusercontent.com/greenseeing/ovenmitts/main/install.sh".to_string()
 }
 
 // pipefail: a failed download must surface as a failure instead of feeding
@@ -46,16 +46,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pipeline_fetches_the_installer_from_codeberg_main() {
+    fn pipeline_fetches_the_installer_from_github_main() {
         let p = installer_pipeline();
         assert!(p.contains("set -o pipefail"), "missing pipefail guard: {p}");
         assert!(
-            p.contains("https://codeberg.org/greenseer/ovenmitts/raw/branch/main/install.sh"),
-            "installer not fetched from the Codeberg raw main URL: {p}"
+            p.contains("https://raw.githubusercontent.com/greenseeing/ovenmitts/main/install.sh"),
+            "installer not fetched from the GitHub raw main URL: {p}"
         );
         assert!(
-            !p.contains("github") && !p.contains("githubusercontent"),
-            "installer must not reference GitHub: {p}"
+            !p.contains("codeberg"),
+            "installer must not reference Codeberg: {p}"
         );
         assert!(p.contains("| bash"), "installer is not piped to bash: {p}");
     }
