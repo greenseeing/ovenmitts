@@ -39,3 +39,6 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           files: dist/*
+          # Explicit: a release left drafted serves nothing — /releases/latest
+          # excludes drafts, so install.sh and the updater would 404.
+          draft: false
