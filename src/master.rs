@@ -50,6 +50,11 @@ pub fn build_iso(
         "xorriso produced an empty ISO at {}",
         input.out_iso.display()
     );
+    // xorriso wrote the image; make sure it is on the platter before the burn
+    // reads it back and before anything reports it as staged.
+    std::fs::File::open(input.out_iso)
+        .and_then(|f| f.sync_all())
+        .with_context(|| format!("fsync mastered ISO {}", input.out_iso.display()))?;
     Ok(size)
 }
 
@@ -191,7 +196,7 @@ pub fn write_manifest(
             let _ = writeln!(t, "    par2 slice: {slice} bytes ({blocks} blocks)");
         }
     }
-    std::fs::write(out, t).with_context(|| format!("write {}", out.display()))
+    crate::fsutil::write_durable(out, t)
 }
 
 /// RECOVERY.txt: self-documenting restore instructions (darbrrb lesson) -
@@ -312,7 +317,7 @@ pub fn write_recovery(out: &Path, label: &str, payloads: &[Payload]) -> Result<(
             "   header at the end of the container is the first fallback."
         );
     }
-    std::fs::write(out, t).with_context(|| format!("write {}", out.display()))
+    crate::fsutil::write_durable(out, t)
 }
 
 /// After mastering: `xorriso -indev <iso> -find / -exec report_lba --`,
@@ -332,7 +337,7 @@ pub fn report_lba(tools: &Tools, iso: &Path, out: &Path) -> Result<()> {
             tail.join("\n")
         );
     }
-    std::fs::write(out, &output.stdout).with_context(|| format!("write {}", out.display()))
+    crate::fsutil::write_durable(out, &output.stdout)
 }
 
 #[cfg(test)]

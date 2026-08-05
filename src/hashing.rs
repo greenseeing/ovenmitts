@@ -42,6 +42,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// Write sha256sum-compatible lines: "<hex>  <relpath>\n" (two spaces).
+/// Durable: these files are what a future recovery starts from.
 pub fn write_checksums(entries: &[(String, String)], out: &Path) -> Result<()> {
     let mut text = String::new();
     for (hash, rel) in entries {
@@ -50,7 +51,7 @@ pub fn write_checksums(entries: &[(String, String)], out: &Path) -> Result<()> {
         text.push_str(rel);
         text.push('\n');
     }
-    std::fs::write(out, text).with_context(|| format!("write {}", out.display()))
+    crate::fsutil::write_durable(out, text)
 }
 
 /// Parse sha256sum-format text into (hex, relpath) pairs.

@@ -93,10 +93,13 @@ pub fn save_device(path: &Path, device: &str) -> Result<()> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
-    // write-then-rename: a torn write would brick every later load
+    // write-then-rename: a torn write would brick every later load. The tmp
+    // write is fsynced before the rename and the directory after it, so a
+    // crash never leaves an empty or half-written config in place.
     let tmp = path.with_extension("toml.tmp");
-    std::fs::write(&tmp, doc.to_string()).with_context(|| format!("writing {}", tmp.display()))?;
-    std::fs::rename(&tmp, path).with_context(|| format!("replacing config {}", path.display()))
+    crate::fsutil::write_durable(&tmp, doc.to_string())?;
+    std::fs::rename(&tmp, path).with_context(|| format!("replacing config {}", path.display()))?;
+    crate::fsutil::fsync_dir(path.parent().unwrap_or(Path::new(".")))
 }
 
 impl Config {

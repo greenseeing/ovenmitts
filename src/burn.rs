@@ -43,7 +43,20 @@ pub fn burn_iso(
         .with_context(|| format!("stat ISO {}", iso.display()))?
         .len();
     let args = burn_args(device, iso, speed);
-    let mut log = std::fs::File::create(burn_log_path(iso)).ok();
+    // Append, never truncate: a retry must keep the failed attempt's
+    // transcript. Each attempt starts under its own dated header.
+    let mut log = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(burn_log_path(iso))
+        .ok();
+    if let Some(f) = log.as_mut() {
+        let _ = writeln!(
+            f,
+            "=== burn attempt {} ===",
+            chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
+        );
+    }
     run_streaming(&tools.xorriso, &args, stall, &mut |line| {
         if let Some(f) = log.as_mut() {
             let _ = writeln!(f, "{line}");
@@ -422,6 +435,32 @@ mod tests {
             .any(|(p, l)| p.is_none() && l.contains("completed successfully")));
         let log = std::fs::read_to_string(burn_log_path(&iso)).unwrap();
         assert!(log.contains("completed successfully"), "{log}");
+    }
+
+    #[test]
+    fn burn_log_appends_across_attempts_with_headers() {
+        // A retry after a failed attempt must not destroy the earlier
+        // transcript - each attempt appends under its own dated header.
+        let dir = tempfile::tempdir().unwrap();
+        let iso = dir.path().join("v.iso");
+        std::fs::write(&iso, vec![0u8; 2048]).unwrap();
+        let script = "#!/bin/sh\necho 'attempt output' >&2\n";
+        let tools = fake_tools(script, dir.path());
+        for _ in 0..2 {
+            burn_iso(
+                &tools,
+                "/dev/sr0",
+                &iso,
+                None,
+                Duration::ZERO,
+                &mut |_, _| {},
+            )
+            .unwrap();
+        }
+        let log = std::fs::read_to_string(burn_log_path(&iso)).unwrap();
+        assert_eq!(log.matches("=== burn attempt ").count(), 2, "{log}");
+        assert_eq!(log.matches("attempt output").count(), 2, "{log}");
+        assert!(log.contains(" UTC ==="), "{log}");
     }
 
     #[test]
