@@ -7,6 +7,7 @@ pub mod media;
 pub mod parity;
 pub mod picker;
 pub mod plan;
+pub mod proc;
 pub mod runner;
 pub mod tools;
 pub mod tui;

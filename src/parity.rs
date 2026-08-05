@@ -1,6 +1,6 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use anyhow::{bail, ensure, Context, Result};
 
@@ -56,10 +56,9 @@ pub fn create(
         payload.slice_bytes(),
         mem_mb(),
     );
-    let mut child = Command::new(par2)
+    let mut child = crate::proc::command(par2)
         .args(&args)
         .current_dir(parent)
-        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

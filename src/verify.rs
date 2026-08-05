@@ -1,7 +1,7 @@
 use std::io::{BufRead, BufReader, Read};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::mpsc::Sender;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -25,7 +25,10 @@ pub fn wait_medium_ready(
     cb: &mut dyn FnMut(String),
 ) -> Result<()> {
     if let Some(eject_bin) = &tools.eject {
-        let _ = Command::new(eject_bin).arg("-t").arg(device).output();
+        let _ = crate::proc::command(eject_bin)
+            .arg("-t")
+            .arg(device)
+            .output();
     }
     let start = Instant::now();
     let mut hinted = false;
@@ -60,7 +63,7 @@ pub fn eject(tools: &Tools, device: &str) -> Result<()> {
     let Some(bin) = &tools.eject else {
         bail!("'eject' not found - needed for cache-proof verification (install util-linux)");
     };
-    let out = Command::new(bin)
+    let out = crate::proc::command(bin)
         .arg(device)
         .output()
         .with_context(|| format!("running eject {device}"))?;
@@ -219,7 +222,7 @@ pub fn ensure_unmounted(tools: &Tools, device: &str) -> Result<()> {
     let Some(udisksctl) = &tools.udisksctl else {
         bail!("{device} is mounted at {mp}; unmount it first: sudo umount {device}");
     };
-    let out = Command::new(udisksctl)
+    let out = crate::proc::command(udisksctl)
         .args(["unmount", "-b", device])
         .output()
         .context("running udisksctl unmount")?;
@@ -277,7 +280,7 @@ pub fn mount_ro(tools: &Tools, device: &str) -> Result<PathBuf> {
     let Some(udisksctl) = &tools.udisksctl else {
         bail!("udisksctl not found; mount manually: sudo mount -o ro {device} /mnt");
     };
-    let ro = Command::new(udisksctl)
+    let ro = crate::proc::command(udisksctl)
         .args(["mount", "-b", device, "-o", "ro"])
         .output()
         .context("running udisksctl mount")?;
@@ -285,7 +288,7 @@ pub fn mount_ro(tools: &Tools, device: &str) -> Result<PathBuf> {
         ro
     } else {
         // older udisks without -o; optical media get mounted read-only anyway
-        let plain = Command::new(udisksctl)
+        let plain = crate::proc::command(udisksctl)
             .args(["mount", "-b", device])
             .output()
             .context("running udisksctl mount")?;
@@ -311,7 +314,7 @@ pub fn unmount(tools: &Tools, device: &str) -> Result<()> {
     let Some(udisksctl) = &tools.udisksctl else {
         return Ok(());
     };
-    let out = Command::new(udisksctl)
+    let out = crate::proc::command(udisksctl)
         .args(["unmount", "-b", device])
         .output()
         .with_context(|| format!("spawning {}", udisksctl.display()))?;
@@ -334,9 +337,8 @@ pub fn check_media(
     device: &str,
     cb: &mut dyn FnMut(Option<f32>, String),
 ) -> Result<bool> {
-    let mut child = Command::new(&tools.xorriso)
+    let mut child = crate::proc::command(&tools.xorriso)
         .args(["-md5", "on", "-indev", device, "-check_media", "--"])
-        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

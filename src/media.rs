@@ -6,7 +6,7 @@ use crate::tools::Tools;
 /// Probe the drive: run `xorriso -outdev <dev> -toc -list_formats -list_speeds`
 /// and optionally `dvd+rw-mediainfo` for the media ID.
 pub fn probe(tools: &Tools, device: &str) -> Result<MediaInfo> {
-    let out = std::process::Command::new(&tools.xorriso)
+    let out = crate::proc::command(&tools.xorriso)
         .args(["-outdev", device, "-toc", "-list_formats", "-list_speeds"])
         .output()
         .with_context(|| format!("cannot run {}", tools.xorriso.display()))?;
@@ -19,7 +19,7 @@ pub fn probe(tools: &Tools, device: &str) -> Result<MediaInfo> {
         parse_xorriso_probe(&text).with_context(|| probe_failure_context(device, &text))?;
     if info.media_id.is_none() {
         if let Some(mediainfo) = &tools.mediainfo {
-            if let Ok(mo) = std::process::Command::new(mediainfo).arg(device).output() {
+            if let Ok(mo) = crate::proc::command(mediainfo).arg(device).output() {
                 info.media_id = parse_media_id(&String::from_utf8_lossy(&mo.stdout));
             }
         }

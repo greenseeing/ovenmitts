@@ -1113,7 +1113,7 @@ pub fn preflight_probe(
     }
 
     if let Some(veracrypt) = &ctx.tools.veracrypt {
-        let listing = veracrypt_list(veracrypt);
+        let listing = veracrypt_list(veracrypt)?;
         for m in payloads.iter().flat_map(|p| p.files.iter()) {
             ensure!(
                 !listing_mentions(&listing, &m.abs),
@@ -1195,14 +1195,29 @@ fn inspect_payloads(paths: &[PathBuf]) -> Result<(Vec<Payload>, Vec<String>)> {
     Ok((payloads, warnings))
 }
 
-fn veracrypt_list(bin: &Path) -> String {
-    match std::process::Command::new(bin)
-        .args(["--text", "--list"])
-        .output()
-    {
-        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).into_owned(),
-        _ => String::new(),
+// The mounted-container check must fail CLOSED: burning a live container yields
+// a silently corrupt archive, the exact disaster this tool exists to prevent.
+// `veracrypt --text --list` exits non-zero with "No volumes mounted" when
+// nothing is mounted (that is the clean, empty case); any other failure means
+// we could not determine mount state and must refuse rather than assume safe.
+fn veracrypt_list(bin: &Path) -> Result<String> {
+    let out = crate::burn::spawn_retrying(bin, &["--text".into(), "--list".into()])?
+        .wait_with_output()
+        .with_context(|| format!("running {} --text --list", bin.display()))?;
+    if out.status.success() {
+        return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
     }
+    let combined =
+        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+    if combined.contains("No volumes mounted") {
+        return Ok(String::new());
+    }
+    bail!(
+        "could not determine whether a VeraCrypt container is mounted \
+         (veracrypt --list failed: {}) - dismount any container manually, \
+         or remove veracrypt from PATH to skip this check",
+        combined.trim()
+    )
 }
 
 fn listing_mentions(listing: &str, path: &Path) -> bool {
@@ -1722,34 +1737,48 @@ mod tests {
 
     #[test]
     fn preflight_refuses_mounted_container() {
-        // an ETXTBSY-hit veracrypt spawn is swallowed as "not mounted", so
-        // retry on any wrong outcome, bounded
-        let mut last = String::new();
-        for _ in 0..50 {
-            let dir = tempfile::tempdir().unwrap();
-            let payload = dir.path().join("vault.hc");
-            std::fs::write(&payload, b"secret").unwrap();
-            let veracrypt = dir.path().join("veracrypt");
-            write_script(
-                &veracrypt,
-                &format!(
-                    "#!/bin/sh\necho '1: {} /dev/mapper/veracrypt1 /mnt/v'\n",
-                    payload.display()
-                ),
-            );
-            let tools = tools_with("/bin/true".into(), None, None, Some(veracrypt));
-            let (ctx, _rx, _ack) = ctx_pair(
-                cfg_with(Path::new("/dev/null"), &dir.path().join("staging")),
-                tools,
-            );
-            match preflight_probe(&ctx, &[payload]) {
-                Err(e) if e.to_string().contains("MOUNTED VeraCrypt container") => return,
-                Err(e) => last = format!("{e:#}"),
-                Ok(_) => last = "preflight succeeded".into(),
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        panic!("never refused the mounted container; last outcome: {last}");
+        let dir = tempfile::tempdir().unwrap();
+        let payload = dir.path().join("vault.hc");
+        std::fs::write(&payload, b"secret").unwrap();
+        let veracrypt = dir.path().join("veracrypt");
+        write_script(
+            &veracrypt,
+            &format!(
+                "#!/bin/sh\necho '1: {} /dev/mapper/veracrypt1 /mnt/v'\n",
+                payload.display()
+            ),
+        );
+        let tools = tools_with("/bin/true".into(), None, None, Some(veracrypt));
+        let (ctx, _rx, _ack) = ctx_pair(
+            cfg_with(Path::new("/dev/null"), &dir.path().join("staging")),
+            tools,
+        );
+        let err = preflight_probe(&ctx, &[payload]).unwrap_err();
+        assert!(
+            err.to_string().contains("MOUNTED VeraCrypt container"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn veracrypt_no_volumes_is_the_clean_empty_case() {
+        // `--text --list` exits 1 with this line when nothing is mounted.
+        let dir = tempfile::tempdir().unwrap();
+        let veracrypt = dir.path().join("veracrypt");
+        write_script(
+            &veracrypt,
+            "#!/bin/sh\necho 'No volumes mounted.' >&2\nexit 1\n",
+        );
+        assert_eq!(veracrypt_list(&veracrypt).unwrap(), "");
+    }
+
+    #[test]
+    fn veracrypt_other_failure_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let veracrypt = dir.path().join("veracrypt");
+        write_script(&veracrypt, "#!/bin/sh\necho 'boom' >&2\nexit 3\n");
+        let err = veracrypt_list(&veracrypt).unwrap_err();
+        assert!(err.to_string().contains("could not determine"), "{err:#}");
     }
 
     // Probe-only fake: reports media in exactly the `loaded` devices,

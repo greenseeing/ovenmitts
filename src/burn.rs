@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::mpsc;
 
 use anyhow::{bail, Context, Result};
@@ -233,9 +233,8 @@ pub(crate) fn run_streaming(
 pub(crate) fn spawn_retrying(bin: &Path, args: &[String]) -> Result<std::process::Child> {
     let mut tries = 0;
     loop {
-        match Command::new(bin)
+        match crate::proc::command(bin)
             .args(args)
-            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
