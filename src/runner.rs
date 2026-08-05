@@ -360,10 +360,18 @@ fn burn_pipeline(ctx: &RunnerCtx, req: &BurnRequest, stage: &mut Stage) -> Resul
     let mut params = BurnParams::resolve(&ctx.cfg, req);
     let mut prev_warnings: Vec<String> = Vec::new();
     let mut prev_staging_warn: Option<String> = None;
+    let mut staging_note_pending = true;
     // Confirm loop: the plan on screen is always one this loop computed for the
     // params it holds; Amend re-plans (pure — media stays probed once).
     let (params, plan) = loop {
         let plan = plan::build_plan(&params.plan_input(&payloads, ctx.cfg.headroom_pct), &media);
+        if staging_note_pending {
+            staging_note_pending = false;
+            let needed = plan.parity_bytes_est + plan.total_bytes_est;
+            if let Some(note) = stale_staging_note(&params.staging, needed) {
+                ctx.info(note);
+            }
+        }
         for w in plan.warnings.iter().filter(|w| !prev_warnings.contains(w)) {
             ctx.warn(w.clone());
         }
@@ -548,6 +556,9 @@ fn burn_pipeline(ctx: &RunnerCtx, req: &BurnRequest, stage: &mut Stage) -> Resul
 
     *stage = Stage::Master;
     ctx.start(Stage::Master);
+    // The ISO is the big late allocation: parity above (or a parallel run)
+    // may have consumed the space that was free at confirm time.
+    check_staging_space(&plan, &params.staging)?;
     let manifest_path = stage_dir.join("MANIFEST.txt");
     let recovery_path = stage_dir.join("RECOVERY.txt");
     master::write_manifest(
@@ -1305,6 +1316,76 @@ fn ensure_fits(plan: &ArchivePlan, headroom_pct: u32) -> Result<()> {
     Ok(())
 }
 
+/// Staging is never auto-cleaned (an archival tool never deletes staged
+/// data), so earlier run dirs accumulate until burns fail on space. Flag
+/// siblings that are >30 days old, or whose combined size exceeds what this
+/// plan still needs, and leave the deleting to the operator.
+fn stale_staging_note(staging: &Path, needed: u64) -> Option<String> {
+    const STALE_DAYS: u64 = 30;
+    let entries = std::fs::read_dir(staging).ok()?;
+    let mut dirs: Vec<(String, u64, u64)> = Vec::new(); // (name, age days, bytes)
+    for e in entries.flatten() {
+        let p = e.path();
+        if !p.is_dir() {
+            continue;
+        }
+        let age_days = std::fs::metadata(&p)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.elapsed().ok())
+            .map(|d| d.as_secs() / 86_400)
+            .unwrap_or(0);
+        dirs.push((file_name_string(&p), age_days, dir_size(&p)));
+    }
+    let total: u64 = dirs.iter().map(|(_, _, b)| *b).sum();
+    let stale: Vec<&(String, u64, u64)> = dirs
+        .iter()
+        .filter(|(_, age, _)| *age > STALE_DAYS)
+        .collect();
+    if stale.is_empty() && total <= needed {
+        return None;
+    }
+    let flagged: Vec<&(String, u64, u64)> = if stale.is_empty() {
+        dirs.iter().collect()
+    } else {
+        stale
+    };
+    let bytes: u64 = flagged.iter().map(|(_, _, b)| *b).sum();
+    let mut names: Vec<&str> = flagged.iter().map(|(n, _, _)| n.as_str()).collect();
+    names.sort_unstable();
+    let shown = names.len().min(5);
+    let mut listed = names[..shown].join(", ");
+    if names.len() > shown {
+        listed.push_str(&format!(", … {} more", names.len() - shown));
+    }
+    Some(format!(
+        "staging {} holds {} earlier run dir(s), {}: {listed} - remove ones you \
+         have burned and verified (ovenmitts never deletes staged data)",
+        staging.display(),
+        flagged.len(),
+        human_bytes(bytes),
+    ))
+}
+
+fn dir_size(dir: &Path) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if let Ok(m) = p.symlink_metadata() {
+                total += m.len();
+            }
+        }
+    }
+    total
+}
+
 // payloads stay in place; staging holds parity + the ISO (which contains both)
 fn check_staging_space(plan: &ArchivePlan, staging: &Path) -> Result<()> {
     let needed = plan.parity_bytes_est + plan.total_bytes_est;
@@ -1882,6 +1963,72 @@ mod tests {
 
     fn is_busy(e: &anyhow::Error) -> bool {
         format!("{e:#}").contains("Text file busy")
+    }
+
+    fn set_mtime_days_ago(p: &Path, days: u64) {
+        use std::os::unix::ffi::OsStrExt;
+        let t = std::time::SystemTime::now() - std::time::Duration::from_secs(days * 86_400);
+        let secs = t
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as libc::time_t;
+        let tv = [
+            libc::timeval {
+                tv_sec: secs,
+                tv_usec: 0,
+            },
+            libc::timeval {
+                tv_sec: secs,
+                tv_usec: 0,
+            },
+        ];
+        let c = std::ffi::CString::new(p.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::utimes(c.as_ptr(), tv.as_ptr()) }, 0);
+    }
+
+    #[test]
+    fn stale_staging_dirs_are_reported_not_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join("staging");
+        let old_run = staging.join("OLD_ARCHIVE");
+        std::fs::create_dir_all(&old_run).unwrap();
+        std::fs::write(old_run.join("OLD_ARCHIVE.iso"), vec![0u8; 4096]).unwrap();
+        set_mtime_days_ago(&old_run, 40);
+
+        let note = stale_staging_note(&staging, 1 << 40).expect("40-day dir must be flagged");
+        assert!(note.contains("OLD_ARCHIVE"), "{note}");
+        assert!(note.contains("burned and verified"), "{note}");
+        assert!(old_run.exists(), "must never delete staged data");
+    }
+
+    #[test]
+    fn crowding_staging_dirs_are_reported_by_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join("staging");
+        let recent = staging.join("RECENT");
+        std::fs::create_dir_all(&recent).unwrap();
+        std::fs::write(recent.join("RECENT.iso"), vec![0u8; 8192]).unwrap();
+
+        // fresh dir, but bigger than what this plan still needs to allocate
+        let note = stale_staging_note(&staging, 4096).expect("crowding dirs must be flagged");
+        assert!(note.contains("RECENT"), "{note}");
+    }
+
+    #[test]
+    fn clean_staging_produces_no_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join("staging");
+        std::fs::create_dir_all(&staging).unwrap();
+        assert_eq!(stale_staging_note(&staging, 1024), None);
+        let fresh = staging.join("FRESH");
+        std::fs::create_dir_all(&fresh).unwrap();
+        std::fs::write(fresh.join("f"), b"x").unwrap();
+        assert_eq!(
+            stale_staging_note(&staging, 1 << 30),
+            None,
+            "a small fresh dir is not worth a note"
+        );
+        assert_eq!(stale_staging_note(Path::new("/nonexistent-xyz"), 1), None);
     }
 
     #[test]
