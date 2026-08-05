@@ -12,6 +12,7 @@ pub mod plan;
 pub mod proc;
 pub mod runner;
 pub mod shutdown;
+pub mod span;
 pub mod tools;
 pub mod tui;
 pub mod update;

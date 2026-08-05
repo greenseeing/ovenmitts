@@ -724,8 +724,9 @@ impl<'a> BurnRun<'a> {
             params.parity.then_some(params.redundancy_pct),
             params.defect_management,
             ecc_attempted,
+            None,
         )?;
-        master::write_recovery(&recovery_path, label, payloads, ecc_attempted)?;
+        master::write_recovery(&recovery_path, label, payloads, ecc_attempted, None)?;
         let iso = staging.dir.join(format!("{label}.iso"));
         let input = master::MasterInput {
             label,
@@ -734,6 +735,7 @@ impl<'a> BurnRun<'a> {
             checksums: &sums.path,
             manifest: &manifest_path,
             recovery: &recovery_path,
+            set_txt: None,
             out_iso: &iso,
         };
         let mut iso_bytes = master::build_iso(
@@ -2448,6 +2450,7 @@ mod tests {
             capacity: 0,
             budget: 0,
             fits: true,
+            span: None,
             warnings: vec![],
         };
         let err = check_staging_space(&plan, &staging).unwrap_err();

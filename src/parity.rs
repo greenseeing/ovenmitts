@@ -55,31 +55,100 @@ pub fn create(
         parent,
         redundancy_pct,
         payload.slice_bytes(),
-        mem_mb(),
+        mem_mb(MEM_CAP_MB),
     );
-    // stdout carries the Processing:/Constructing: progress stream, stderr
-    // the failure cause; both ride the shared watchdog-equipped pump.
+    run_par2_create(par2, &args, Some(parent), stall, cb)?;
+    collect_outputs(&out_dir, &payload_name)
+}
+
+/// par2 create for a multi-disc SET: ONE recovery set across the part files
+/// in `set_dir`. cwd = set_dir and -B<set_dir>, so the set stores bare part
+/// names and `par2 r` works from any directory of collected files. Exact
+/// -c<recovery_blocks>, NEVER -r: the count was derived from the parity
+/// disc's capacity at plan time (span::plan_span); a percentage would let
+/// par2 re-round it. Outputs land in out_dir: `<source>.par2` (the index,
+/// burned onto EVERY disc) plus the recovery volume(s).
+pub fn create_set(
+    tools: &Tools,
+    span: &crate::span::SpanPlan,
+    set_dir: &Path,
+    out_dir: &Path,
+    stall: Duration,
+    cb: &mut dyn FnMut(Option<f32>, String),
+) -> Result<Vec<PathBuf>> {
+    let par2 = tools
+        .par2
+        .as_ref()
+        .context("par2 not found (install par2cmdline or par2cmdline-turbo)")?;
+    ensure!(
+        span.recovery_blocks > 0,
+        "create_set called with no recovery blocks planned"
+    );
+    let part_names: Vec<String> = span
+        .discs
+        .iter()
+        .filter_map(|d| d.part.as_ref())
+        .map(|p| p.file_name.clone())
+        .collect();
+    ensure!(!part_names.is_empty(), "span plan has no parts");
+    let set_dir = set_dir
+        .canonicalize()
+        .with_context(|| format!("resolve {}", set_dir.display()))?;
+    std::fs::create_dir_all(out_dir).with_context(|| format!("create {}", out_dir.display()))?;
+    let out_dir = out_dir
+        .canonicalize()
+        .with_context(|| format!("resolve {}", out_dir.display()))?;
+    let out_par2 = out_dir.join(format!("{}.par2", span.source_name));
+
+    let cap = if span.source_bytes > LARGE_SOURCE_BYTES {
+        MEM_CAP_LARGE_MB
+    } else {
+        MEM_CAP_MB
+    };
+    let args = create_set_args(
+        &part_names,
+        &out_par2,
+        &set_dir,
+        span.block,
+        span.recovery_blocks,
+        mem_mb(cap),
+    );
+    run_par2_create(par2, &args, Some(&set_dir), stall, cb)?;
+    collect_outputs(&out_dir, &span.source_name)
+}
+
+// stdout carries the Processing:/Constructing: progress stream, stderr the
+// failure cause; both ride the shared watchdog-equipped pump.
+fn run_par2_create(
+    par2: &Path,
+    args: &[String],
+    cwd: Option<&Path>,
+    stall: Duration,
+    cb: &mut dyn FnMut(Option<f32>, String),
+) -> Result<()> {
     let mut err_text = String::new();
-    let status =
-        crate::proc::stream_lines(par2, &args, Some(parent), stall, &mut |is_err, line| {
-            if is_err {
-                err_text.push_str(line);
-                err_text.push('\n');
-            } else {
-                cb(parse_progress_line(line), line.to_string());
-            }
-        })?;
+    let status = crate::proc::stream_lines(par2, args, cwd, stall, &mut |is_err, line| {
+        if is_err {
+            err_text.push_str(line);
+            err_text.push('\n');
+        } else {
+            cb(parse_progress_line(line), line.to_string());
+        }
+    })?;
     if !status.success() {
         bail!("par2 create failed ({status}): {}", err_text.trim());
     }
+    Ok(())
+}
 
-    let mut produced: Vec<PathBuf> = std::fs::read_dir(&out_dir)?
+fn collect_outputs(out_dir: &Path, prefix: &str) -> Result<Vec<PathBuf>> {
+    let mut produced: Vec<PathBuf> = std::fs::read_dir(out_dir)?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .filter(|p| {
             p.file_name()
                 .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with(&payload_name) && n.ends_with(".par2"))
+                .is_some_and(|n| n.starts_with(prefix) && n.ends_with(".par2"))
         })
         .collect();
     produced.sort();
@@ -115,6 +184,30 @@ pub fn create_args(
     args
 }
 
+/// Pure: build the set-level par2 argv (testable without par2). Exact
+/// -c count, never -r; operands are the bare part names, resolved against
+/// -B<set_dir> which is also the cwd.
+pub fn create_set_args(
+    part_names: &[String],
+    out_par2: &Path,
+    set_dir: &Path,
+    block: u64,
+    recovery_blocks: u64,
+    mem_mb: u32,
+) -> Vec<String> {
+    let mut args = vec![
+        "create".to_string(),
+        format!("-B{}", set_dir.display()),
+        format!("-s{block}"),
+        format!("-c{recovery_blocks}"),
+        "-n1".to_string(),
+        format!("-m{mem_mb}"),
+        out_par2.display().to_string(),
+    ];
+    args.extend(part_names.iter().cloned());
+    args
+}
+
 /// Pure: parse par2 stdout progress ("Constructing: 12.3%" / "Processing: ...").
 pub fn parse_progress_line(line: &str) -> Option<f32> {
     let t = line.trim();
@@ -132,20 +225,26 @@ pub fn parse_progress_line(line: &str) -> Option<f32> {
     (0.0..=100.0).contains(&pct).then_some(pct)
 }
 
-fn mem_mb() -> u32 {
+const MEM_CAP_MB: u32 = 4096;
+// A set-level run hashes 32k blocks across tens of GB; the higher ceiling
+// roughly halves its wall-clock hours on machines that have the RAM.
+const MEM_CAP_LARGE_MB: u32 = 8192;
+const LARGE_SOURCE_BYTES: u64 = 50 * 1024 * 1024 * 1024;
+
+fn mem_mb(cap_mb: u32) -> u32 {
     std::fs::read_to_string("/proc/meminfo")
-        .map(|t| mem_mb_from_meminfo(&t))
+        .map(|t| mem_mb_from_meminfo(&t, cap_mb))
         .unwrap_or(512)
 }
 
-fn mem_mb_from_meminfo(text: &str) -> u32 {
+fn mem_mb_from_meminfo(text: &str, cap_mb: u32) -> u32 {
     let avail_kb: u64 = text
         .lines()
         .find_map(|l| l.strip_prefix("MemAvailable:"))
         .and_then(|rest| rest.split_whitespace().next())
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
-    (avail_kb / 1024 / 2).clamp(512, 4096) as u32
+    (avail_kb / 1024 / 2).clamp(512, cap_mb as u64) as u32
 }
 
 #[cfg(test)]
@@ -322,11 +421,30 @@ mod tests {
 
     #[test]
     fn mem_halves_available_and_clamps() {
-        assert_eq!(mem_mb_from_meminfo("MemAvailable:    4194304 kB\n"), 2048);
-        assert_eq!(mem_mb_from_meminfo("MemAvailable:   33554432 kB\n"), 4096);
-        assert_eq!(mem_mb_from_meminfo("MemAvailable:     524288 kB\n"), 512);
-        assert_eq!(mem_mb_from_meminfo("MemTotal: 1 kB\n"), 512);
-        assert_eq!(mem_mb_from_meminfo(""), 512);
+        let m = |t| mem_mb_from_meminfo(t, MEM_CAP_MB);
+        assert_eq!(m("MemAvailable:    4194304 kB\n"), 2048);
+        assert_eq!(m("MemAvailable:   33554432 kB\n"), 4096);
+        assert_eq!(m("MemAvailable:     524288 kB\n"), 512);
+        assert_eq!(m("MemTotal: 1 kB\n"), 512);
+        assert_eq!(m(""), 512);
+    }
+
+    #[test]
+    fn mem_cap_rises_for_huge_sources() {
+        // 32 GiB available: half is 16 GiB, clamped by whichever cap applies
+        assert_eq!(
+            mem_mb_from_meminfo("MemAvailable: 33554432 kB\n", MEM_CAP_MB),
+            4096
+        );
+        assert_eq!(
+            mem_mb_from_meminfo("MemAvailable: 33554432 kB\n", MEM_CAP_LARGE_MB),
+            8192
+        );
+        // below the cap the caps agree
+        assert_eq!(
+            mem_mb_from_meminfo("MemAvailable: 4194304 kB\n", MEM_CAP_LARGE_MB),
+            2048
+        );
     }
 
     fn inspect(path: &Path) -> plan::Payload {
@@ -437,6 +555,223 @@ mod tests {
             err.to_string().contains("no non-empty files to protect"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn create_set_args_match_design_contract() {
+        let args = create_set_args(
+            &["vault.hc.001".to_string(), "vault.hc.002".to_string()],
+            Path::new("/stage/parity/vault.hc.par2"),
+            Path::new("/stage/set"),
+            1_966_204,
+            11_357,
+            2048,
+        );
+        assert_eq!(
+            args,
+            vec![
+                "create",
+                "-B/stage/set",
+                "-s1966204",
+                "-c11357",
+                "-n1",
+                "-m2048",
+                "/stage/parity/vault.hc.par2",
+                "vault.hc.001",
+                "vault.hc.002",
+            ]
+        );
+        // NEVER -r: the block count is exact, a percentage would re-round it
+        assert!(!args.iter().any(|a| a.starts_with("-r")), "{args:?}");
+    }
+
+    fn span_plan(
+        set_dir: &Path,
+        source: &str,
+        part_bytes: u64,
+        n: u32,
+        r: u64,
+    ) -> crate::span::SpanPlan {
+        use crate::span::{DiscPlan, DiscRole, PartPlan, SpanPlan};
+        let mut discs: Vec<DiscPlan> = (1..=n)
+            .map(|k| {
+                let name = crate::span::part_file_name(source, k);
+                let bytes: Vec<u8> = (0..part_bytes)
+                    .map(|i| (i as u8).wrapping_mul(k as u8).wrapping_add(k as u8))
+                    .collect();
+                std::fs::write(set_dir.join(&name), bytes).unwrap();
+                DiscPlan {
+                    index: k,
+                    label: format!("T_{k}OF{}", n + 1),
+                    role: DiscRole::Data,
+                    part: Some(PartPlan {
+                        file_name: name,
+                        offset: (k as u64 - 1) * part_bytes,
+                        bytes: part_bytes,
+                    }),
+                }
+            })
+            .collect();
+        discs.push(DiscPlan {
+            index: n + 1,
+            label: format!("T_{}OF{}", n + 1, n + 1),
+            role: DiscRole::Parity,
+            part: None,
+        });
+        SpanPlan {
+            base_label: "T".into(),
+            discs,
+            source_name: source.into(),
+            source_bytes: part_bytes * n as u64,
+            block: 65_536,
+            recovery_blocks: r,
+            per_disc_iso_est: 0,
+            staging_peak: 0,
+        }
+    }
+
+    #[test]
+    fn create_set_runs_par2_in_set_dir_with_bare_part_names() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let set_dir = dir.path().join("set");
+        std::fs::create_dir(&set_dir).unwrap();
+        let span = span_plan(&set_dir, "vault.hc", 128 * 1024, 3, 7);
+        let out_dir = dir.path().join("parity");
+        let fake = dir.path().join("par2");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\n\
+             out=$7\n\
+             d=$(dirname \"$out\")\n\
+             { pwd; printf '%s\\n' \"$@\"; } > \"$d/argv.txt\"\n\
+             printf 'Constructing: 50.0%%\\r'\n\
+             printf 'Done\\n'\n\
+             : > \"$out\"\n\
+             : > \"${out%.par2}.vol000+07.par2\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut tools = Tools::bare("/bin/true");
+        tools.par2 = Some(fake);
+
+        let mut events = Vec::new();
+        let files = create_set(
+            &tools,
+            &span,
+            &set_dir,
+            &out_dir,
+            Duration::ZERO,
+            &mut |p, l| events.push((p, l)),
+        )
+        .unwrap();
+
+        let names: Vec<_> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(names, vec!["vault.hc.par2", "vault.hc.vol000+07.par2"]);
+        assert!(events.iter().any(|(p, _)| *p == Some(50.0)));
+        assert!(events.iter().any(|(p, l)| *p == Some(100.0) && l == "Done"));
+
+        let argv = std::fs::read_to_string(out_dir.join("argv.txt")).unwrap();
+        let mut it = argv.lines();
+        let canon_set = set_dir.canonicalize().unwrap();
+        assert_eq!(
+            std::fs::canonicalize(it.next().unwrap()).unwrap(),
+            canon_set,
+            "par2 must run in the set dir"
+        );
+        let rest: Vec<&str> = it.collect();
+        assert_eq!(rest[0], "create");
+        assert_eq!(
+            std::fs::canonicalize(rest[1].strip_prefix("-B").unwrap()).unwrap(),
+            canon_set
+        );
+        assert_eq!(rest[2], "-s65536");
+        assert_eq!(rest[3], "-c7");
+        assert_eq!(rest[4], "-n1");
+        assert!(rest[5].starts_with("-m"));
+        assert!(rest[6].ends_with("parity/vault.hc.par2"));
+        assert_eq!(
+            &rest[7..],
+            &["vault.hc.001", "vault.hc.002", "vault.hc.003"]
+        );
+        assert!(!rest.iter().any(|a| a.starts_with("-r")), "{rest:?}");
+    }
+
+    #[test]
+    fn create_set_rejects_a_parity_free_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let set_dir = dir.path().join("set");
+        std::fs::create_dir(&set_dir).unwrap();
+        let span = span_plan(&set_dir, "v", 1024, 2, 0);
+        let mut tools = Tools::bare("/bin/true");
+        tools.par2 = Some("/bin/true".into());
+        let err = create_set(
+            &tools,
+            &span,
+            &set_dir,
+            &dir.path().join("out"),
+            Duration::ZERO,
+            &mut |_, _| {},
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("no recovery blocks"), "{err}");
+    }
+
+    // The most important test in M7: with real par2, the set-level recovery
+    // volumes rebuild a COMPLETELY LOST part from the survivors - the
+    // one-disc-loss promise, end to end.
+    #[test]
+    fn create_set_rebuilds_a_lost_part_with_real_par2() {
+        let Some(par2) = crate::tools::which("par2") else {
+            eprintln!("skipping: par2 not installed");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let set_dir = dir.path().join("set");
+        std::fs::create_dir(&set_dir).unwrap();
+        // 3 parts x 3 blocks at -s65536; -c4 covers any one part plus slack
+        let span = span_plan(&set_dir, "blob.bin", 192 * 1024, 3, 4);
+        let lost = std::fs::read(set_dir.join("blob.bin.002")).unwrap();
+        let out_dir = dir.path().join("parity");
+        let mut tools = Tools::bare("/bin/true");
+        tools.par2 = Some(par2.clone());
+        let files = create_set(
+            &tools,
+            &span,
+            &set_dir,
+            &out_dir,
+            Duration::from_secs(120),
+            &mut |_, _| {},
+        )
+        .unwrap();
+        assert!(files.len() >= 2, "index + volumes expected: {files:?}");
+
+        // a lost disc: its part is GONE; survivors + /parity/* in one dir
+        let collected = dir.path().join("collected");
+        std::fs::create_dir(&collected).unwrap();
+        for name in ["blob.bin.001", "blob.bin.003"] {
+            std::fs::copy(set_dir.join(name), collected.join(name)).unwrap();
+        }
+        for f in &files {
+            std::fs::copy(f, collected.join(f.file_name().unwrap())).unwrap();
+        }
+        let out = std::process::Command::new(&par2)
+            .arg("r")
+            .arg("blob.bin.par2")
+            .current_dir(&collected)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "par2 r failed: {}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let rebuilt = std::fs::read(collected.join("blob.bin.002")).unwrap();
+        assert_eq!(rebuilt, lost, "reconstructed part must be byte-identical");
     }
 
     #[test]

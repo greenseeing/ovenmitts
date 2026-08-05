@@ -260,6 +260,10 @@ pub struct ArchivePlan {
     pub capacity: u64,
     pub budget: u64,
     pub fits: bool,
+    /// Multi-disc set plan when the payload cannot fit one disc. build_plan
+    /// always leaves it None; the runner attaches span::plan_span's answer.
+    /// Boxed so the plan (which rides inside StageEvent) stays small.
+    pub span: Option<Box<crate::span::SpanPlan>>,
     pub warnings: Vec<String>,
 }
 
@@ -366,6 +370,7 @@ pub fn build_plan(input: &PlanInput, media: &MediaInfo) -> ArchivePlan {
         capacity,
         budget,
         fits,
+        span: None,
         warnings,
     }
 }

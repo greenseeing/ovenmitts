@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, ensure, Context, Result};
 
 use crate::plan::{self, Payload};
+use crate::span::{DiscRole, SpanNote};
 use crate::tools::Tools;
 
 pub struct MasterInput<'a> {
@@ -12,6 +13,8 @@ pub struct MasterInput<'a> {
     pub checksums: &'a Path,
     pub manifest: &'a Path,
     pub recovery: &'a Path,
+    /// Some on every disc of a multi-disc set: the shared catalog.
+    pub set_txt: Option<&'a Path>,
     pub out_iso: &'a Path,
 }
 
@@ -21,6 +24,7 @@ pub struct MasterInput<'a> {
 ///   /checksums.sha256
 ///   /MANIFEST.txt
 ///   /RECOVERY.txt
+///   /SET.txt                    (multi-disc sets only)
 pub fn build_iso(
     tools: &Tools,
     input: &MasterInput,
@@ -84,6 +88,9 @@ pub fn master_args(input: &MasterInput) -> Vec<String> {
     args.push(graft("/checksums.sha256", input.checksums));
     args.push(graft("/MANIFEST.txt", input.manifest));
     args.push(graft("/RECOVERY.txt", input.recovery));
+    if let Some(set_txt) = input.set_txt {
+        args.push(graft("/SET.txt", set_txt));
+    }
     args
 }
 
@@ -134,7 +141,9 @@ pub struct ManifestEntry {
 
 /// MANIFEST.txt: date, label, parameters (redundancy, slice size, defect
 /// management), one row per top-level payload. Credits only standard tools —
-/// on-disc files never name ovenmitts.
+/// on-disc files never name ovenmitts. `span` marks a disc of a multi-disc
+/// set: the parity line then describes the ONE set-level par2 set instead of
+/// per-payload redundancy, and the disc's part row is located in the source.
 pub fn write_manifest(
     out: &Path,
     label: &str,
@@ -142,6 +151,7 @@ pub fn write_manifest(
     redundancy_pct: Option<u32>,
     defect_management: bool,
     ecc: bool,
+    span: Option<&SpanNote>,
 ) -> Result<()> {
     use std::fmt::Write as _;
     let mut t = String::new();
@@ -152,18 +162,44 @@ pub fn write_manifest(
         chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
     );
     let _ = writeln!(t, "volume label: {label}");
+    if let Some(n) = span {
+        let _ = writeln!(
+            t,
+            "set: disc {} of {} ({}) — catalog in SET.txt (identical on every disc)",
+            n.disc,
+            n.of,
+            n.role.as_str()
+        );
+    }
     let _ = writeln!(t);
     let _ = writeln!(t, "parameters:");
     let _ = writeln!(
         t,
         "  mastered and burned: xorriso (ISO 9660 level 3, Rock Ridge, embedded MD5 tags)"
     );
-    match redundancy_pct {
-        Some(pct) => {
-            let _ = writeln!(t, "  parity: par2, {pct}% redundancy, one set per payload");
+    match (span, redundancy_pct) {
+        (Some(n), _) if n.recovery_blocks > 0 => {
+            // the layering, restated where a reader will look first
+            let rs02 = if ecc {
+                "; sector damage within a disc is repaired first by the embedded RS02 layer"
+            } else {
+                ""
+            };
+            let _ = writeln!(
+                t,
+                "  parity: par2, one set across the {} data parts; {} recovery blocks \
+                 on disc {} of {} — the set survives the loss of any ONE disc{rs02}",
+                n.data_parts(),
+                n.recovery_blocks,
+                n.of,
+                n.of
+            );
         }
-        None => {
+        (Some(_), _) | (None, None) => {
             let _ = writeln!(t, "  parity: none");
+        }
+        (None, Some(pct)) => {
+            let _ = writeln!(t, "  parity: par2, {pct}% redundancy, one set per payload");
         }
     }
     let _ = writeln!(
@@ -200,6 +236,25 @@ pub fn write_manifest(
                 let _ = writeln!(t, "    sha256: per-file hashes in checksums.sha256");
             }
         }
+        if let Some(n) = span {
+            if n.role == DiscRole::Data
+                && e.name == crate::span::part_file_name(&n.source_name, n.disc)
+            {
+                let parts = n.data_parts();
+                // balanced split: every part before the last is the same
+                // size, so this part's own byte count locates it
+                let offset = if n.disc < parts {
+                    u64::from(n.disc - 1) * e.bytes
+                } else {
+                    n.source_bytes - e.bytes
+                };
+                let _ = writeln!(
+                    t,
+                    "    part {} of {parts} of {}, offset {offset}",
+                    n.disc, n.source_name
+                );
+            }
+        }
         if let Some((slice, blocks)) = e.par2 {
             let _ = writeln!(t, "    par2 slice: {slice} bytes ({blocks} blocks)");
         }
@@ -210,8 +265,19 @@ pub fn write_manifest(
 /// RECOVERY.txt: self-documenting restore instructions (darbrrb lesson) -
 /// exact commands for: mount + copy, ddrescue a failing disc, par2repair the
 /// payload, regenerate the file->LBA map from disc or ISO, VeraCrypt header
-/// restore pointers.
-pub fn write_recovery(out: &Path, label: &str, payloads: &[Payload], ecc: bool) -> Result<()> {
+/// restore pointers. `span` switches to the set-aware steps: whole-disc loss
+/// repairs through the set-level par2 (SET.txt walkthrough), and VeraCrypt
+/// points at the reassembled container, never a part.
+pub fn write_recovery(
+    out: &Path,
+    label: &str,
+    payloads: &[Payload],
+    ecc: bool,
+    span: Option<&SpanNote>,
+) -> Result<()> {
+    if let Some(note) = span {
+        return write_recovery_span(out, label, payloads, ecc, note);
+    }
     use std::fmt::Write as _;
     let mut t = String::new();
     let mut step = 0u32;
@@ -219,17 +285,7 @@ pub fn write_recovery(out: &Path, label: &str, payloads: &[Payload], ecc: bool) 
         step += 1;
         step
     };
-    let _ = writeln!(t, "RECOVERY — disc \"{label}\"");
-    let _ = writeln!(
-        t,
-        "Mastered and burned with xorriso; recovery needs only standard tools"
-    );
-    if ecc {
-        let _ = writeln!(t, "(ddrescue, dvdisaster, par2, xorriso).");
-    } else {
-        let _ = writeln!(t, "(ddrescue, par2, xorriso).");
-    }
-    let _ = writeln!(t, "Commands assume Linux with this disc in /dev/sr0.");
+    recovery_preamble(&mut t, label, ecc);
     let _ = writeln!(t);
     let _ = writeln!(t, "{}. Disc reads normally: mount and copy", num());
     let _ = writeln!(t, "   mount -o ro /dev/sr0 /mnt");
@@ -237,58 +293,15 @@ pub fn write_recovery(out: &Path, label: &str, payloads: &[Payload], ecc: bool) 
         let flag = if p.is_dir { "-r " } else { "" };
         let _ = writeln!(t, "   cp {flag}/mnt/{} .", p.name);
     }
-    let _ = writeln!(t, "   sha256sum -c --ignore-missing /mnt/checksums.sha256");
-    let _ = writeln!(
-        t,
-        "   Run in the directory holding the copies; --ignore-missing skips the"
-    );
-    let _ = writeln!(t, "   parity/ entries you did not copy.");
+    recovery_checksum_note(&mut t);
     let _ = writeln!(t);
-    let _ = writeln!(
-        t,
-        "{}. Disc has read errors: image everything readable first (GNU ddrescue)",
-        num()
-    );
-    let _ = writeln!(t, "   ddrescue /dev/sr0 recovered.iso rescue.map");
-    let _ = writeln!(
-        t,
-        "   ddrescue -r3 /dev/sr0 recovered.iso rescue.map   # extra retry passes"
-    );
-    let _ = writeln!(
-        t,
-        "   Unreadable sectors stay zero-filled and the image keeps its full"
-    );
-    let _ = writeln!(t, "   length - exactly what the repair steps below expect.");
+    recovery_ddrescue(&mut t, num());
     if ecc {
         let _ = writeln!(t);
-        let _ = writeln!(
-            t,
-            "{}. Repair sector damage with the embedded ECC (dvdisaster RS02)",
-            num()
-        );
-        let _ = writeln!(
-            t,
-            "   The image carries a dvdisaster RS02 layer when free disc capacity"
-        );
-        let _ = writeln!(
-            t,
-            "   allowed at mastering time; it self-identifies. Run this BEFORE the"
-        );
-        let _ = writeln!(t, "   par2 step - it repairs raw sectors in the image:");
-        let _ = writeln!(t, "   dvdisaster -i recovered.iso -t     # assess");
-        let _ = writeln!(t, "   dvdisaster -i recovered.iso -f     # repair in place");
+        recovery_rs02(&mut t, num());
     }
     let _ = writeln!(t);
-    let _ = writeln!(t, "{}. Extract files from the rescued image", num());
-    let _ = writeln!(t, "   mount -o loop,ro recovered.iso /mnt");
-    let _ = writeln!(t, "   or without root:");
-    for p in payloads {
-        let _ = writeln!(
-            t,
-            "   xorriso -osirrox on -indev recovered.iso -extract /{} {}",
-            p.name, p.name
-        );
-    }
+    recovery_extract(&mut t, num(), payloads);
     let _ = writeln!(t);
     let _ = writeln!(
         t,
@@ -317,16 +330,7 @@ pub fn write_recovery(out: &Path, label: &str, payloads: &[Payload], ecc: bool) 
         "   read-only /mnt/parity/ as its base and ignores the damaged copy."
     );
     let _ = writeln!(t);
-    let _ = writeln!(
-        t,
-        "{}. Map damaged sectors to files (regenerate the file->LBA table)",
-        num()
-    );
-    let _ = writeln!(t, "   xorriso -indev /dev/sr0 -find / -exec report_lba --");
-    let _ = writeln!(
-        t,
-        "   Works against the rescued image too: xorriso -indev recovered.iso ..."
-    );
+    recovery_lba(&mut t, num());
     let containers: Vec<&str> = payloads
         .iter()
         .flat_map(|p| p.files.iter())
@@ -343,20 +347,283 @@ pub fn write_recovery(out: &Path, label: &str, payloads: &[Payload], ecc: bool) 
         for rel in containers {
             let _ = writeln!(t, "   veracrypt --text --mount-options ro /mnt/{rel}");
         }
+        recovery_header_restore(&mut t);
+    }
+    let _ = writeln!(t);
+    recovery_prevention(&mut t);
+    crate::fsutil::write_durable(out, t)
+}
+
+/// The set-aware RECOVERY.txt (§5 ordering): healthy-set copy, ddrescue,
+/// RS02 BEFORE par2 (every disc has the layer), extract, whole-disc loss via
+/// the set-level par2, parity-disc re-creation, LBA, VeraCrypt on the
+/// REASSEMBLED container only.
+fn write_recovery_span(
+    out: &Path,
+    label: &str,
+    payloads: &[Payload],
+    ecc: bool,
+    n: &SpanNote,
+) -> Result<()> {
+    use std::fmt::Write as _;
+    let mut t = String::new();
+    let mut step = 0u32;
+    let mut num = move || {
+        step += 1;
+        step
+    };
+    let part_list = n.part_names().join(" ");
+    recovery_preamble(&mut t, label, ecc);
+    let _ = writeln!(t);
+    match n.role {
+        DiscRole::Data => {
+            let _ = writeln!(
+                t,
+                "This disc is {} of {} in an archive set (data): it carries part {} of",
+                n.disc, n.of, n.disc
+            );
+            let _ = writeln!(
+                t,
+                "the {}-part source file {}. SET.txt (identical on every disc)",
+                n.data_parts(),
+                n.source_name
+            );
+            let _ = writeln!(t, "is the full catalog of the set.");
+        }
+        DiscRole::Parity => {
+            let _ = writeln!(
+                t,
+                "This disc is {} of {} in an archive set (parity): it carries the par2",
+                n.disc, n.of
+            );
+            let _ = writeln!(
+                t,
+                "recovery volumes for the {}-part source file {}. SET.txt (identical",
+                n.data_parts(),
+                n.source_name
+            );
+            let _ = writeln!(t, "on every disc) is the full catalog of the set.");
+        }
+    }
+    let _ = writeln!(t);
+    let _ = writeln!(
+        t,
+        "{}. Healthy set: mount each data disc and copy its part",
+        num()
+    );
+    let _ = writeln!(t, "   mount -o ro /dev/sr0 /mnt");
+    for p in payloads {
+        let _ = writeln!(t, "   cp /mnt/{} .", p.name);
+    }
+    recovery_checksum_note(&mut t);
+    let _ = writeln!(
+        t,
+        "   With every part in one directory, reassemble and check the whole file:"
+    );
+    let _ = writeln!(t, "   cat {part_list} > {}", n.source_name);
+    let _ = writeln!(
+        t,
+        "   printf '{}  {}\\n' | sha256sum -c",
+        n.source_sha256, n.source_name
+    );
+    let _ = writeln!(t);
+    recovery_ddrescue(&mut t, num());
+    if ecc {
+        let _ = writeln!(t);
+        recovery_rs02(&mut t, num());
+    }
+    let _ = writeln!(t);
+    recovery_extract(&mut t, num(), payloads);
+    if n.role == DiscRole::Parity {
         let _ = writeln!(
             t,
-            "   If the volume header is damaged, restore it from your EXTERNAL header"
-        );
-        let _ = writeln!(
-            t,
-            "   backup: VeraCrypt > Tools > Restore Volume Header. The embedded backup"
-        );
-        let _ = writeln!(
-            t,
-            "   header at the end of the container is the first fallback."
+            "   xorriso -osirrox on -indev recovered.iso -extract /parity parity"
         );
     }
     let _ = writeln!(t);
+    if n.recovery_blocks > 0 {
+        let _ = writeln!(
+            t,
+            "{}. A WHOLE disc of the set is lost or unreadable",
+            num()
+        );
+        let _ = writeln!(
+            t,
+            "   Copy every readable part from the surviving discs into one directory,"
+        );
+        let _ = writeln!(
+            t,
+            "   add /parity/* from disc {} (ddrescue what reads poorly), then:",
+            n.of
+        );
+        let _ = writeln!(t, "     par2 r {}.par2", n.source_name);
+        let _ = writeln!(
+            t,
+            "   par2 recreates the missing part; reassemble and check as above."
+        );
+        let _ = writeln!(
+            t,
+            "   Reassembly transiently needs the parts plus the output - about"
+        );
+        let _ = writeln!(t, "   2x {} free.", plan::human_bytes(n.source_bytes));
+        let _ = writeln!(t);
+        let _ = writeln!(
+            t,
+            "{}. The parity disc (disc {}) is lost: no payload data is lost; nothing",
+            num(),
+            n.of
+        );
+        let _ = writeln!(t, "   to repair. It can even be re-created from the parts:");
+        let _ = writeln!(
+            t,
+            "   par2 create -s{} -c{} -n1 {}.par2 {part_list}",
+            n.block, n.recovery_blocks, n.source_name
+        );
+    } else {
+        let _ = writeln!(
+            t,
+            "{}. A WHOLE disc of the set is lost: THERE IS NO PARITY DISC (parity was",
+            num()
+        );
+        let _ = writeln!(
+            t,
+            "   disabled at burn time). The payload cannot be rebuilt without every"
+        );
+        let _ = writeln!(
+            t,
+            "   data disc; the second copy of the set is the only protection."
+        );
+    }
+    let _ = writeln!(t);
+    recovery_lba(&mut t, num());
+    if n.source_container {
+        let _ = writeln!(t);
+        let _ = writeln!(t, "{}. VeraCrypt container", num());
+        let _ = writeln!(
+            t,
+            "   The container is the REASSEMBLED {} - the per-disc parts are",
+            n.source_name
+        );
+        let _ = writeln!(t, "   fragments and will not mount:");
+        let _ = writeln!(
+            t,
+            "   veracrypt --text --mount-options ro {}",
+            n.source_name
+        );
+        recovery_header_restore(&mut t);
+    }
+    let _ = writeln!(t);
+    recovery_prevention(&mut t);
+    crate::fsutil::write_durable(out, t)
+}
+
+fn recovery_preamble(t: &mut String, label: &str, ecc: bool) {
+    use std::fmt::Write as _;
+    let _ = writeln!(t, "RECOVERY — disc \"{label}\"");
+    let _ = writeln!(
+        t,
+        "Mastered and burned with xorriso; recovery needs only standard tools"
+    );
+    if ecc {
+        let _ = writeln!(t, "(ddrescue, dvdisaster, par2, xorriso).");
+    } else {
+        let _ = writeln!(t, "(ddrescue, par2, xorriso).");
+    }
+    let _ = writeln!(t, "Commands assume Linux with this disc in /dev/sr0.");
+}
+
+fn recovery_checksum_note(t: &mut String) {
+    use std::fmt::Write as _;
+    let _ = writeln!(t, "   sha256sum -c --ignore-missing /mnt/checksums.sha256");
+    let _ = writeln!(
+        t,
+        "   Run in the directory holding the copies; --ignore-missing skips the"
+    );
+    let _ = writeln!(t, "   parity/ entries you did not copy.");
+}
+
+fn recovery_ddrescue(t: &mut String, step: u32) {
+    use std::fmt::Write as _;
+    let _ = writeln!(
+        t,
+        "{step}. Disc has read errors: image everything readable first (GNU ddrescue)"
+    );
+    let _ = writeln!(t, "   ddrescue /dev/sr0 recovered.iso rescue.map");
+    let _ = writeln!(
+        t,
+        "   ddrescue -r3 /dev/sr0 recovered.iso rescue.map   # extra retry passes"
+    );
+    let _ = writeln!(
+        t,
+        "   Unreadable sectors stay zero-filled and the image keeps its full"
+    );
+    let _ = writeln!(t, "   length - exactly what the repair steps below expect.");
+}
+
+fn recovery_rs02(t: &mut String, step: u32) {
+    use std::fmt::Write as _;
+    let _ = writeln!(
+        t,
+        "{step}. Repair sector damage with the embedded ECC (dvdisaster RS02)"
+    );
+    let _ = writeln!(
+        t,
+        "   The image carries a dvdisaster RS02 layer when free disc capacity"
+    );
+    let _ = writeln!(
+        t,
+        "   allowed at mastering time; it self-identifies. Run this BEFORE the"
+    );
+    let _ = writeln!(t, "   par2 step - it repairs raw sectors in the image:");
+    let _ = writeln!(t, "   dvdisaster -i recovered.iso -t     # assess");
+    let _ = writeln!(t, "   dvdisaster -i recovered.iso -f     # repair in place");
+}
+
+fn recovery_extract(t: &mut String, step: u32, payloads: &[Payload]) {
+    use std::fmt::Write as _;
+    let _ = writeln!(t, "{step}. Extract files from the rescued image");
+    let _ = writeln!(t, "   mount -o loop,ro recovered.iso /mnt");
+    let _ = writeln!(t, "   or without root:");
+    for p in payloads {
+        let _ = writeln!(
+            t,
+            "   xorriso -osirrox on -indev recovered.iso -extract /{} {}",
+            p.name, p.name
+        );
+    }
+}
+
+fn recovery_lba(t: &mut String, step: u32) {
+    use std::fmt::Write as _;
+    let _ = writeln!(
+        t,
+        "{step}. Map damaged sectors to files (regenerate the file->LBA table)"
+    );
+    let _ = writeln!(t, "   xorriso -indev /dev/sr0 -find / -exec report_lba --");
+    let _ = writeln!(
+        t,
+        "   Works against the rescued image too: xorriso -indev recovered.iso ..."
+    );
+}
+
+fn recovery_header_restore(t: &mut String) {
+    use std::fmt::Write as _;
+    let _ = writeln!(
+        t,
+        "   If the volume header is damaged, restore it from your EXTERNAL header"
+    );
+    let _ = writeln!(
+        t,
+        "   backup: VeraCrypt > Tools > Restore Volume Header. The embedded backup"
+    );
+    let _ = writeln!(
+        t,
+        "   header at the end of the container is the first fallback."
+    );
+}
+
+fn recovery_prevention(t: &mut String) {
+    use std::fmt::Write as _;
     let _ = writeln!(
         t,
         "Prevention: re-verify this disc every 6-12 months (no consensus interval"
@@ -370,7 +637,6 @@ pub fn write_recovery(out: &Path, label: &str, payloads: &[Payload], ecc: bool) 
         "the reference). Decay caught while the parity above is still readable is"
     );
     let _ = writeln!(t, "decay these files can repair.");
-    crate::fsutil::write_durable(out, t)
 }
 
 /// ISO 9660 truncation self-check (isolyzer-inspired, native): the Primary
@@ -505,6 +771,7 @@ mod tests {
             checksums: Path::new("/stage/checksums.sha256"),
             manifest: Path::new("/stage/MANIFEST.txt"),
             recovery: Path::new("/stage/RECOVERY.txt"),
+            set_txt: None,
             out_iso: Path::new("/stage/VAULT_20260717.iso"),
         }
     }
@@ -552,6 +819,20 @@ mod tests {
             args.contains(&"/extras=/home/u/extras".to_string()),
             "{args:?}"
         );
+    }
+
+    #[test]
+    fn master_args_graft_set_txt_after_recovery() {
+        let payloads = vec![payload("/home/u/vault.hc.002", 100)];
+        let mut input = sample_input(&payloads, &[]);
+        input.set_txt = Some(Path::new("/stage/SET.txt"));
+        let args = master_args(&input);
+        let recovery = args
+            .iter()
+            .position(|a| a == "/RECOVERY.txt=/stage/RECOVERY.txt")
+            .unwrap();
+        assert_eq!(args[recovery + 1], "/SET.txt=/stage/SET.txt");
+        assert_eq!(args.last().unwrap(), "/SET.txt=/stage/SET.txt");
     }
 
     #[test]
@@ -607,7 +888,16 @@ mod tests {
             sha256: Some("ab".repeat(32)),
             par2: Some((655_360, 32_768)),
         }];
-        write_manifest(&out, "VAULT_20260717", &payloads, Some(15), false, false).unwrap();
+        write_manifest(
+            &out,
+            "VAULT_20260717",
+            &payloads,
+            Some(15),
+            false,
+            false,
+            None,
+        )
+        .unwrap();
         let text = std::fs::read_to_string(&out).unwrap();
         assert!(
             !text.contains("ovenmitts"),
@@ -637,7 +927,7 @@ mod tests {
             sha256: Some("cd".repeat(32)),
             par2: None,
         };
-        write_manifest(&out, "L", &[entry], None, true, false).unwrap();
+        write_manifest(&out, "L", &[entry], None, true, false, None).unwrap();
         let text = std::fs::read_to_string(&out).unwrap();
         assert!(text.contains("parity: none"));
         assert!(text.contains("defect management: on"));
@@ -656,7 +946,7 @@ mod tests {
             sha256: None,
             par2: Some((65_536, 47)),
         };
-        write_manifest(&out, "L", &[entry], Some(15), false, true).unwrap();
+        write_manifest(&out, "L", &[entry], Some(15), false, true, None).unwrap();
         let text = std::fs::read_to_string(&out).unwrap();
         assert!(text.contains("  extras/\n"), "{text}");
         assert!(text.contains("files: 42"), "{text}");
@@ -675,7 +965,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("RECOVERY.txt");
         let payloads = vec![payload("/h/vault.hc", 10), payload("/h/notes.hc", 5)];
-        write_recovery(&out, "VAULT_20260717", &payloads, true).unwrap();
+        write_recovery(&out, "VAULT_20260717", &payloads, true, None).unwrap();
         let text = std::fs::read_to_string(&out).unwrap();
         assert!(text.contains("disc \"VAULT_20260717\""));
         assert!(text.contains("mount -o ro /dev/sr0 /mnt"));
@@ -715,7 +1005,7 @@ mod tests {
             ),
             payload("/h/vault.hc", 10),
         ];
-        write_recovery(&out, "L", &payloads, false).unwrap();
+        write_recovery(&out, "L", &payloads, false, None).unwrap();
         let text = std::fs::read_to_string(&out).unwrap();
         assert!(text.contains("cp -r /mnt/extras ."), "{text}");
         assert!(
@@ -738,10 +1028,263 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("RECOVERY.txt");
         let payloads = vec![dir_payload("/h/extras", &[("extras/a.bin", 10, false)])];
-        write_recovery(&out, "L", &payloads, false).unwrap();
+        write_recovery(&out, "L", &payloads, false, None).unwrap();
         let text = std::fs::read_to_string(&out).unwrap();
         assert!(!text.contains("veracrypt"), "{text}");
         assert!(!text.contains("VeraCrypt containers"), "{text}");
+    }
+
+    const SOURCE_SHA: &str = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+
+    fn span_note(disc: u32, role: DiscRole) -> SpanNote {
+        SpanNote {
+            disc,
+            of: 4,
+            role,
+            source_name: "vault.hc".into(),
+            source_bytes: 64_424_509_440,
+            source_sha256: SOURCE_SHA.into(),
+            source_container: true,
+            recovery_blocks: 11_357,
+            block: 1_966_204,
+        }
+    }
+
+    fn part_entry(name: &str, bytes: u64) -> ManifestEntry {
+        ManifestEntry {
+            name: name.into(),
+            bytes,
+            files: 1,
+            is_dir: false,
+            sha256: Some("ab".repeat(32)),
+            par2: None,
+        }
+    }
+
+    #[test]
+    fn manifest_span_data_disc_locates_the_part() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("MANIFEST.txt");
+        let entries = vec![part_entry("vault.hc.002", 21_474_836_480)];
+        let note = span_note(2, DiscRole::Data);
+        write_manifest(
+            &out,
+            "VAULT_2026Q3_2OF4",
+            &entries,
+            None,
+            false,
+            true,
+            Some(&note),
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&out).unwrap();
+        assert!(
+            text.contains("set: disc 2 of 4 (data) — catalog in SET.txt (identical on every disc)"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "  parity: par2, one set across the 3 data parts; 11357 recovery blocks \
+                 on disc 4 of 4 — the set survives the loss of any ONE disc; sector \
+                 damage within a disc is repaired first by the embedded RS02 layer"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("    part 2 of 3 of vault.hc, offset 21474836480\n"),
+            "{text}"
+        );
+        assert!(!text.contains("one set per payload"), "{text}");
+        assert!(!text.contains("ovenmitts"), "{text}");
+    }
+
+    #[test]
+    fn manifest_span_last_part_offset_comes_from_the_tail() {
+        // the last part may be smaller; its offset is source minus itself
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("MANIFEST.txt");
+        let entries = vec![part_entry("vault.hc.003", 21_474_836_470)];
+        let note = span_note(3, DiscRole::Data);
+        write_manifest(&out, "L", &entries, None, false, true, Some(&note)).unwrap();
+        let text = std::fs::read_to_string(&out).unwrap();
+        assert!(
+            text.contains(&format!(
+                "    part 3 of 3 of vault.hc, offset {}\n",
+                64_424_509_440u64 - 21_474_836_470
+            )),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn manifest_span_parity_disc_and_ecc_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("MANIFEST.txt");
+        let note = span_note(4, DiscRole::Parity);
+        write_manifest(
+            &out,
+            "VAULT_2026Q3_4OF4",
+            &[],
+            None,
+            false,
+            false,
+            Some(&note),
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&out).unwrap();
+        assert!(text.contains("set: disc 4 of 4 (parity)"), "{text}");
+        assert!(
+            text.contains("survives the loss of any ONE disc\n"),
+            "{text}"
+        );
+        // no RS02 claim when no layer was attempted
+        assert!(!text.contains("RS02 layer"), "{text}");
+        assert!(!text.contains("part 4 of"), "{text}");
+    }
+
+    #[test]
+    fn manifest_span_without_parity_says_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("MANIFEST.txt");
+        let mut note = span_note(1, DiscRole::Data);
+        note.of = 3;
+        note.recovery_blocks = 0;
+        let entries = vec![part_entry("vault.hc.001", 21_474_836_480)];
+        write_manifest(&out, "L", &entries, Some(15), false, true, Some(&note)).unwrap();
+        let text = std::fs::read_to_string(&out).unwrap();
+        assert!(text.contains("  parity: none\n"), "{text}");
+        assert!(!text.contains("redundancy"), "{text}");
+        assert!(
+            text.contains("    part 1 of 3 of vault.hc, offset 0\n"),
+            "{text}"
+        );
+    }
+
+    fn part_payload(name: &str, size: u64) -> Payload {
+        Payload {
+            root: format!("/stage/set/{name}").into(),
+            is_dir: false,
+            files: vec![plan::PayloadMember {
+                abs: format!("/stage/set/{name}").into(),
+                rel: name.to_string(),
+                size,
+                container: false, // parts never read as containers
+            }],
+            dirs: 0,
+            total_size: size,
+            name: name.into(),
+        }
+    }
+
+    #[test]
+    fn recovery_span_data_disc_walks_the_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("RECOVERY.txt");
+        let payloads = vec![part_payload("vault.hc.002", 21_474_836_480)];
+        write_recovery(
+            &out,
+            "VAULT_2026Q3_2OF4",
+            &payloads,
+            true,
+            Some(&span_note(2, DiscRole::Data)),
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&out).unwrap();
+        assert!(text.contains("disc \"VAULT_2026Q3_2OF4\""));
+        assert!(
+            text.contains("This disc is 2 of 4 in an archive set (data)"),
+            "{text}"
+        );
+        assert!(text.contains("cp /mnt/vault.hc.002 ."), "{text}");
+        assert!(
+            text.contains("cat vault.hc.001 vault.hc.002 vault.hc.003 > vault.hc"),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "printf '{SOURCE_SHA}  vault.hc\\n' | sha256sum -c"
+            )),
+            "{text}"
+        );
+        // RS02 comes BEFORE the set-level par2 walkthrough
+        let rs02 = text.find("dvdisaster RS02").unwrap();
+        let whole = text.find("A WHOLE disc of the set is lost").unwrap();
+        assert!(rs02 < whole, "RS02 must precede the par2 step");
+        assert!(text.contains("     par2 r vault.hc.par2\n"), "{text}");
+        assert!(
+            text.contains(
+                "   par2 create -s1966204 -c11357 -n1 vault.hc.par2 \
+                 vault.hc.001 vault.hc.002 vault.hc.003\n"
+            ),
+            "{text}"
+        );
+        // VeraCrypt names only the REASSEMBLED container, never a part
+        assert!(
+            text.contains("veracrypt --text --mount-options ro vault.hc\n"),
+            "{text}"
+        );
+        assert!(!text.contains("ro /mnt/vault.hc.002"), "{text}");
+        assert!(text.contains("Restore Volume Header"), "{text}");
+        // the per-disc "parity on this disc" repair step is set-level now
+        assert!(!text.contains("par2 r -B."), "{text}");
+        assert!(text.contains("report_lba"), "{text}");
+        assert!(text.contains("fixity"), "{text}");
+        assert!(!text.contains("ovenmitts"), "{text}");
+    }
+
+    #[test]
+    fn recovery_span_parity_disc_extracts_the_volumes() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("RECOVERY.txt");
+        write_recovery(
+            &out,
+            "VAULT_2026Q3_4OF4",
+            &[],
+            true,
+            Some(&span_note(4, DiscRole::Parity)),
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&out).unwrap();
+        assert!(
+            text.contains("This disc is 4 of 4 in an archive set (parity)"),
+            "{text}"
+        );
+        assert!(!text.contains("cp /mnt/"), "{text}");
+        assert!(
+            text.contains("xorriso -osirrox on -indev recovered.iso -extract /parity parity"),
+            "{text}"
+        );
+        assert!(
+            text.contains("The parity disc (disc 4) is lost: no payload data is lost"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn recovery_span_without_parity_warns_and_skips_repair() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("RECOVERY.txt");
+        let mut note = span_note(1, DiscRole::Data);
+        note.of = 3;
+        note.recovery_blocks = 0;
+        note.source_container = false;
+        let payloads = vec![part_payload("vault.hc.001", 100)];
+        write_recovery(&out, "L", &payloads, false, Some(&note)).unwrap();
+        let text = std::fs::read_to_string(&out).unwrap();
+        assert!(text.contains("THERE IS NO PARITY DISC"), "{text}");
+        assert!(
+            text.contains("the second copy of the set is the only protection"),
+            "{text}"
+        );
+        assert!(!text.contains("par2 r"), "{text}");
+        assert!(!text.contains("par2 create"), "{text}");
+        // no container source: no veracrypt section at all
+        assert!(!text.contains("veracrypt"), "{text}");
+        // three data parts, no parity disc: the cat line still lists all
+        assert!(
+            text.contains("cat vault.hc.001 vault.hc.002 vault.hc.003 > vault.hc"),
+            "{text}"
+        );
     }
 
     fn fake_tools(script: &str, dir: &Path) -> Tools {
@@ -775,6 +1318,7 @@ mod tests {
             checksums: Path::new("/s/checksums.sha256"),
             manifest: Path::new("/s/MANIFEST.txt"),
             recovery: Path::new("/s/RECOVERY.txt"),
+            set_txt: None,
             out_iso: &iso,
         };
         let mut events = Vec::new();
@@ -810,6 +1354,7 @@ mod tests {
             checksums: Path::new("/c"),
             manifest: Path::new("/m"),
             recovery: Path::new("/r"),
+            set_txt: None,
             out_iso: &dir.path().join("never.iso"),
         };
         let err = build_iso(&tools, &input, std::time::Duration::ZERO, &mut |_, _| {}).unwrap_err();
