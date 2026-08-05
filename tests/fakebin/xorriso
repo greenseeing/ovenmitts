@@ -7,7 +7,11 @@ here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 fixtures="$here/../fixtures"
 
 if [ "${1:-}" = "-outdev" ] && [ "${3:-}" = "-toc" ]; then
-    cat "$fixtures/xorriso_probe_bdr_blank_full.txt"
+    if [ "${OVENMITTS_FAKE_MEDIA:-}" = "small" ]; then
+        cat "$fixtures/xorriso_probe_bdr_blank_small.txt"
+    else
+        cat "$fixtures/xorriso_probe_bdr_blank_full.txt"
+    fi
     exit 0
 fi
 
@@ -97,8 +101,8 @@ if [ "${1:-}" = "-as" ] && [ "${2:-}" = "cdrecord" ]; then
         echo "fake xorriso: -as cdrecord needs dev= and an ISO argument" >&2
         exit 2
     fi
-    if [ -n "${OVENMITTS_FAKE_BURN_FAIL:-}" ]; then
-        # real Verbatim-43887 failure transcript shape: keepalives, then cause
+    # real Verbatim-43887 failure transcript shape: keepalives, then cause
+    burn_failure_transcript() {
         i=267
         while [ "$i" -le 273 ]; do
             printf 'xorriso : UPDATE : Thank you for being patient. Working since %s seconds.\n' "$i" >&2
@@ -109,9 +113,25 @@ if [ "${1:-}" = "-as" ] && [ "${2:-}" = "cdrecord" ]; then
         printf "xorriso : NOTE : Giving up for -eject whole -dev ''\n" >&2
         printf 'xorriso : FAILURE : -as cdrecord: Job could not be performed properly.\n' >&2
         printf "xorriso : aborting : -abort_on 'FAILURE' encountered 'FATAL'\n" >&2
+    }
+    if [ -n "${OVENMITTS_FAKE_BURN_FAIL:-}" ]; then
+        burn_failure_transcript
+        exit 5
+    fi
+    # per-burn counter: OVENMITTS_FAKE_BURN_FAIL_AT=<n> fails exactly the
+    # n-th burn; every successful burn also snapshots the device image as
+    # .disc<counter> so multi-disc tests can assert each disc's content
+    count_file="$OVENMITTS_FAKE_DEVICE.burncount"
+    count=0
+    if [ -f "$count_file" ]; then count=$(cat "$count_file"); fi
+    count=$((count + 1))
+    printf '%s' "$count" > "$count_file"
+    if [ "${OVENMITTS_FAKE_BURN_FAIL_AT:-}" = "$count" ]; then
+        burn_failure_transcript
         exit 5
     fi
     cp "$iso" "$OVENMITTS_FAKE_DEVICE"
+    cp "$iso" "$OVENMITTS_FAKE_DEVICE.disc$count"
     printf 'xorriso : UPDATE :  4 of 8 MB written (fifo 97%%) [buf  94%%]   4.0x.\n' >&2
     printf 'xorriso : UPDATE : Writing:    4096s  100.0%%   fifo   0%%  buf  99%%  4.0xD\n' >&2
     printf "Writing to '%s' completed successfully.\n" "$dev"

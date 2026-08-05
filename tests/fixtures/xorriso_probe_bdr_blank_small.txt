@@ -1,0 +1,29 @@
+xorriso 1.5.4 : RockRidge filesystem manipulator, libburnia project.
+
+Drive current: -outdev '/dev/sr0'
+Drive type   : vendor 'HL-DT-ST' product 'BD-RE WH16NS40' revision '1.02'
+Media current: BD-R sequential recording
+Media product: MILLEN/MR1/0 , Millenniata Inc.
+Media status : is blank
+Media blocks : 0 readable , 32768 writable , 32768 overall
+Media summary: 0 sessions, 0 data blocks, 0 data, 64.0m free
+Drive current: -outdev '/dev/sr0'
+Media current: BD-R sequential recording
+Media status : is blank
+Media summary: 0 sessions, 0 data blocks, 0 data, 64.0m free
+Format status: unformatted, up to 64.0 MiB
+Format idx 0 : 00h , 31744s , 62.0 MiB
+Format idx 1 : 32h , 31744s , 62.0 MiB
+Format idx 2 : 32h , 19456s , 38.0 MiB
+Format idx 3 : 32h , 32256s , 63.0 MiB
+Drive current: -outdev '/dev/sr0'
+Media current: BD-R sequential recording
+Media status : is blank
+Media summary: 0 sessions, 0 data blocks, 0 data, 64.0m free
+Read speed   :  35968k ,  8.0xB
+Read speed L :  35968k ,  8.0xB
+Read speed H :  35968k ,  8.0xB
+Write speed  :  17984k ,  4.0xB
+Write speed  :   8992k ,  2.0xB
+Write speed L:   8992k ,  2.0xB
+Write speed H:  17984k ,  4.0xB

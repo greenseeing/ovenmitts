@@ -10,6 +10,10 @@ fn fakebin() -> PathBuf {
 // Per-child env only (no global set_var): tempdir HOME/XDG so the user's
 // real config can never leak into a test run.
 fn run(dir: &Path, args: &[&str]) -> Output {
+    run_with_env(dir, args, &[])
+}
+
+fn run_with_env(dir: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
     let home = dir.join("home");
     std::fs::create_dir_all(&home).unwrap();
     let old = std::env::var_os("PATH").unwrap_or_default();
@@ -22,6 +26,7 @@ fn run(dir: &Path, args: &[&str]) -> Output {
         .env("XDG_DATA_HOME", home.join(".local").join("share"))
         .env("PATH", std::env::join_paths(parts).unwrap())
         .env("OVENMITTS_FAKE_DEVICE", dir.join("fake-device"))
+        .envs(extra_env.iter().copied())
         .output()
         .unwrap()
 }
@@ -260,6 +265,35 @@ fn sigterm_at_confirm_prompt_aborts_instead_of_hanging() {
         .unwrap();
     assert!(stderr.contains("signal received"), "stderr:\n{stderr}");
     drop(stdin);
+}
+
+// An oversized single-file payload is not a refusal: `plan` prints the
+// multi-disc span table and exits 0.
+#[test]
+fn plan_prints_span_table_for_oversized_payload() {
+    let dir = tempfile::tempdir().unwrap();
+    let payload = dir.path().join("vault.hc");
+    let f = std::fs::File::create(&payload).unwrap();
+    f.set_len(100 * 1024 * 1024).unwrap();
+    let device = dir.path().join("fake-device");
+    let out = run_with_env(
+        dir.path(),
+        &[
+            "--device",
+            device.to_str().unwrap(),
+            "plan",
+            payload.to_str().unwrap(),
+        ],
+        &[("OVENMITTS_FAKE_MEDIA", "small")],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("set:"), "stdout:\n{stdout}");
+    assert!(stdout.contains("disc 1/"), "stdout:\n{stdout}");
 }
 
 #[test]

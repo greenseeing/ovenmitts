@@ -4,8 +4,10 @@ use std::sync::{Mutex, MutexGuard};
 
 use ovenmitts::config::Config;
 use ovenmitts::hashing;
+use ovenmitts::media;
 use ovenmitts::plan;
 use ovenmitts::runner::{self, Ack, BurnParams, BurnRequest, RunnerCtx, Stage, StageEvent};
+use ovenmitts::span;
 use ovenmitts::tools::Tools;
 
 // Fake tools read OVENMITTS_FAKE_* from the process environment, which is
@@ -42,6 +44,8 @@ impl Harness {
         std::env::set_var("OVENMITTS_FAKE_DEVICE", &device);
         std::env::remove_var("OVENMITTS_FAKE_MOUNT");
         std::env::remove_var("OVENMITTS_FAKE_BURN_FAIL");
+        std::env::remove_var("OVENMITTS_FAKE_BURN_FAIL_AT");
+        std::env::remove_var("OVENMITTS_FAKE_MEDIA");
         let staging = dir.path().join("staging");
         Self {
             _env: guard,
@@ -854,6 +858,374 @@ fn run_verify_without_iso_is_labeled_advisory() {
     assert!(events
         .iter()
         .any(|ev| matches!(ev, StageEvent::Warn(t) if t.contains("no --iso"))));
+}
+
+/// Recompute the span plan exactly as the runner does against the small
+/// fixture: inspected payload -> build_plan budget/overhead -> plan_span.
+fn expected_span(h: &Harness, payload: &Path, label: &str) -> span::SpanPlan {
+    let media =
+        media::parse_xorriso_probe(include_str!("fixtures/xorriso_probe_bdr_blank_small.txt"))
+            .unwrap();
+    let cfg = h.config();
+    let (p, _) = plan::Payload::inspect(payload.to_path_buf()).unwrap();
+    let input = plan::PlanInput {
+        payloads: vec![p.clone()],
+        parity: true,
+        redundancy_pct: cfg.redundancy_pct,
+        headroom_pct: cfg.headroom_pct,
+        defect_management: cfg.defect_management,
+    };
+    let base = plan::build_plan(&input, &media);
+    assert!(!base.fits, "payload must not fit the small media");
+    span::plan_span(
+        &[p],
+        label,
+        base.budget,
+        base.overhead_bytes_est,
+        true,
+        true,
+    )
+    .unwrap()
+    .expect("payload must span a set")
+}
+
+/// Run a spanning burn on a worker thread and answer prompts in order from
+/// the event stream: Proceed to the set confirm, repoint the fake mount at
+/// the next disc's ISO contents before each swap Proceed, `on_retry` to any
+/// burn-failure retry prompt. Errors flatten to their display string because
+/// anyhow is not a dev-dependency.
+fn drive_span_burn(
+    h: &Harness,
+    req: BurnRequest,
+    stage_dir: &Path,
+    on_retry: Ack,
+) -> (Vec<StageEvent>, Result<(), String>) {
+    let (ctx, rx, ack_tx) = h.ctx();
+    let worker =
+        std::thread::spawn(move || runner::run_burn(&ctx, &req).map_err(|e| format!("{e:#}")));
+    let mut events = Vec::new();
+    let mut last_disc: Option<String> = None;
+    for ev in rx.iter() {
+        match &ev {
+            StageEvent::DiscStart { label, .. } => last_disc = Some(label.clone()),
+            StageEvent::NeedAck { prompt } => {
+                // the runner is parked on ack_rx.recv() here, so mutating the
+                // fake-mount env var races with nothing
+                let ack = if prompt.contains("burn the set?") {
+                    Ack::Proceed
+                } else if prompt.contains("confirm to retry") {
+                    on_retry.clone()
+                } else if prompt.contains("insert a blank") {
+                    let label = last_disc.as_ref().expect("swap prompt before DiscStart");
+                    h.set_mount_for(&stage_dir.join(format!("{label}.iso")));
+                    Ack::Proceed
+                } else {
+                    panic!("unexpected prompt: {prompt}");
+                };
+                ack_tx.send(ack).unwrap();
+            }
+            _ => {}
+        }
+        events.push(ev);
+    }
+    (events, worker.join().unwrap())
+}
+
+fn rel_files_under(dir: &Path) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else {
+                found.push(p.strip_prefix(dir).unwrap().to_str().unwrap().to_string());
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+#[test]
+fn burn_pipeline_spans_set() {
+    let h = Harness::new();
+    std::env::set_var("OVENMITTS_FAKE_MEDIA", "small");
+    let payload = h.payload("vault.hc", 100 * 1024 * 1024, 4242);
+
+    let span = expected_span(&h, &payload, "SPAN");
+    let total = span.discs.len();
+    assert!(total >= 3, "expected at least a 2+1 set, planned {total}");
+    let stage_dir = h.stage_dir("SPAN");
+    h.set_mount_for(&stage_dir.join(format!("{}.iso", span.discs[0].label)));
+
+    let mut req = burn_request(vec![payload.clone()], "SPAN");
+    req.assume_yes = false;
+    let (events, res) = drive_span_burn(&h, req, &stage_dir, Ack::Proceed);
+    std::env::remove_var("OVENMITTS_FAKE_MEDIA");
+    res.unwrap();
+
+    // DiscStart events must mirror the independently recomputed plan
+    let disc_starts: Vec<(u32, u32, String, bool)> = events
+        .iter()
+        .filter_map(|ev| match ev {
+            StageEvent::DiscStart {
+                index,
+                total,
+                label,
+                parity,
+            } => Some((*index, *total, label.clone(), *parity)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(disc_starts.len(), total);
+    for (i, d) in span.discs.iter().enumerate() {
+        assert_eq!(
+            disc_starts[i],
+            (d.index, total as u32, d.label.clone(), d.part.is_none())
+        );
+        assert!(
+            d.label.ends_with(&format!("_{}OF{total}", d.index)),
+            "label must carry the set suffix: {}",
+            d.label
+        );
+    }
+
+    // set-scoped stages run once, disc-scoped stages once per disc, with
+    // DiscStart between (DM off, so no Format stage)
+    #[derive(Debug, PartialEq)]
+    enum Step {
+        Start(Stage),
+        Disc(u32),
+    }
+    let seq: Vec<Step> = events
+        .iter()
+        .filter_map(|ev| match ev {
+            StageEvent::StageStart(s) => Some(Step::Start(*s)),
+            StageEvent::DiscStart { index, .. } => Some(Step::Disc(*index)),
+            _ => None,
+        })
+        .collect();
+    let mut expected = vec![
+        Step::Start(Stage::Preflight),
+        Step::Start(Stage::Split),
+        Step::Start(Stage::Parity),
+        Step::Start(Stage::Checksums),
+        Step::Start(Stage::Master),
+    ];
+    for k in 1..=total as u32 {
+        expected.extend([
+            Step::Disc(k),
+            Step::Start(Stage::Burn),
+            Step::Start(Stage::VerifyImage),
+            Step::Start(Stage::VerifyFiles),
+        ]);
+    }
+    assert_eq!(seq, expected);
+    let mut expected_dones = vec![
+        Stage::Preflight,
+        Stage::Split,
+        Stage::Parity,
+        Stage::Checksums,
+        Stage::Master,
+    ];
+    for _ in 0..total {
+        expected_dones.extend([Stage::Burn, Stage::VerifyImage, Stage::VerifyFiles]);
+    }
+    assert_eq!(stage_dones(&events), expected_dones);
+
+    // every disc: fake device snapshot == staged ISO, and the ISO's contents
+    // hold exactly the part (or the recovery volumes) + index + docs
+    let set_txt = std::fs::read(stage_dir.join("SET.txt")).unwrap();
+    let mut concat = Vec::new();
+    for d in &span.discs {
+        let iso = stage_dir.join(format!("{}.iso", d.label));
+        assert!(iso.is_file(), "kept ISO missing: {}", iso.display());
+        let saved = PathBuf::from(format!("{}.disc{}", h.device.display(), d.index));
+        assert!(saved.is_file(), "no device image for disc {}", d.index);
+        assert!(
+            std::fs::read(&saved).unwrap() == std::fs::read(&iso).unwrap(),
+            "disc {} must be the ISO bit-for-bit",
+            d.index
+        );
+
+        let contents = PathBuf::from(format!("{}.contents", iso.display()));
+        let mut expected_files = vec![
+            "MANIFEST.txt".to_string(),
+            "RECOVERY.txt".to_string(),
+            "SET.txt".to_string(),
+            "checksums.sha256".to_string(),
+            "parity/vault.hc.par2".to_string(),
+        ];
+        match &d.part {
+            Some(p) => expected_files.push(p.file_name.clone()),
+            None => expected_files.push("parity/vault.hc.vol000+01.par2".to_string()),
+        }
+        expected_files.sort();
+        assert_eq!(
+            rel_files_under(&contents),
+            expected_files,
+            "disc {} contents",
+            d.index
+        );
+        assert_eq!(
+            std::fs::read(contents.join("SET.txt")).unwrap(),
+            set_txt,
+            "SET.txt must be byte-identical on disc {}",
+            d.index
+        );
+        if let Some(p) = &d.part {
+            concat.extend_from_slice(&std::fs::read(contents.join(&p.file_name)).unwrap());
+        }
+    }
+    let source = std::fs::read(&payload).unwrap();
+    assert!(
+        concat == source,
+        "concatenated parts from the data discs must equal the source"
+    );
+
+    // ONE par2 set: exact -c count, never -r
+    let argv =
+        std::fs::read_to_string(stage_dir.join("parity").join("vault.hc.par2.argv")).unwrap();
+    let lines: Vec<&str> = argv.lines().collect();
+    assert!(
+        lines.contains(&format!("-c{}", span.recovery_blocks).as_str()),
+        "argv: {argv}"
+    );
+    assert!(
+        lines.contains(&format!("-s{}", span.block).as_str()),
+        "argv: {argv}"
+    );
+    assert!(!lines.iter().any(|l| l.starts_with("-r")), "argv: {argv}");
+
+    // the report's second-copy reminder lists one burn-iso line per disc
+    let Some(StageEvent::Finished { report }) = events.last() else {
+        panic!("expected Finished last, got {:?}", events.last());
+    };
+    let burn_iso_lines: Vec<&str> = report
+        .reminders
+        .iter()
+        .flat_map(|r| r.lines())
+        .filter(|l| l.contains("ovenmitts burn-iso"))
+        .collect();
+    assert_eq!(burn_iso_lines.len(), total, "{burn_iso_lines:?}");
+    for d in &span.discs {
+        let iso = stage_dir.join(format!("{}.iso", d.label));
+        assert!(
+            burn_iso_lines
+                .iter()
+                .any(|l| l.contains(&iso.display().to_string())),
+            "no burn-iso reminder for disc {}: {burn_iso_lines:?}",
+            d.index
+        );
+    }
+}
+
+#[test]
+fn span_burn_fails_then_retries() {
+    let h = Harness::new();
+    std::env::set_var("OVENMITTS_FAKE_MEDIA", "small");
+    std::env::set_var("OVENMITTS_FAKE_BURN_FAIL_AT", "2");
+    // 80 MiB -> a 2+1 set: still exercises the swap loop but halves the
+    // debug-build hashing cost of the flagship 100 MiB test
+    let payload = h.payload("vault.hc", 80 * 1024 * 1024, 77);
+    let span = expected_span(&h, &payload, "RETRY");
+    let total = span.discs.len();
+    assert!(total >= 3, "expected at least a 2+1 set, planned {total}");
+    let stage_dir = h.stage_dir("RETRY");
+    h.set_mount_for(&stage_dir.join(format!("{}.iso", span.discs[0].label)));
+
+    let mut req = burn_request(vec![payload], "RETRY");
+    req.assume_yes = false;
+    let (events, res) = drive_span_burn(&h, req, &stage_dir, Ack::Proceed);
+    std::env::remove_var("OVENMITTS_FAKE_BURN_FAIL_AT");
+    std::env::remove_var("OVENMITTS_FAKE_MEDIA");
+    res.unwrap();
+
+    assert!(matches!(events.last(), Some(StageEvent::Finished { .. })));
+    assert!(
+        events.iter().any(|ev| matches!(
+            ev,
+            StageEvent::NeedAck { prompt } if prompt.contains("confirm to retry disc 2/")
+        )),
+        "the failed burn must raise the inline retry prompt"
+    );
+    // the ruined attempt adds exactly one extra Burn start, none downstream
+    let burns = stage_starts(&events)
+        .iter()
+        .filter(|s| **s == Stage::Burn)
+        .count();
+    assert_eq!(burns, total + 1);
+    let verifies = stage_starts(&events)
+        .iter()
+        .filter(|s| **s == Stage::VerifyImage)
+        .count();
+    assert_eq!(verifies, total);
+
+    let run_log = std::fs::read_to_string(stage_dir.join("run.log")).unwrap();
+    assert!(
+        run_log.contains(&format!("warning: disc 2/{total} FAILED")),
+        "{run_log}"
+    );
+    assert!(run_log.contains("libburn indicates failure"), "{run_log}");
+    assert!(
+        stage_dir.join("RETRY.report.txt").is_file(),
+        "a retried set must still finish with a report"
+    );
+}
+
+#[test]
+fn span_abort_resumes_via_burn_iso() {
+    let h = Harness::new();
+    std::env::set_var("OVENMITTS_FAKE_MEDIA", "small");
+    std::env::set_var("OVENMITTS_FAKE_BURN_FAIL_AT", "2");
+    let payload = h.payload("vault.hc", 80 * 1024 * 1024, 55);
+    let span = expected_span(&h, &payload, "ABORT");
+    assert!(span.discs.len() >= 3, "expected at least a 2+1 set");
+    let stage_dir = h.stage_dir("ABORT");
+    h.set_mount_for(&stage_dir.join(format!("{}.iso", span.discs[0].label)));
+
+    let mut req = burn_request(vec![payload], "ABORT");
+    req.assume_yes = false;
+    let (events, res) = drive_span_burn(&h, req, &stage_dir, Ack::Abort);
+    std::env::remove_var("OVENMITTS_FAKE_BURN_FAIL_AT");
+
+    let msg = res.unwrap_err();
+    assert!(msg.contains("set aborted at disc 2/"), "{msg}");
+    let Some(StageEvent::Failed { stage, .. }) = events.last() else {
+        panic!("expected Failed last, got {:?}", events.last());
+    };
+    assert_eq!(*stage, Stage::Burn);
+    for d in &span.discs {
+        let iso = stage_dir.join(format!("{}.iso", d.label));
+        assert!(iso.is_file(), "abort must keep every staged ISO");
+        let line = format!("ovenmitts burn-iso {}", iso.display());
+        if d.index == 1 {
+            assert!(
+                !msg.contains(&line),
+                "disc 1 completed, not remaining: {msg}"
+            );
+        } else {
+            assert!(msg.contains(&line), "{msg}");
+        }
+    }
+
+    // resume IS burn-iso: the aborted disc's staged image burns and verifies
+    let iso2 = stage_dir.join(format!("{}.iso", span.discs[1].label));
+    h.set_mount_for(&iso2);
+    let (ctx, rx, _ack) = h.ctx();
+    runner::run_burn_iso(&ctx, &iso2, true).unwrap();
+    let events2 = drain(ctx, rx);
+    assert!(matches!(events2.last(), Some(StageEvent::Finished { .. })));
+    assert!(!events2
+        .iter()
+        .any(|ev| matches!(ev, StageEvent::Failed { .. })));
+    assert!(
+        std::fs::read(&h.device).unwrap() == std::fs::read(&iso2).unwrap(),
+        "resumed disc must carry the staged image bit-for-bit"
+    );
+    std::env::remove_var("OVENMITTS_FAKE_MEDIA");
 }
 
 #[test]
