@@ -27,8 +27,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `stall_timeout_secs` seconds (new config key, default 900 = 15 min; `0`
   disables). Healthy tools emit keepalives every second, so this only trips on
   a genuinely stuck drive; a softer "still working" note appears after 2 min of
-  silence. Short one-shot probes (`xorriso -toc`, `dvd+rw-mediainfo`, `par2 -V`,
-  `veracrypt --list`, the LBA report) get a fixed 120 s deadline.
+  silence. Covers every streaming tool — burn, format, master, `par2 create`,
+  and `xorriso -check_media` (verification is where a failing drive shows up
+  first). Short one-shot probes (`xorriso -toc`, `dvd+rw-mediainfo`,
+  `par2 -V`, `veracrypt --list`, the LBA report) get a fixed 120 s deadline.
 - CI: `ci.yml` runs tests, `clippy -D warnings`, `rustfmt --check`, an MSRV
   (1.80) check, and `shellcheck`/`bash -n` on `install.sh` for every push and
   PR; `audit.yml` runs `cargo audit` weekly. Release binaries now carry signed
@@ -65,12 +67,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now run the same graceful sequence the TUI already used for Ctrl-C — abort the
   runner, SIGTERM the tools, wait, then SIGKILL — and report that the disc may
   be partially written. A main-thread panic also terminates running tools now,
-  and a TUI draw error mid-burn no longer orphans the tool.
+  and a TUI draw error mid-burn no longer orphans the tool. A second signal
+  restores the default disposition (hard exit) in case the graceful
+  escalation itself wedges.
 - **Tools are never orphaned on error or panic.** Every external process is now
   owned by a guard that kills and reaps it on any early return or unwind, so a
   burning xorriso can't be left running when ovenmitts exits abnormally. The
   guard also unregisters a child before waiting on it, closing a window where a
-  force-quit could signal a recycled PID.
+  force-quit could signal a recycled PID. Tools run in their own process
+  group and every kill signals the group, so a helper a tool forks dies with
+  it instead of surviving as an orphan holding the output pipes.
+- **`check_media` progress reaches the screen line by line.** xorriso's
+  pacifier rewrites its "blocks read" line in place with `\r`; the old
+  line-based reader glued whole batches into one mega-line.
 - **Verification fails closed when the page cache can't be defeated.** With
   `verify --iso`, if `eject` is unavailable *and* the O_DIRECT read-back also
   fails, ovenmitts previously fell back to a buffered read that could be served
@@ -101,6 +110,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Staging and artifacts are private and claimed atomically.** Run dirs are
+  created with `mkdir` 0700 (no check-then-create race, symlinks never
+  followed), the staging root and config dir are 0700, and every artifact
+  ovenmitts writes (checksums, MANIFEST, RECOVERY, LBA map, logs, reports,
+  config) is 0600 — these files describe private archive contents.
+- **Device strings are validated.** They reach `xorriso dev=<device>`
+  verbatim, where whitespace/`=`/`,` re-parse as options and a `stdio:/…`
+  pseudo-drive would silently burn into a file; the device must now be an
+  absolute path without those characters (a block device is deliberately not
+  required). The ISO operand on the burn command line is absolutized so a
+  leading-`-` name can never parse as an option.
 - **Disc verification refuses path-traversal and symlink escapes.** `ovenmitts
   verify` reads `checksums.sha256` off the mounted disc, which is untrusted
   input. Entries whose path is absolute, contains `..`, or resolves (via a Rock
@@ -268,6 +288,11 @@ No functional changes to ovenmitts itself — this release moves where it lives.
   (`FAILURE`/`FATAL`/`SORRY`/`aborting`) instead of the raw stderr tail,
   where "Thank you for being patient" keepalives could bury or evict the
   actual cause.
+
+## [0.1.2] — skipped
+
+Never released: the version number was skipped by mistake during the 0.1.3
+release; no tag or binaries exist for it.
 
 ## [0.1.1] - 2026-07-17
 

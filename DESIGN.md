@@ -60,8 +60,9 @@ parity:   par2 create -B<root_parent> -r<pct> -n1 -s<slice_bytes> -m<mem_mb> <ou
            parent and -B pins the basepath there because par2 otherwise bases
            on the staged .par2's dir and skips the sources; 0-byte members are
            excluded - par2 cannot repair them; no -q - par2 emits its percent
-           stream only at default verbosity; prefer `par2cmdline-turbo` binary
-           name `par2` or `par2turbo` if found)
+           stream only at default verbosity; par2cmdline-turbo installs as
+           `par2` everywhere - detect via the `par2 -V` banner if ever needed,
+           never probe a `par2turbo` name)
 ```
 
 ## Payload model
@@ -99,26 +100,26 @@ exact progress-line formats must be handled from real samples documented there.
 
 ```
 src/
-  main.rs      entry; dispatch CLI subcommand or TUI
+  main.rs      entry; dispatch CLI subcommand or TUI; line-mode event printer
   lib.rs       pub mod declarations
-  cli.rs       clap v4 derive definitions (done in scaffold)
-  config.rs    TOML config ~/.config/ovenmitts/config.toml, CLI-override merge (done)
-  plan.rs      core domain types + pure planning math (done in scaffold)
-  tools.rs     external binary discovery + version probe (done)
+  cli.rs       clap v4 derive definitions
+  config.rs    TOML config ~/.config/ovenmitts/config.toml, CLI-override merge, device validation
+  plan.rs      core domain types + pure planning math
+  tools.rs     external binary discovery + version probe
+  proc.rs      process layer: LC_ALL=C + own-process-group spawning, Reaper (kill/reap on drop), one streaming pump with inactivity watchdog, short-op deadlines
+  fsutil.rs    durable private writes (0600 + fsync file and parent dir)
+  shutdown.rs  SIGINT/TERM/HUP flag + graceful tool-terminating escalation
   media.rs     parse xorriso -toc/-list_formats/-list_speeds + dvd+rw-mediainfo → MediaInfo
-  hashing.rs   streaming SHA-256; write/parse/verify checksums.sha256
-  parity.rs    par2 slice-size computation + create/verify invocation
+  hashing.rs   streaming SHA-256; write/parse/verify checksums.sha256 (traversal-safe)
+  parity.rs    par2 slice-size computation + create invocation
   master.rs    ISO build, MANIFEST.txt, RECOVERY.txt, LBA map extraction
-  burn.rs      burn + optional DM format; parse xorriso progress → BurnProgress events
+  burn.rs      burn + optional DM format; parse xorriso progress → StageEvent::Progress
   verify.rs    readiness poll, O_DIRECT exact-size read-back hash, mount + file verify, check_media
   runner.rs    pipeline orchestration; emits StageEvent over mpsc; used by CLI and TUI
   tui.rs       ratatui 0.30 live pipeline view (interactive plan → stage progress → report)
   picker.rs    interactive payload picker for bare `ovenmitts` (browse, checkbox, fuzzy filter)
+  update.rs    in-process self-update (hardened curl fetch, sha256 gate, atomic swap)
 ```
-
-Signatures in the scaffold are the contract. Fill bodies; do not change public
-signatures unless compilation genuinely requires it — if so, note it in the
-final report. `todo!()` bodies mark what to implement.
 
 ## Events
 

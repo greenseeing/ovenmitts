@@ -135,18 +135,20 @@ file; comments and other keys survive).
 
 ## The plan screen
 
-The TUI's plan screen is where a burn is shaped. Five parameters are editable
-in place; every change round-trips through the pipeline runner, which redoes
-the capacity math and sends back the plan it now holds — the parity estimate,
-totals, fit gauge, and warnings on screen are always the runner's own numbers,
-never a UI approximation. What you confirm is exactly what burns.
+The TUI's plan screen is where a burn is shaped. Six parameters are editable
+in place — label, burn speed, redundancy, parity on/off, defect management,
+and the staging path; every change round-trips through the pipeline runner,
+which redoes the capacity math and sends back the plan it now holds — the
+parity estimate, totals, fit gauge, and warnings on screen are always the
+runner's own numbers, never a UI approximation. What you confirm is exactly
+what burns.
 
 | Key | Action |
 |-----|--------|
 | `↑` `↓` (or `k` `j`) | select a parameter row |
 | `←` `→` (or `h` `l`) | step redundancy ±1 · cycle speed through the drive's probed speeds · toggle parity / defect management |
 | `Space` | toggle parity / defect management |
-| `e` | edit label or speed inline (type, `Enter` commits, `Esc` cancels) |
+| `e` | edit label, speed or staging path inline (type, `Enter` commits, `Esc` cancels; an empty staging entry resets to the config/CLI default) |
 | `Enter` | burn — disabled while the plan does not fit |
 | `q` / `Esc` | abort (while editing, `Esc` only cancels the edit) |
 
@@ -182,7 +184,15 @@ speed = 4                  # burn speed factor; unset = drive decides (default)
 redundancy_pct = 15        # par2 redundancy percent (default 15)
 headroom_pct = 5           # never fill the disc past 100−headroom % (default 5)
 defect_management = false  # format spare areas before burning (default false)
-keep_iso = true            # keep the staged ISO after a verified burn (default true)
+keep_iso = true            # keep the staged ISO after a verified burn
+                           # (default true); false discards it exactly like
+                           # --discard-iso — the flag and the key can only
+                           # tighten each other
+stall_timeout_secs = 900   # kill a streaming tool after this many seconds of
+                           # NO output (inactivity, not total runtime — burns
+                           # legitimately run for an hour); healthy tools
+                           # print keepalives every second, so only a wedged
+                           # drive trips this. 0 disables the watchdog.
 # eject_when_done = true   # force (true) or suppress (false) the eject after a
                            # verified archive; unset = eject only in the TUI,
                            # where someone is present to take the disc
@@ -195,7 +205,7 @@ keep_iso = true            # keep the staged ISO after a verified burn (default 
 | preflight | inspects payloads — a directory expands to its member files, warning about symlinks/special files and 0-byte files — refuses mounted VeraCrypt containers, selects the drive and probes the disc (`xorriso -toc -list_formats -list_speeds`), fit-checks with headroom, checks staging space; in the TUI the plan then stays open for editing until confirmed |
 | parity | one recovery set per top-level payload: `par2 create -B<parent> -r<pct> -n1 -s<slice> -m<mem>` with every member file as a relative operand (a directory's files share one set; 0-byte files excluded — par2 cannot repair them); slice size computed toward the PAR2 32768-block ceiling (~2 MiB slices on 93 GiB) — never the default 2000 blocks that defeat 15% parity |
 | checksums | streaming SHA-256 of every payload file (directory members by their relative disc path) and parity file → `checksums.sha256` |
-| master | writes `MANIFEST.txt` + `RECOVERY.txt`, then `xorriso -as mkisofs -iso-level 3 -rock --md5`, extracts the file→LBA map, hashes the ISO |
+| master | re-checks staging space (the ISO is the big late allocation), writes `MANIFEST.txt` + `RECOVERY.txt`, then `xorriso -as mkisofs -iso-level 3 -rock --md5`, extracts the file→LBA map, hashes the ISO |
 | format | only with `--defect-management`: `xorriso -format as_needed`, then re-reads the reduced capacity and re-checks fit |
 | burn | `xorriso -as cdrecord -v dev=<dev> [speed=<n>] fs=64m blank=as_needed -eject <iso>` — stream recording on unformatted BD-R; the full xorriso transcript tees to `<label>.burn.log` next to the staged ISO, and a failure reports xorriso's diagnostic lines plus the `burn-iso` retry hint (the staged ISO survives) |
 | verify image | reloads the tray, polls drive readiness, reads exactly ISO-size bytes from the device (O_DIRECT, buffered fallback) and compares SHA-256 to the staged ISO |
@@ -222,7 +232,12 @@ the disc up and verification continues unattended.
 The staging directory keeps off-disc copies of everything that repairs a
 damaged disc: the ISO (with a `.sha256` sidecar), the parity set,
 `checksums.sha256`, `<label>.lba.txt` mapping every file to its disc
-sectors, and `<label>.burn.log` (the full xorriso burn transcript). Keep it.
+sectors, `<label>.burn.log` (the full xorriso burn transcript, appended
+across retries), `run.log` (the timestamped event record of every run in
+this dir), and `<label>.report.txt` (the final report with the exact tool
+versions that made the disc). Keep it. Old run dirs are never deleted by
+ovenmitts — preflight flags ones older than 30 days so you can remove what
+is already burned and verified.
 
 ## Recovery
 
