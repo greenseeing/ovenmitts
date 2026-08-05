@@ -50,11 +50,9 @@ pub fn build_iso(
         "xorriso produced an empty ISO at {}",
         input.out_iso.display()
     );
-    // xorriso wrote the image; make sure it is on the platter before the burn
-    // reads it back and before anything reports it as staged.
-    std::fs::File::open(input.out_iso)
-        .and_then(|f| f.sync_all())
-        .with_context(|| format!("fsync mastered ISO {}", input.out_iso.display()))?;
+    // xorriso wrote the image; make sure it is on the platter (data AND
+    // directory entry) before the burn reads it back or reports it staged.
+    crate::fsutil::fsync_existing(input.out_iso)?;
     Ok(size)
 }
 

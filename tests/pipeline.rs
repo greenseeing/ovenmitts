@@ -485,6 +485,8 @@ fn burn_pipeline_end_to_end() {
     assert!(run_log.contains("=== run "), "{run_log}");
     assert!(run_log.contains("[burn] start"), "{run_log}");
     assert!(run_log.contains("[verify files] done"), "{run_log}");
+    // percent-less tool lines (stall notes, tool output) must be kept too
+    assert!(run_log.contains("completed successfully"), "{run_log}");
     let report_txt = std::fs::read_to_string(stage_dir.join("PIPE.report.txt")).unwrap();
     assert!(
         report_txt.contains(&format!("ovenmitts {}", env!("CARGO_PKG_VERSION"))),

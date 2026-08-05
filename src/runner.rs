@@ -314,6 +314,13 @@ impl RunLog {
                     Some(format!("[{}] {pct:5.1}% {detail}", stage.label()))
                 }
             }
+            // percent-less lines are the interesting ones during a stall
+            // ("(no tool output for Ns)", raw tool notes) - keep them all
+            StageEvent::Progress {
+                stage,
+                pct: None,
+                detail,
+            } => Some(format!("[{}] {detail}", stage.label())),
             StageEvent::Info(t) => Some(format!("info: {t}")),
             StageEvent::Warn(t) => Some(format!("warning: {t}")),
             StageEvent::Failed { stage, error } => {
@@ -700,7 +707,7 @@ impl<'a> BurnRun<'a> {
         ctx.start(Stage::Master);
         // The ISO is the big late allocation: parity above (or a parallel run)
         // may have consumed the space that was free at confirm time.
-        check_staging_space(plan, &params.staging)?;
+        check_staging_space_for_iso(plan, &params.staging)?;
         let label = &staging.label;
         let manifest_path = staging.dir.join("MANIFEST.txt");
         let recovery_path = staging.dir.join("RECOVERY.txt");
@@ -833,12 +840,18 @@ impl<'a> BurnRun<'a> {
                 mastered.iso.display()
             ));
         } else {
-            std::fs::remove_file(&mastered.iso)
-                .with_context(|| format!("remove {}", mastered.iso.display()))?;
-            ctx.info(format!(
-                "discarded {} after successful verification",
-                mastered.iso.display()
-            ));
+            match std::fs::remove_file(&mastered.iso) {
+                Ok(()) => ctx.info(format!(
+                    "discarded {} after successful verification",
+                    mastered.iso.display()
+                )),
+                // the archive is verified; a leftover ISO must not turn the
+                // run into a failure that reads as a bad burn
+                Err(e) => ctx.warn(format!(
+                    "could not discard {}: {e:#} - remove it manually",
+                    mastered.iso.display()
+                )),
+            }
         }
         reminders.push(format!(
             "keep {} off-disc: parity, {label}.lba.txt and checksums.sha256 are what repair a damaged disc",
@@ -879,10 +892,21 @@ impl<'a> BurnRun<'a> {
             written_files,
             degradations: self.degradations,
         };
-        crate::fsutil::write_durable(&report_path, report_text(&report, &ctx.tools))?;
-        ctx.send(StageEvent::Finished { report });
+        send_finished(ctx, report, &report_path);
         Ok(())
     }
+}
+
+/// Write the report file and emit Finished. The disc is already verified at
+/// this point: a failed report write warns and drops the file from the list
+/// instead of failing the run — a Failed here would be misattributed to the
+/// verify stages and read as a bad burn.
+fn send_finished(ctx: &RunnerCtx, mut report: RunReport, report_path: &Path) {
+    if let Err(e) = crate::fsutil::write_durable(report_path, report_text(&report, &ctx.tools)) {
+        ctx.warn(format!("could not write {}: {e:#}", report_path.display()));
+        report.written_files.retain(|p| p != report_path);
+    }
+    ctx.send(StageEvent::Finished { report });
 }
 
 /// Where a VerifyFiles stage gets its checksum entries: the burn pipeline
@@ -1080,8 +1104,7 @@ pub fn run_burn_iso(ctx: &RunnerCtx, iso: &Path, assume_yes: bool) -> Result<()>
             written_files,
             degradations,
         };
-        crate::fsutil::write_durable(&report_path, report_text(&report, &ctx.tools))?;
-        ctx.send(StageEvent::Finished { report });
+        send_finished(ctx, report, &report_path);
         Ok(())
     })
 }
@@ -1546,6 +1569,9 @@ fn stale_staging_note(staging: &Path, needed: u64) -> Option<String> {
     ))
 }
 
+// Never follows symlinks (DirEntry::file_type is lstat-based): a symlinked
+// dir inside an old run dir must not be descended into - a cycle would spin
+// this forever, on every future burn's preflight.
 fn dir_size(dir: &Path) -> u64 {
     let mut total = 0u64;
     let mut stack = vec![dir.to_path_buf()];
@@ -1554,11 +1580,12 @@ fn dir_size(dir: &Path) -> u64 {
             continue;
         };
         for e in entries.flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                stack.push(p);
-            } else if let Ok(m) = p.symlink_metadata() {
-                total += m.len();
+            match e.file_type() {
+                Ok(t) if t.is_dir() => stack.push(e.path()),
+                Ok(t) if t.is_file() => {
+                    total += e.metadata().map(|m| m.len()).unwrap_or(0);
+                }
+                _ => {}
             }
         }
     }
@@ -1567,18 +1594,48 @@ fn dir_size(dir: &Path) -> u64 {
 
 // payloads stay in place; staging holds parity + the ISO (which contains both)
 fn check_staging_space(plan: &ArchivePlan, staging: &Path) -> Result<()> {
-    let needed = plan.parity_bytes_est + plan.total_bytes_est;
+    ensure_staging_free(
+        staging,
+        confirm_space_needed(plan),
+        &format!(
+            "parity {} + ISO {}",
+            human_bytes(plan.parity_bytes_est),
+            human_bytes(plan.total_bytes_est)
+        ),
+    )
+}
+
+/// Master-time re-check: the parity files are already on disk (sunk cost,
+/// already subtracted from the free-space reading), so only the ISO — whose
+/// estimate contains the parity copies — remains to allocate. Charging
+/// parity again here would spuriously fail near-capacity burns after the
+/// parity work is done.
+fn check_staging_space_for_iso(plan: &ArchivePlan, staging: &Path) -> Result<()> {
+    ensure_staging_free(
+        staging,
+        master_space_needed(plan),
+        &format!("ISO {}", human_bytes(plan.total_bytes_est)),
+    )
+}
+
+fn confirm_space_needed(plan: &ArchivePlan) -> u64 {
+    plan.parity_bytes_est + plan.total_bytes_est
+}
+
+fn master_space_needed(plan: &ArchivePlan) -> u64 {
+    plan.total_bytes_est
+}
+
+fn ensure_staging_free(staging: &Path, needed: u64, breakdown: &str) -> Result<()> {
     std::fs::create_dir_all(staging)
         .with_context(|| format!("create staging dir {}", staging.display()))?;
     let free = staging_free_bytes(staging)?;
     ensure!(
         free >= needed,
-        "staging {} has {} free but needs ~{} (parity {} + ISO {})",
+        "staging {} has {} free but needs ~{} ({breakdown})",
         staging.display(),
         human_bytes(free),
         human_bytes(needed),
-        human_bytes(plan.parity_bytes_est),
-        human_bytes(plan.total_bytes_est)
     );
     Ok(())
 }
@@ -2191,6 +2248,54 @@ mod tests {
         // fresh dir, but bigger than what this plan still needs to allocate
         let note = stale_staging_note(&staging, 4096).expect("crowding dirs must be flagged");
         assert!(note.contains("RECENT"), "{note}");
+    }
+
+    #[test]
+    fn stale_staging_note_survives_symlink_cycles() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join("staging");
+        let old_run = staging.join("OLD");
+        std::fs::create_dir_all(&old_run).unwrap();
+        std::fs::write(old_run.join("f"), vec![1u8; 1024]).unwrap();
+        // a symlink cycle in an old run dir must not hang every future burn
+        std::os::unix::fs::symlink(".", old_run.join("loop")).unwrap();
+        set_mtime_days_ago(&old_run, 40);
+        let note = stale_staging_note(&staging, u64::MAX).expect("stale dir must be flagged");
+        assert!(note.contains("OLD"), "{note}");
+    }
+
+    #[test]
+    fn master_recheck_charges_only_the_iso() {
+        let payload = plan::Payload {
+            root: "/data/vault.hc".into(),
+            is_dir: false,
+            files: vec![plan::PayloadMember {
+                abs: "/data/vault.hc".into(),
+                rel: "vault.hc".into(),
+                size: 8 * 1024 * 1024,
+                container: false,
+            }],
+            dirs: 0,
+            total_size: 8 * 1024 * 1024,
+            name: "vault.hc".into(),
+        };
+        let input = PlanInput {
+            payloads: vec![payload],
+            parity: true,
+            redundancy_pct: 15,
+            headroom_pct: 5,
+            defect_management: false,
+        };
+        let plan = plan::build_plan(&input, &media::synthetic("bd25").unwrap());
+        assert!(plan.parity_bytes_est > 0);
+        // by Master time the parity files are on disk (sunk cost, already out
+        // of the free-space reading) and the ISO estimate contains the parity
+        // copies - charging parity again would fail near-capacity burns
+        assert_eq!(master_space_needed(&plan), plan.total_bytes_est);
+        assert_eq!(
+            confirm_space_needed(&plan),
+            plan.parity_bytes_est + plan.total_bytes_est
+        );
     }
 
     #[test]
