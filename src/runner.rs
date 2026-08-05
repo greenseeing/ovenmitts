@@ -587,16 +587,7 @@ fn burn_pipeline(ctx: &RunnerCtx, req: &BurnRequest, stage: &mut Stage) -> Resul
         }
         res?
     };
-    let bad: Vec<&str> = verified
-        .iter()
-        .filter(|(_, ok)| !ok)
-        .map(|(rel, _)| rel.as_str())
-        .collect();
-    ensure!(
-        bad.is_empty(),
-        "file verification FAILED on disc: {}",
-        bad.join(", ")
-    );
+    ensure_all_match(&verified)?;
     ctx.done(
         &mut stages,
         Stage::VerifyFiles,
@@ -857,16 +848,7 @@ pub fn run_verify(ctx: &RunnerCtx, iso: Option<&Path>) -> Result<()> {
             }
             res?
         };
-        let bad: Vec<&str> = verified
-            .iter()
-            .filter(|(_, ok)| !ok)
-            .map(|(rel, _)| rel.as_str())
-            .collect();
-        ensure!(
-            bad.is_empty(),
-            "file verification FAILED on disc: {}",
-            bad.join(", ")
-        );
+        ensure_all_match(&verified)?;
         ctx.done(
             &mut stages,
             Stage::VerifyFiles,
@@ -1348,6 +1330,22 @@ fn file_name_string(p: &Path) -> String {
     p.file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| p.display().to_string())
+}
+
+/// One line per failed file, each stating whether it is a bad burn
+/// (mismatch/missing) or a failing medium (read error) - the operator's next
+/// move differs completely between the two.
+fn ensure_all_match(verified: &[(String, hashing::FileCheck)]) -> Result<()> {
+    let bad: Vec<String> = verified
+        .iter()
+        .filter_map(|(rel, check)| check.problem().map(|p| format!("{rel}: {p}")))
+        .collect();
+    ensure!(
+        bad.is_empty(),
+        "file verification FAILED on disc: {}",
+        bad.join("; ")
+    );
+    Ok(())
 }
 
 fn wait_ready(ctx: &RunnerCtx, device: &str) -> Result<()> {

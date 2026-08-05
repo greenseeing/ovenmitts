@@ -130,12 +130,41 @@ fn resolve_under_root(canon_root: &Path, rel: &str) -> Result<Resolved> {
     Ok(Resolved::File(cur))
 }
 
-/// Hash every listed file under root and compare; returns (relpath, ok) per entry.
+/// Per-file verification outcome. Mismatch and Missing mean the burn wrote
+/// the wrong bytes (or none); ReadError means the medium would not give the
+/// bytes back at all - a decaying disc, which needs rescue, not re-burning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileCheck {
+    Match,
+    Mismatch,
+    Missing,
+    ReadError(String),
+}
+
+impl FileCheck {
+    pub fn ok(&self) -> bool {
+        matches!(self, FileCheck::Match)
+    }
+
+    /// Human description of a non-Match outcome; None when Match.
+    pub fn problem(&self) -> Option<String> {
+        match self {
+            FileCheck::Match => None,
+            FileCheck::Mismatch => Some("hash MISMATCH (bad burn)".into()),
+            FileCheck::Missing => Some("MISSING from the disc (bad burn)".into()),
+            FileCheck::ReadError(e) => Some(format!(
+                "READ ERROR ({e}) - failing medium: ddrescue now, see RECOVERY.txt"
+            )),
+        }
+    }
+}
+
+/// Hash every listed file under root and compare; returns a FileCheck per entry.
 pub fn verify_checksums(
     root: &Path,
     entries: &[(String, String)],
     cb: &mut dyn FnMut(u64, u64),
-) -> Result<Vec<(String, bool)>> {
+) -> Result<Vec<(String, FileCheck)>> {
     let canon_root = root
         .canonicalize()
         .with_context(|| format!("resolve {}", root.display()))?;
@@ -155,18 +184,19 @@ pub fn verify_checksums(
     cb(0, total);
     let mut results = Vec::with_capacity(entries.len());
     for (((expected, rel), size), res) in entries.iter().zip(&sizes).zip(&resolved) {
-        let ok = match res {
-            Resolved::Missing => false,
+        let check = match res {
+            Resolved::Missing => FileCheck::Missing,
             Resolved::File(path) => {
                 match sha256_file(path, &mut |done, _| cb(base + done.min(*size), total)) {
-                    Ok(actual) => actual == expected.to_ascii_lowercase(),
-                    Err(_) => false,
+                    Ok(actual) if actual == expected.to_ascii_lowercase() => FileCheck::Match,
+                    Ok(_) => FileCheck::Mismatch,
+                    Err(e) => FileCheck::ReadError(format!("{e:#}")),
                 }
             }
         };
         base += size;
         cb(base, total);
-        results.push((rel.clone(), ok));
+        results.push((rel.clone(), check));
     }
     Ok(results)
 }
@@ -304,7 +334,7 @@ mod tests {
         std::fs::write(root.path().join("parity/a.par2"), b"abc").unwrap();
         let entries = vec![(ABC.to_string(), "parity/a.par2".to_string())];
         let res = verify_checksums(root.path(), &entries, &mut |_, _| {}).unwrap();
-        assert_eq!(res, vec![("parity/a.par2".to_string(), true)]);
+        assert_eq!(res, vec![("parity/a.par2".to_string(), FileCheck::Match)]);
     }
 
     #[test]
@@ -335,11 +365,39 @@ mod tests {
         assert_eq!(
             res,
             vec![
-                ("good".to_string(), true),
-                ("bad".to_string(), false),
-                ("missing".to_string(), false),
+                ("good".to_string(), FileCheck::Match),
+                ("bad".to_string(), FileCheck::Mismatch),
+                ("missing".to_string(), FileCheck::Missing),
             ]
         );
         assert_eq!(last, (6, 6));
+        assert!(FileCheck::Match.problem().is_none());
+        assert!(FileCheck::Mismatch
+            .problem()
+            .unwrap()
+            .contains("MISMATCH (bad burn)"));
+        assert!(FileCheck::Missing.problem().unwrap().contains("MISSING"));
+    }
+
+    #[test]
+    fn read_error_is_distinguished_from_mismatch() {
+        // A file the medium refuses to give back is decay, not a bad burn -
+        // the report must steer toward ddrescue, not a re-burn.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("decayed");
+        std::fs::write(&p, b"abc").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let entries = vec![(ABC.to_string(), "decayed".to_string())];
+        let res = verify_checksums(dir.path(), &entries, &mut |_, _| {}).unwrap();
+        let (rel, check) = &res[0];
+        assert_eq!(rel, "decayed");
+        let FileCheck::ReadError(cause) = check else {
+            panic!("expected ReadError, got {check:?}");
+        };
+        assert!(!cause.is_empty());
+        let msg = check.problem().unwrap();
+        assert!(msg.contains("READ ERROR"), "{msg}");
+        assert!(msg.contains("ddrescue"), "{msg}");
     }
 }
