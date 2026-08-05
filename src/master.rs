@@ -28,7 +28,7 @@ pub fn build_iso(
     cb: &mut dyn FnMut(Option<f32>, String),
 ) -> Result<u64> {
     let args = master_args(input);
-    crate::burn::run_streaming(
+    crate::proc::run_streaming(
         &tools.xorriso,
         &args,
         stall,

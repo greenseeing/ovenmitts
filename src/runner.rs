@@ -475,6 +475,7 @@ fn burn_pipeline(ctx: &RunnerCtx, req: &BurnRequest, stage: &mut Stage) -> Resul
                 p,
                 &stage_dir.join("parity"),
                 params.redundancy_pct,
+                ctx.cfg.stall_timeout(),
                 &mut |pct, line| {
                     let overall = pct.map(|v| (i as f32 * 100.0 + v) / n);
                     let detail = if line.is_empty() {
@@ -978,9 +979,14 @@ pub fn run_verify(ctx: &RunnerCtx, iso: Option<&Path>) -> Result<()> {
 
         *stage = Stage::CheckMedia;
         ctx.start(Stage::CheckMedia);
-        match verify::check_media(&ctx.tools, &device, &mut |pct, line| {
-            ctx.progress(Stage::CheckMedia, pct, line);
-        }) {
+        match verify::check_media(
+            &ctx.tools,
+            &device,
+            ctx.cfg.stall_timeout(),
+            &mut |pct, line| {
+                ctx.progress(Stage::CheckMedia, pct, line);
+            },
+        ) {
             Ok(true) => ctx.done(
                 &mut stages,
                 Stage::CheckMedia,
@@ -1024,9 +1030,14 @@ pub fn run_check(ctx: &RunnerCtx, save_to: Option<&Path>) -> Result<()> {
             "medium in {device} is blank - nothing to check yet (check verifies a burned disc)"
         );
         verify::ensure_unmounted(&ctx.tools, &device)?;
-        let clean = verify::check_media(&ctx.tools, &device, &mut |pct, line| {
-            ctx.progress(Stage::CheckMedia, pct, line);
-        })?;
+        let clean = verify::check_media(
+            &ctx.tools,
+            &device,
+            ctx.cfg.stall_timeout(),
+            &mut |pct, line| {
+                ctx.progress(Stage::CheckMedia, pct, line);
+            },
+        )?;
         ensure!(
             clean,
             "medium DAMAGED or MD5 mismatch - recover now: copy what reads, then par2 repair (see RECOVERY.txt on the disc)"

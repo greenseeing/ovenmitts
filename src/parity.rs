@@ -1,6 +1,5 @@
-use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::time::Duration;
 
 use anyhow::{bail, ensure, Context, Result};
 
@@ -14,12 +13,14 @@ use crate::tools::Tools;
 /// the set stores disc-layout paths (repair with -B works from a disc copy);
 /// slice size from Payload::slice_bytes (never the 2000-block default); -n1;
 /// -m from available memory (min 512 MB, cap 4096 MB).
+/// `stall` is the inactivity watchdog (a wedged disk mid-par2 must not hang).
 /// Output files land in out_dir; returns their paths.
 pub fn create(
     tools: &Tools,
     payload: &plan::Payload,
     out_dir: &Path,
     redundancy_pct: u32,
+    stall: Duration,
     cb: &mut dyn FnMut(Option<f32>, String),
 ) -> Result<Vec<PathBuf>> {
     let par2 = tools
@@ -56,29 +57,18 @@ pub fn create(
         payload.slice_bytes(),
         mem_mb(),
     );
-    let mut reaper = crate::proc::Reaper::adopt(
-        crate::proc::command(par2)
-            .args(&args)
-            .current_dir(parent)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .with_context(|| format!("spawn {}", par2.display()))?,
-    );
-
-    let mut stderr = reaper.stderr().context("no stderr pipe")?;
-    let err_reader = std::thread::spawn(move || {
-        let mut s = String::new();
-        let _ = stderr.read_to_string(&mut s);
-        s
-    });
-    let stdout = reaper.stdout().context("no stdout pipe")?;
-    pump_lines(stdout, &mut |line| {
-        cb(parse_progress_line(line), line.to_string())
-    });
-
-    let status = reaper.wait().context("wait for par2")?;
-    let err_text = err_reader.join().unwrap_or_default();
+    // stdout carries the Processing:/Constructing: progress stream, stderr
+    // the failure cause; both ride the shared watchdog-equipped pump.
+    let mut err_text = String::new();
+    let status =
+        crate::proc::stream_lines(par2, &args, Some(parent), stall, &mut |is_err, line| {
+            if is_err {
+                err_text.push_str(line);
+                err_text.push('\n');
+            } else {
+                cb(parse_progress_line(line), line.to_string());
+            }
+        })?;
     if !status.success() {
         bail!("par2 create failed ({status}): {}", err_text.trim());
     }
@@ -142,33 +132,6 @@ pub fn parse_progress_line(line: &str) -> Option<f32> {
     (0.0..=100.0).contains(&pct).then_some(pct)
 }
 
-// par2 rewrites progress in place with '\r'; split on both terminators.
-// Read errors end the pump instead of erroring out: create() must always
-// reach child.wait() so the par2 process is reaped.
-fn pump_lines(mut r: impl Read, f: &mut dyn FnMut(&str)) {
-    let mut buf = [0u8; 8192];
-    let mut acc: Vec<u8> = Vec::new();
-    loop {
-        let n = match r.read(&mut buf) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => n,
-        };
-        for &b in &buf[..n] {
-            if b == b'\n' || b == b'\r' {
-                if !acc.is_empty() {
-                    f(&String::from_utf8_lossy(&acc));
-                    acc.clear();
-                }
-            } else {
-                acc.push(b);
-            }
-        }
-    }
-    if !acc.is_empty() {
-        f(&String::from_utf8_lossy(&acc));
-    }
-}
-
 fn mem_mb() -> u32 {
     std::fs::read_to_string("/proc/meminfo")
         .map(|t| mem_mb_from_meminfo(&t))
@@ -193,7 +156,10 @@ mod tests {
     const CAPTURE: &str = include_str!("../tests/fixtures/par2_create_output.txt");
     // Live-stream reconstruction of the same run per the source format strings
     // (par2creator.cpp "Processing: ", reedsolomon.h "Constructing: "), with \r.
-    const STREAM: &[u8] = include_bytes!("../tests/fixtures/par2_create_stream.txt");
+    const STREAM_PATH: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/par2_create_stream.txt"
+    );
 
     #[test]
     fn args_match_design_contract() {
@@ -285,17 +251,85 @@ mod tests {
     }
 
     #[test]
-    fn pump_splits_on_carriage_returns() {
-        let mut lines = Vec::new();
-        pump_lines(STREAM, &mut |l| lines.push(l.to_string()));
-        assert!(lines.contains(&"Constructing: 45.6%".to_string()));
-        assert!(lines.contains(&"Processing: 99.9%".to_string()));
-        assert_eq!(lines.last().map(String::as_str), Some("Done"));
-        let pcts: Vec<f32> = lines
-            .iter()
-            .filter_map(|l| parse_progress_line(l))
-            .collect();
+    fn create_splits_carriage_return_progress() {
+        use std::os::unix::fs::PermissionsExt;
+        // a fake par2 replays the real \r-terminated stream; every in-place
+        // progress update must arrive as its own callback, not one mega-line
+        let dir = tempfile::tempdir().unwrap();
+        let payload = dir.path().join("vault.hc");
+        std::fs::write(&payload, vec![0u8; 64 * 1024]).unwrap();
+        let fake = dir.path().join("par2");
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\n\
+                 out=$7\n\
+                 cat {STREAM_PATH}\n\
+                 : > \"$out\"\n\
+                 : > \"${{out%.par2}}.vol000+01.par2\"\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let tools = Tools {
+            xorriso: "/bin/true".into(),
+            par2: Some(fake),
+            par2_version: None,
+            udisksctl: None,
+            veracrypt: None,
+            eject: None,
+            mediainfo: None,
+        };
+        let mut events = Vec::new();
+        create_retrying(
+            &tools,
+            &inspect(&payload),
+            &dir.path().join("out"),
+            &mut events,
+        )
+        .unwrap();
+        let pcts: Vec<f32> = events.iter().filter_map(|(p, _)| *p).collect();
         assert_eq!(pcts, vec![12.3, 45.6, 99.9, 100.0, 0.1, 12.3, 99.9, 100.0]);
+    }
+
+    #[test]
+    fn create_kills_a_stalled_par2() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let payload = dir.path().join("vault.hc");
+        std::fs::write(&payload, vec![0u8; 1024]).unwrap();
+        let fake = dir.path().join("par2");
+        // one line then silence; exec so the watched process is par2 itself
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\nprintf 'Processing: 1.0%%\\n'\nexec sleep 120\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let tools = Tools {
+            xorriso: "/bin/true".into(),
+            par2: Some(fake),
+            par2_version: None,
+            udisksctl: None,
+            veracrypt: None,
+            eject: None,
+            mediainfo: None,
+        };
+        let start = std::time::Instant::now();
+        let err = create(
+            &tools,
+            &inspect(&payload),
+            &dir.path().join("out"),
+            15,
+            Duration::from_secs(1),
+            &mut |_, _| {},
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("no output"), "{err}");
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "watchdog never fired for par2"
+        );
     }
 
     #[test]
@@ -321,7 +355,9 @@ mod tests {
     ) -> Result<Vec<PathBuf>> {
         loop {
             events.clear();
-            match create(tools, payload, out_dir, 15, &mut |p, l| events.push((p, l))) {
+            match create(tools, payload, out_dir, 15, Duration::ZERO, &mut |p, l| {
+                events.push((p, l))
+            }) {
                 Err(e) if format!("{e:#}").contains("Text file busy") => {
                     std::thread::sleep(std::time::Duration::from_millis(20));
                 }
@@ -408,7 +444,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let payload = dir.path().join("v");
         std::fs::write(&payload, b"x").unwrap();
-        let err = create(&tools, &inspect(&payload), dir.path(), 15, &mut |_, _| {}).unwrap_err();
+        let err = create(
+            &tools,
+            &inspect(&payload),
+            dir.path(),
+            15,
+            Duration::ZERO,
+            &mut |_, _| {},
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("par2 not found"));
     }
 
@@ -432,6 +476,7 @@ mod tests {
             &inspect(&extras),
             &dir.path().join("out"),
             15,
+            Duration::ZERO,
             &mut |_, _| {},
         )
         .unwrap_err();

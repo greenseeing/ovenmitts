@@ -1,9 +1,6 @@
-use std::io::{BufRead, BufReader, Read};
+use std::io::Read;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::PathBuf;
-use std::process::Stdio;
-use std::sync::mpsc::Sender;
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -332,41 +329,28 @@ pub fn unmount(tools: &Tools, device: &str) -> Result<()> {
 /// at mastering time; returns true when the medium checks clean.
 /// xorriso's -md5 default is off, and check runs verify the session tags only
 /// when it is on; it must precede -indev so the tags load with the image.
+/// `stall` is the inactivity watchdog - a wedged drive during the health
+/// check is precisely where a failing drive shows up first.
 pub fn check_media(
     tools: &Tools,
     device: &str,
+    stall: Duration,
     cb: &mut dyn FnMut(Option<f32>, String),
 ) -> Result<bool> {
-    let mut reaper = crate::proc::Reaper::adopt(
-        crate::proc::command(&tools.xorriso)
-            .args(["-md5", "on", "-indev", device, "-check_media", "--"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .context("spawning xorriso -check_media")?,
-    );
-    let (tx, rx) = std::sync::mpsc::channel::<String>();
-    let mut pumps: Vec<JoinHandle<()>> = Vec::new();
-    // result channel (stdout) carries the tables, info channel (stderr) the pacifier
-    if let Some(o) = reaper.stdout() {
-        pumps.push(spawn_line_pump(o, tx.clone()));
-    }
-    if let Some(e) = reaper.stderr() {
-        pumps.push(spawn_line_pump(e, tx.clone()));
-    }
-    drop(tx);
+    let args: Vec<String> = ["-md5", "on", "-indev", device, "-check_media", "--"]
+        .map(String::from)
+        .to_vec();
+    // stdout carries the result tables, stderr the pacifier; the shared pump
+    // splits xorriso's \r-rewritten pacifier into real lines.
     let mut all = String::new();
-    for line in rx {
+    let status = crate::proc::stream_lines(&tools.xorriso, &args, None, stall, &mut |_, line| {
         if line.contains("blocks read") || line.contains("SORRY") || line.contains("FAILURE") {
             cb(None, line.trim().to_string());
         }
-        all.push_str(&line);
+        all.push_str(line);
         all.push('\n');
-    }
-    for p in pumps {
-        let _ = p.join();
-    }
-    let status = reaper.wait().context("waiting for xorriso -check_media")?;
+    })
+    .context("running xorriso -check_media")?;
     if !status.success() && !all.contains("Media checks :") {
         bail!(
             "xorriso -check_media failed ({status}): {}",
@@ -374,17 +358,6 @@ pub fn check_media(
         );
     }
     Ok(parse_check_media(&all))
-}
-
-fn spawn_line_pump(r: impl Read + Send + 'static, tx: Sender<String>) -> JoinHandle<()> {
-    std::thread::spawn(move || {
-        for line in BufReader::new(r).lines() {
-            let Ok(line) = line else { break };
-            if tx.send(line).is_err() {
-                break;
-            }
-        }
-    })
 }
 
 fn tail_lines(s: &str, n: usize) -> String {
@@ -585,6 +558,40 @@ mod tests {
         assert!(!parse_check_media(include_str!(
             "../tests/fixtures/check_media_md5_mismatch.txt"
         )));
+    }
+
+    #[test]
+    fn check_media_splits_carriage_return_pacifier() {
+        use std::os::unix::fs::PermissionsExt;
+        // xorriso's pacifier rewrites "... blocks read" in place with \r; each
+        // update must reach the callback as its own line, not one mega-line.
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("xorriso");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\n\
+             printf 'xorriso : UPDATE :   1024 blocks read\\r' >&2\n\
+             printf 'xorriso : UPDATE :   2048 blocks read\\r\\n' >&2\n\
+             printf 'Media checks :        lba ,       size , quality\\n'\n\
+             printf 'Media region :          0 ,       2048 , + good\\n'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut tools = no_tools();
+        tools.xorriso = fake;
+        let mut lines = Vec::new();
+        let clean = check_media(&tools, "/dev/whatever", Duration::ZERO, &mut |_, l| {
+            lines.push(l)
+        })
+        .unwrap();
+        assert!(clean);
+        assert_eq!(
+            lines,
+            vec![
+                "xorriso : UPDATE :   1024 blocks read",
+                "xorriso : UPDATE :   2048 blocks read",
+            ]
+        );
     }
 
     #[test]

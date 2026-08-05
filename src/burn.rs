@@ -1,11 +1,10 @@
-use std::collections::VecDeque;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 
+use crate::proc::run_streaming;
 use crate::tools::Tools;
 
 /// Optional drive-level defect management: `xorriso -outdev <dev> -format as_needed`.
@@ -149,130 +148,11 @@ fn pct_token(t: &str) -> Option<f32> {
     Some(pct.clamp(0.0, 100.0))
 }
 
-const STDERR_TAIL: usize = 12;
-
-// xorriso keeps emitting UPDATE keepalives to stderr while aborting; without
-// severity filtering they bury (or evict) the FATAL/FAILURE cause.
-fn is_diagnostic(line: &str) -> bool {
-    [
-        " FATAL : ",
-        " FAILURE : ",
-        " SORRY : ",
-        " ABORT : ",
-        " : aborting :",
-    ]
-    .iter()
-    .any(|needle| line.contains(needle))
-}
-
-fn push_capped(buf: &mut VecDeque<String>, line: String) {
-    if buf.len() == STDERR_TAIL {
-        buf.pop_front();
-    }
-    buf.push_back(line);
-}
-
-// Poll cadence for the inactivity watchdog, and how long a tool may be silent
-// before we surface a reassuring "still working" note (not a kill).
-const WATCH_POLL: Duration = Duration::from_secs(5);
-const WARN_AFTER: Duration = Duration::from_secs(120);
-
-// libburn rewrites progress in place with '\r'; split on both terminators.
-// `stall` kills the child after that long with no output at all (Duration::ZERO
-// disables). A healthy xorriso/par2 emits keepalives every second, so only a
-// genuinely wedged drive stays silent that long.
-pub(crate) fn run_streaming(
-    bin: &Path,
-    args: &[String],
-    stall: Duration,
-    on_line: &mut dyn FnMut(&str),
-) -> Result<()> {
-    let mut reaper = crate::proc::Reaper::spawn(bin, args)?;
-    let stdout = reaper.stdout().context("no stdout pipe")?;
-    let stderr = reaper.stderr().context("no stderr pipe")?;
-    let (tx, rx) = mpsc::channel::<(bool, String)>();
-    let tx_err = tx.clone();
-    let t_out = std::thread::spawn(move || pump(stdout, false, tx));
-    let t_err = std::thread::spawn(move || pump(stderr, true, tx_err));
-
-    let mut tail: VecDeque<String> = VecDeque::with_capacity(STDERR_TAIL);
-    let mut diags: VecDeque<String> = VecDeque::with_capacity(STDERR_TAIL);
-    let mut last_activity = Instant::now();
-    let mut last_warn = Instant::now();
-    let mut stalled = false;
-    loop {
-        match rx.recv_timeout(WATCH_POLL) {
-            Ok((is_err, line)) => {
-                last_activity = Instant::now();
-                if is_err {
-                    if is_diagnostic(&line) {
-                        push_capped(&mut diags, line.clone());
-                    }
-                    push_capped(&mut tail, line.clone());
-                }
-                on_line(&line);
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                let quiet = last_activity.elapsed();
-                if quiet >= WARN_AFTER && last_warn.elapsed() >= Duration::from_secs(60) {
-                    on_line(&format!("(no tool output for {}s)", quiet.as_secs()));
-                    last_warn = Instant::now();
-                }
-                if !stall.is_zero() && quiet >= stall {
-                    reaper.kill_now();
-                    stalled = true;
-                    break;
-                }
-            }
-        }
-    }
-    let _ = t_out.join();
-    let _ = t_err.join();
-    if stalled {
-        bail!(
-            "{}: no output for {}s - terminated (wedged drive?)",
-            bin.display(),
-            stall.as_secs()
-        );
-    }
-    let status = reaper.wait()?;
-    if !status.success() {
-        let lines: Vec<String> = if diags.is_empty() { tail } else { diags }.into();
-        bail!("{} failed ({status}): {}", bin.display(), lines.join("\n"));
-    }
-    Ok(())
-}
-
-fn pump(mut r: impl Read, is_err: bool, tx: mpsc::Sender<(bool, String)>) {
-    let mut buf = [0u8; 8192];
-    let mut acc: Vec<u8> = Vec::new();
-    loop {
-        let n = match r.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(_) => break,
-        };
-        for &b in &buf[..n] {
-            if b == b'\n' || b == b'\r' {
-                if !acc.is_empty() {
-                    let _ = tx.send((is_err, String::from_utf8_lossy(&acc).into_owned()));
-                    acc.clear();
-                }
-            } else {
-                acc.push(b);
-            }
-        }
-    }
-    if !acc.is_empty() {
-        let _ = tx.send((is_err, String::from_utf8_lossy(&acc).into_owned()));
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::time::Instant;
 
     // Real captures: bug-xorriso list 2015-08 msg00002 (DVD+RW burn via
     // -as cdrecord) and xorriso doc/qemu_xorriso.wiki (Writing:/Blanking/

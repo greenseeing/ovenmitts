@@ -9,10 +9,11 @@
 //! orphaned), and [`terminate_active`] lets an interactive force-quit signal
 //! every live tool.
 
+use std::collections::VecDeque;
 use std::io::Read;
 use std::path::Path;
-use std::process::{Child, Command, Output, Stdio};
-use std::sync::Mutex;
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::sync::{mpsc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -63,15 +64,10 @@ pub fn terminate_active(force: bool) {
 // inherits a write fd to the binary); it also fires when we exec a binary that
 // another process — e.g. an in-progress `ovenmitts update` — still holds open
 // for write. Retry briefly rather than fail the whole operation.
-pub(crate) fn spawn_retrying(bin: &Path, args: &[String]) -> Result<Child> {
+fn spawn_command_retrying(cmd: &mut Command, bin: &Path) -> Result<Child> {
     let mut tries = 0;
     loop {
-        match command(bin)
-            .args(args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-        {
+        match cmd.spawn() {
             Ok(child) => return Ok(child),
             Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && tries < 20 => {
                 tries += 1;
@@ -80,6 +76,12 @@ pub(crate) fn spawn_retrying(bin: &Path, args: &[String]) -> Result<Child> {
             Err(e) => return Err(e).with_context(|| format!("spawn {}", bin.display())),
         }
     }
+}
+
+pub(crate) fn spawn_retrying(bin: &Path, args: &[String]) -> Result<Child> {
+    let mut cmd = command(bin);
+    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    spawn_command_retrying(&mut cmd, bin)
 }
 
 /// Owns a spawned child and guarantees it is reaped. `wait` deregisters the PID
@@ -180,6 +182,147 @@ impl Drop for Reaper {
             return;
         }
         self.kill_now();
+    }
+}
+
+// Poll cadence for the inactivity watchdog, and how long a tool may be silent
+// before we surface a reassuring "still working" note (not a kill).
+const WATCH_POLL: Duration = Duration::from_secs(5);
+const WARN_AFTER: Duration = Duration::from_secs(120);
+
+/// The one streaming implementation: spawn `bin`, split both pipes on \r and
+/// \n (libburn and par2 rewrite progress in place with '\r'), and feed every
+/// line to `on_line` with an is-stderr flag. `stall` kills the child after
+/// that long with no output at all (Duration::ZERO disables) — healthy tools
+/// emit keepalives every second, so only a genuinely wedged drive stays
+/// silent that long. Returns the exit status; success policy is the caller's.
+pub(crate) fn stream_lines(
+    bin: &Path,
+    args: &[String],
+    current_dir: Option<&Path>,
+    stall: Duration,
+    on_line: &mut dyn FnMut(bool, &str),
+) -> Result<ExitStatus> {
+    let mut cmd = command(bin);
+    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    if let Some(dir) = current_dir {
+        cmd.current_dir(dir);
+    }
+    let mut reaper = Reaper::adopt(spawn_command_retrying(&mut cmd, bin)?);
+    let stdout = reaper.stdout().context("no stdout pipe")?;
+    let stderr = reaper.stderr().context("no stderr pipe")?;
+    let (tx, rx) = mpsc::channel::<(bool, String)>();
+    let tx_err = tx.clone();
+    let t_out = std::thread::spawn(move || pump(stdout, false, tx));
+    let t_err = std::thread::spawn(move || pump(stderr, true, tx_err));
+
+    let mut last_activity = Instant::now();
+    let mut last_warn = Instant::now();
+    let mut stalled = false;
+    loop {
+        match rx.recv_timeout(WATCH_POLL) {
+            Ok((is_err, line)) => {
+                last_activity = Instant::now();
+                on_line(is_err, &line);
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let quiet = last_activity.elapsed();
+                if quiet >= WARN_AFTER && last_warn.elapsed() >= Duration::from_secs(60) {
+                    on_line(false, &format!("(no tool output for {}s)", quiet.as_secs()));
+                    last_warn = Instant::now();
+                }
+                if !stall.is_zero() && quiet >= stall {
+                    reaper.kill_now();
+                    stalled = true;
+                    break;
+                }
+            }
+        }
+    }
+    let _ = t_out.join();
+    let _ = t_err.join();
+    if stalled {
+        bail!(
+            "{}: no output for {}s - terminated (wedged drive?)",
+            bin.display(),
+            stall.as_secs()
+        );
+    }
+    reaper.wait()
+}
+
+const STDERR_TAIL: usize = 12;
+
+// xorriso keeps emitting UPDATE keepalives to stderr while aborting; without
+// severity filtering they bury (or evict) the FATAL/FAILURE cause.
+fn is_diagnostic(line: &str) -> bool {
+    [
+        " FATAL : ",
+        " FAILURE : ",
+        " SORRY : ",
+        " ABORT : ",
+        " : aborting :",
+    ]
+    .iter()
+    .any(|needle| line.contains(needle))
+}
+
+fn push_capped(buf: &mut VecDeque<String>, line: String) {
+    if buf.len() == STDERR_TAIL {
+        buf.pop_front();
+    }
+    buf.push_back(line);
+}
+
+/// stream_lines with the common success policy: nonzero exit fails with the
+/// diagnostic stderr lines (or the raw tail when no severity markers appear).
+pub(crate) fn run_streaming(
+    bin: &Path,
+    args: &[String],
+    stall: Duration,
+    on_line: &mut dyn FnMut(&str),
+) -> Result<()> {
+    let mut tail: VecDeque<String> = VecDeque::with_capacity(STDERR_TAIL);
+    let mut diags: VecDeque<String> = VecDeque::with_capacity(STDERR_TAIL);
+    let status = stream_lines(bin, args, None, stall, &mut |is_err, line| {
+        if is_err {
+            if is_diagnostic(line) {
+                push_capped(&mut diags, line.to_string());
+            }
+            push_capped(&mut tail, line.to_string());
+        }
+        on_line(line);
+    })?;
+    if !status.success() {
+        let lines: Vec<String> = if diags.is_empty() { tail } else { diags }.into();
+        bail!("{} failed ({status}): {}", bin.display(), lines.join("\n"));
+    }
+    Ok(())
+}
+
+fn pump(mut r: impl Read, is_err: bool, tx: mpsc::Sender<(bool, String)>) {
+    let mut buf = [0u8; 8192];
+    let mut acc: Vec<u8> = Vec::new();
+    loop {
+        let n = match r.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        for &b in &buf[..n] {
+            if b == b'\n' || b == b'\r' {
+                if !acc.is_empty() {
+                    let _ = tx.send((is_err, String::from_utf8_lossy(&acc).into_owned()));
+                    acc.clear();
+                }
+            } else {
+                acc.push(b);
+            }
+        }
+    }
+    if !acc.is_empty() {
+        let _ = tx.send((is_err, String::from_utf8_lossy(&acc).into_owned()));
     }
 }
 
