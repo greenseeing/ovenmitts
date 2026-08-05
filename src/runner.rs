@@ -3798,7 +3798,7 @@ mod tests {
         pvd[130..132].copy_from_slice(&2048u16.to_be_bytes());
         v.extend_from_slice(&pvd);
         v.extend_from_slice(data);
-        v.extend(std::iter::repeat(0u8).take(pad));
+        v.extend(std::iter::repeat_n(0u8, pad));
         v
     }
 

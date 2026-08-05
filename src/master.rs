@@ -1376,7 +1376,7 @@ mod tests {
         pvd[128..130].copy_from_slice(&2048u16.to_le_bytes());
         pvd[130..132].copy_from_slice(&2048u16.to_be_bytes());
         v.extend_from_slice(&pvd);
-        v.extend(std::iter::repeat(7u8).take(data_sectors as usize * 2048));
+        v.extend(std::iter::repeat_n(7u8, data_sectors as usize * 2048));
         v
     }
 
