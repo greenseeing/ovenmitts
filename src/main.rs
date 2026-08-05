@@ -391,12 +391,18 @@ fn print_plan(media: &MediaInfo, plan: &ArchivePlan, headroom_pct: u32, redundan
         human_bytes(plan.parity_bytes_est),
         human_bytes(plan.overhead_bytes_est)
     );
+    let verdict = if plan.fits {
+        "fits".to_string()
+    } else if let Some(span) = &plan.span {
+        format!("spans {} discs", span.discs.len())
+    } else {
+        "DOES NOT FIT".to_string()
+    };
     println!(
-        "[plan] total {} of {} budget ({headroom_pct}% headroom off {} capacity) — {}",
+        "[plan] total {} of {} budget ({headroom_pct}% headroom off {} capacity) — {verdict}",
         human_bytes(plan.total_bytes_est),
         human_bytes(plan.budget),
         human_bytes(plan.capacity),
-        if plan.fits { "fits" } else { "DOES NOT FIT" }
     );
 }
 
