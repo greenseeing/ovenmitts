@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Every burn leaves a persistent run record.** Stage transitions, warnings,
+  failures and decile progress steps tee to `run.log` in the staging dir
+  (append-mode, one dated header per run), and a successful burn writes
+  `<label>.report.txt`: the stage summaries plus provenance — ovenmitts
+  version, tool paths, and the par2 version banner. `burn-iso` writes both
+  next to the ISO. Until now a crash or closed terminal erased the whole
+  story of a burn.
+- **Stale staging dirs are flagged, never deleted.** Preflight lists earlier
+  run dirs older than 30 days (or big enough to crowd out the current plan)
+  with a reminder to remove ones already burned and verified. The staging
+  free-space check also re-runs right before mastering — the ISO is the big
+  late allocation, and space that was free at confirm time may be gone.
 - **Inactivity watchdog for streaming tools.** A wedged drive used to hang
   ovenmitts forever (a burn/format/master would wait on xorriso with no
   timeout). Streaming operations now abort if a tool produces no output for
@@ -17,9 +29,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a genuinely stuck drive; a softer "still working" note appears after 2 min of
   silence. Short one-shot probes (`xorriso -toc`, `dvd+rw-mediainfo`, `par2 -V`,
   `veracrypt --list`, the LBA report) get a fixed 120 s deadline.
+- CI: `ci.yml` runs tests, `clippy -D warnings`, `rustfmt --check`, an MSRV
+  (1.80) check, and `shellcheck`/`bash -n` on `install.sh` for every push and
+  PR; `audit.yml` runs `cargo audit` weekly. Release binaries now carry signed
+  build-provenance attestations (`gh attestation verify`).
 
 ### Fixed
 
+- **`keep_iso = false` in the config works now.** The key was documented and
+  accepted but never read, so the staged ISO was always kept. It now behaves
+  exactly like `--discard-iso`: the ISO is removed after a fully verified
+  burn (sidecars, parity and logs are kept). Users who set it start getting
+  the promised behavior.
+- **Recovery-critical files survive a crash.** `checksums.sha256`,
+  `MANIFEST.txt`, `RECOVERY.txt`, the LBA map, the ISO sha256 sidecar, the
+  mastered ISO and the saved config are now fsynced (file and parent
+  directory) instead of relying on the page cache getting flushed eventually.
+- **A burn retry no longer destroys the failed attempt's transcript.**
+  `<label>.burn.log` appends under a dated `=== burn attempt … ===` header
+  per attempt instead of truncating; the log grows across retries.
+- **Verify failures say what is actually wrong per file.** A hash mismatch
+  ("bad burn — re-burn it") is now reported differently from a read error
+  ("failing medium — ddrescue now, see RECOVERY.txt") and from a file missing
+  off the disc; previously all three collapsed into one undifferentiated
+  failure list.
+- **A signal at the `[Y/n]` prompt aborts cleanly instead of hanging.** The
+  confirm prompt used to block the thread that polls the shutdown flag, so
+  SIGTERM/SIGINT/SIGHUP delivered while ovenmitts waited for an answer was
+  silently swallowed (the kernel restarts the interrupted read) and the run
+  hung forever. The prompt now keeps polling and runs the same graceful
+  tool-terminating shutdown as everywhere else.
 - **Signals shut down cleanly instead of orphaning the burn.** SIGTERM/SIGHUP
   (terminal closed, `systemctl stop`) used to kill ovenmitts instantly and
   leave the burning xorriso running; line-mode Ctrl-C did no cleanup. All three
@@ -84,13 +123,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   URL/path, the release-API call fails loudly instead of silently, and the
   upgrade decision is made by hashing the installed binary against the published
   sidecar rather than by executing the on-PATH binary.
-
-### Added
-
-- CI: `ci.yml` runs tests, `clippy -D warnings`, `rustfmt --check`, an MSRV
-  (1.80) check, and `shellcheck`/`bash -n` on `install.sh` for every push and
-  PR; `audit.yml` runs `cargo audit` weekly. Release binaries now carry signed
-  build-provenance attestations (`gh attestation verify`).
 
 ### Changed
 

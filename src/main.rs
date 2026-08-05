@@ -87,7 +87,7 @@ fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 dry_run: false,
                 assume_yes: false,
                 amend: false,
-                discard_iso: false,
+                discard_iso: !cfg.keep_iso,
             };
             if interactive {
                 ovenmitts::tui::run(cfg, tools, req)
@@ -142,7 +142,9 @@ fn run_command(mut cfg: Config, cmd: Command, config_path: PathBuf) -> anyhow::R
                 dry_run,
                 assume_yes: yes,
                 amend: false,
-                discard_iso,
+                // the documented contract: keep_iso = false in the config
+                // behaves like --discard-iso; the flag can only tighten it
+                discard_iso: discard_iso || !cfg.keep_iso,
             };
             run_cli_burn(cfg, tools, req)
         }

@@ -117,6 +117,65 @@ fn no_tui_without_payloads_bails_with_nothing_to_do() {
     assert!(stderr.contains("nothing to do"), "stderr:\n{stderr}");
 }
 
+// keep_iso = false in the config was documented but dead: the staged ISO was
+// always kept. It must behave like --discard-iso after a verified burn.
+#[test]
+fn config_keep_iso_false_discards_iso_after_verification() {
+    let dir = tempfile::tempdir().unwrap();
+    let payload = dir.path().join("vault.hc");
+    std::fs::write(&payload, vec![7u8; 1024 * 1024]).unwrap();
+    let device = dir.path().join("fake-device");
+    let cfg = dir.path().join("config.toml");
+    std::fs::write(&cfg, "keep_iso = false\n").unwrap();
+    let staging = dir.path().join("staging");
+    let iso = staging.join("KEEPCFG").join("KEEPCFG.iso");
+    let mut contents = iso.clone().into_os_string();
+    contents.push(".contents");
+
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let old = std::env::var_os("PATH").unwrap_or_default();
+    let mut parts = vec![fakebin()];
+    parts.extend(std::env::split_paths(&old));
+    let out = Command::new(env!("CARGO_BIN_EXE_ovenmitts"))
+        .args([
+            "--device",
+            device.to_str().unwrap(),
+            "--config",
+            cfg.to_str().unwrap(),
+            "--staging",
+            staging.to_str().unwrap(),
+            "burn",
+            "--yes",
+            "--label",
+            "KEEPCFG",
+            payload.to_str().unwrap(),
+        ])
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_DATA_HOME", home.join(".local").join("share"))
+        .env("PATH", std::env::join_paths(parts).unwrap())
+        .env("OVENMITTS_FAKE_DEVICE", &device)
+        .env("OVENMITTS_FAKE_MOUNT", &contents)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !iso.exists(),
+        "keep_iso = false must discard the verified ISO"
+    );
+    assert!(
+        staging.join("KEEPCFG").join("checksums.sha256").is_file(),
+        "sidecars must survive the discard"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("discarded"), "stdout:\n{stdout}");
+}
+
 // A signal while parked at the [Y/n] confirm prompt must abort cleanly.
 // Regression test: the prompt used to block the signal-polling thread on a
 // raw stdin read (SA_RESTART), so SIGTERM at a prompt hung ovenmitts forever.
