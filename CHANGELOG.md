@@ -7,8 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Inactivity watchdog for streaming tools.** A wedged drive used to hang
+  ovenmitts forever (a burn/format/master would wait on xorriso with no
+  timeout). Streaming operations now abort if a tool produces no output for
+  `stall_timeout_secs` seconds (new config key, default 900 = 15 min; `0`
+  disables). Healthy tools emit keepalives every second, so this only trips on
+  a genuinely stuck drive; a softer "still working" note appears after 2 min of
+  silence. Short one-shot probes (`xorriso -toc`, `dvd+rw-mediainfo`, `par2 -V`,
+  `veracrypt --list`, the LBA report) get a fixed 120 s deadline.
+
 ### Fixed
 
+- **Tools are never orphaned on error or panic.** Every external process is now
+  owned by a guard that kills and reaps it on any early return or unwind, so a
+  burning xorriso can't be left running when ovenmitts exits abnormally. The
+  guard also unregisters a child before waiting on it, closing a window where a
+  force-quit could signal a recycled PID.
 - **Verification fails closed when the page cache can't be defeated.** With
   `verify --iso`, if `eject` is unavailable *and* the O_DIRECT read-back also
   fails, ovenmitts previously fell back to a buffered read that could be served

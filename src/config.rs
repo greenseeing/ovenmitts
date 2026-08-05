@@ -14,6 +14,7 @@ pub struct FileConfig {
     pub defect_management: Option<bool>,
     pub keep_iso: Option<bool>,
     pub eject_when_done: Option<bool>,
+    pub stall_timeout_secs: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -31,6 +32,9 @@ pub struct Config {
     /// Tri-state on purpose: unset means "eject only when an operator is
     /// present" (TUI), which only the runner can decide per request.
     pub eject_when_done: Option<bool>,
+    /// Kill a streaming tool after this many seconds of *no output* (inactivity,
+    /// not total runtime — burns run for an hour). 0 disables the watchdog.
+    pub stall_timeout_secs: u32,
 }
 
 pub fn default_path() -> PathBuf {
@@ -123,7 +127,14 @@ impl Config {
             defect_management: file.defect_management.unwrap_or(false),
             keep_iso: file.keep_iso.unwrap_or(true),
             eject_when_done: file.eject_when_done,
+            stall_timeout_secs: file.stall_timeout_secs.unwrap_or(900),
         })
+    }
+
+    /// Inactivity watchdog duration for streaming tools; `Duration::ZERO` when
+    /// disabled (`stall_timeout_secs = 0`).
+    pub fn stall_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.stall_timeout_secs as u64)
     }
 }
 
@@ -141,6 +152,20 @@ mod tests {
         assert!(!c.defect_management);
         assert!(c.keep_iso);
         assert_eq!(c.eject_when_done, None);
+        assert_eq!(c.stall_timeout_secs, 900);
+        assert_eq!(c.stall_timeout(), std::time::Duration::from_secs(900));
+    }
+
+    #[test]
+    fn stall_timeout_is_configurable_and_disablable() {
+        let f: FileConfig = toml::from_str("stall_timeout_secs = 0\n").unwrap();
+        let c = Config::resolve(f).unwrap();
+        assert!(c.stall_timeout().is_zero(), "0 disables the watchdog");
+        let f: FileConfig = toml::from_str("stall_timeout_secs = 1800\n").unwrap();
+        assert_eq!(
+            Config::resolve(f).unwrap().stall_timeout(),
+            std::time::Duration::from_secs(1800)
+        );
     }
 
     #[test]

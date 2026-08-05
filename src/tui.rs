@@ -80,13 +80,13 @@ pub fn run(cfg: Config, tools: Tools, req: BurnRequest) -> Result<()> {
         // a runner blocked on a prompt needs the abort ack, not a signal
         let _ = app.ack_tx.send(Ack::Abort);
         // never orphan a running xorriso/par2: SIGTERM, bounded wait, SIGKILL
-        crate::burn::terminate_active(false);
+        crate::proc::terminate_active(false);
         let deadline = Instant::now() + Duration::from_secs(10);
         while !worker.is_finished() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(100));
         }
         if !worker.is_finished() {
-            crate::burn::terminate_active(true);
+            crate::proc::terminate_active(true);
             let deadline = Instant::now() + Duration::from_secs(3);
             while !worker.is_finished() && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(100));

@@ -81,6 +81,7 @@ impl Harness {
             defect_management: false,
             keep_iso: true,
             eject_when_done: None,
+            stall_timeout_secs: 0,
         }
     }
 

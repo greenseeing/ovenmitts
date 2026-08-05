@@ -337,20 +337,21 @@ pub fn check_media(
     device: &str,
     cb: &mut dyn FnMut(Option<f32>, String),
 ) -> Result<bool> {
-    let mut child = crate::proc::command(&tools.xorriso)
-        .args(["-md5", "on", "-indev", device, "-check_media", "--"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("spawning xorriso -check_media")?;
-    let _guard = crate::burn::ChildGuard::new(child.id());
+    let mut reaper = crate::proc::Reaper::adopt(
+        crate::proc::command(&tools.xorriso)
+            .args(["-md5", "on", "-indev", device, "-check_media", "--"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("spawning xorriso -check_media")?,
+    );
     let (tx, rx) = std::sync::mpsc::channel::<String>();
     let mut pumps: Vec<JoinHandle<()>> = Vec::new();
     // result channel (stdout) carries the tables, info channel (stderr) the pacifier
-    if let Some(o) = child.stdout.take() {
+    if let Some(o) = reaper.stdout() {
         pumps.push(spawn_line_pump(o, tx.clone()));
     }
-    if let Some(e) = child.stderr.take() {
+    if let Some(e) = reaper.stderr() {
         pumps.push(spawn_line_pump(e, tx.clone()));
     }
     drop(tx);
@@ -365,7 +366,7 @@ pub fn check_media(
     for p in pumps {
         let _ = p.join();
     }
-    let status = child.wait().context("waiting for xorriso -check_media")?;
+    let status = reaper.wait().context("waiting for xorriso -check_media")?;
     if !status.success() && !all.contains("Media checks :") {
         bail!(
             "xorriso -check_media failed ({status}): {}",

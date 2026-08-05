@@ -50,7 +50,8 @@ pub fn discover() -> Result<Tools> {
     };
     let par2 = which("par2");
     let par2_version = par2.as_ref().and_then(|p| {
-        let out = crate::proc::command(p).arg("-V").output().ok()?;
+        let out =
+            crate::proc::output_deadline(p, &["-V".into()], crate::proc::SHORT_OP_DEADLINE).ok()?;
         let text = String::from_utf8_lossy(&out.stdout).into_owned()
             + &String::from_utf8_lossy(&out.stderr);
         text.lines().next().map(|l| l.trim().to_string())

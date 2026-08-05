@@ -56,27 +56,28 @@ pub fn create(
         payload.slice_bytes(),
         mem_mb(),
     );
-    let mut child = crate::proc::command(par2)
-        .args(&args)
-        .current_dir(parent)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("spawn {}", par2.display()))?;
-    let _guard = crate::burn::ChildGuard::new(child.id());
+    let mut reaper = crate::proc::Reaper::adopt(
+        crate::proc::command(par2)
+            .args(&args)
+            .current_dir(parent)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("spawn {}", par2.display()))?,
+    );
 
-    let mut stderr = child.stderr.take().context("no stderr pipe")?;
+    let mut stderr = reaper.stderr().context("no stderr pipe")?;
     let err_reader = std::thread::spawn(move || {
         let mut s = String::new();
         let _ = stderr.read_to_string(&mut s);
         s
     });
-    let stdout = child.stdout.take().context("no stdout pipe")?;
+    let stdout = reaper.stdout().context("no stdout pipe")?;
     pump_lines(stdout, &mut |line| {
         cb(parse_progress_line(line), line.to_string())
     });
 
-    let status = child.wait().context("wait for par2")?;
+    let status = reaper.wait().context("wait for par2")?;
     let err_text = err_reader.join().unwrap_or_default();
     if !status.success() {
         bail!("par2 create failed ({status}): {}", err_text.trim());

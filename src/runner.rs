@@ -471,9 +471,14 @@ fn burn_pipeline(ctx: &RunnerCtx, req: &BurnRequest, stage: &mut Stage) -> Resul
         recovery: &recovery_path,
         out_iso: &iso,
     };
-    let iso_bytes = master::build_iso(&ctx.tools, &input, &mut |pct, line| {
-        ctx.progress(Stage::Master, pct, line);
-    })?;
+    let iso_bytes = master::build_iso(
+        &ctx.tools,
+        &input,
+        ctx.cfg.stall_timeout(),
+        &mut |pct, line| {
+            ctx.progress(Stage::Master, pct, line);
+        },
+    )?;
     let lba_path = stage_dir.join(format!("{label}.lba.txt"));
     master::report_lba(&ctx.tools, &iso, &lba_path)?;
     let iso_sha = {
@@ -493,9 +498,14 @@ fn burn_pipeline(ctx: &RunnerCtx, req: &BurnRequest, stage: &mut Stage) -> Resul
     if params.defect_management {
         *stage = Stage::Format;
         ctx.start(Stage::Format);
-        burn::format_defect_management(&ctx.tools, &device, &mut |pct, line| {
-            ctx.progress(Stage::Format, pct, line);
-        })?;
+        burn::format_defect_management(
+            &ctx.tools,
+            &device,
+            ctx.cfg.stall_timeout(),
+            &mut |pct, line| {
+                ctx.progress(Stage::Format, pct, line);
+            },
+        )?;
         let formatted = media::probe(&ctx.tools, &device)?;
         let capacity = formatted.formatted_capacity.unwrap_or(formatted.free_bytes);
         ensure!(
@@ -516,9 +526,16 @@ fn burn_pipeline(ctx: &RunnerCtx, req: &BurnRequest, stage: &mut Stage) -> Resul
 
     *stage = Stage::Burn;
     ctx.start(Stage::Burn);
-    burn::burn_iso(&ctx.tools, &device, &iso, params.speed, &mut |pct, line| {
-        ctx.progress(Stage::Burn, pct, line);
-    })
+    burn::burn_iso(
+        &ctx.tools,
+        &device,
+        &iso,
+        params.speed,
+        ctx.cfg.stall_timeout(),
+        &mut |pct, line| {
+            ctx.progress(Stage::Burn, pct, line);
+        },
+    )
     .inspect_err(|_| {
         ctx.info(format!(
             "burn transcript: {}",
@@ -695,9 +712,16 @@ pub fn run_burn_iso(ctx: &RunnerCtx, iso: &Path, assume_yes: bool) -> Result<()>
 
         *stage = Stage::Burn;
         ctx.start(Stage::Burn);
-        burn::burn_iso(&ctx.tools, &device, iso, ctx.cfg.speed, &mut |pct, line| {
-            ctx.progress(Stage::Burn, pct, line);
-        })
+        burn::burn_iso(
+            &ctx.tools,
+            &device,
+            iso,
+            ctx.cfg.speed,
+            ctx.cfg.stall_timeout(),
+            &mut |pct, line| {
+                ctx.progress(Stage::Burn, pct, line);
+            },
+        )
         .inspect_err(|_| {
             ctx.info(format!(
                 "burn transcript: {}",
@@ -1231,9 +1255,12 @@ fn inspect_payloads(paths: &[PathBuf]) -> Result<(Vec<Payload>, Vec<String>)> {
 // nothing is mounted (that is the clean, empty case); any other failure means
 // we could not determine mount state and must refuse rather than assume safe.
 fn veracrypt_list(bin: &Path) -> Result<String> {
-    let out = crate::burn::spawn_retrying(bin, &["--text".into(), "--list".into()])?
-        .wait_with_output()
-        .with_context(|| format!("running {} --text --list", bin.display()))?;
+    let out = crate::proc::output_deadline(
+        bin,
+        &["--text".into(), "--list".into()],
+        crate::proc::SHORT_OP_DEADLINE,
+    )
+    .with_context(|| format!("running {} --text --list", bin.display()))?;
     if out.status.success() {
         return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
     }
@@ -1585,6 +1612,7 @@ mod tests {
             defect_management: false,
             keep_iso: true,
             eject_when_done: None,
+            stall_timeout_secs: 0,
         }
     }
 

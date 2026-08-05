@@ -6,9 +6,11 @@ use crate::tools::Tools;
 /// Probe the drive: run `xorriso -outdev <dev> -toc -list_formats -list_speeds`
 /// and optionally `dvd+rw-mediainfo` for the media ID.
 pub fn probe(tools: &Tools, device: &str) -> Result<MediaInfo> {
-    let out = crate::proc::command(&tools.xorriso)
-        .args(["-outdev", device, "-toc", "-list_formats", "-list_speeds"])
-        .output()
+    let args: Vec<String> = ["-outdev", device, "-toc", "-list_formats", "-list_speeds"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let out = crate::proc::output_deadline(&tools.xorriso, &args, crate::proc::SHORT_OP_DEADLINE)
         .with_context(|| format!("cannot run {}", tools.xorriso.display()))?;
     let text = format!(
         "{}\n{}",
@@ -19,7 +21,11 @@ pub fn probe(tools: &Tools, device: &str) -> Result<MediaInfo> {
         parse_xorriso_probe(&text).with_context(|| probe_failure_context(device, &text))?;
     if info.media_id.is_none() {
         if let Some(mediainfo) = &tools.mediainfo {
-            if let Ok(mo) = crate::proc::command(mediainfo).arg(device).output() {
+            if let Ok(mo) = crate::proc::output_deadline(
+                mediainfo,
+                &[device.to_string()],
+                crate::proc::SHORT_OP_DEADLINE,
+            ) {
                 info.media_id = parse_media_id(&String::from_utf8_lossy(&mo.stdout));
             }
         }

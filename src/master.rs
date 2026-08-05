@@ -24,12 +24,14 @@ pub struct MasterInput<'a> {
 pub fn build_iso(
     tools: &Tools,
     input: &MasterInput,
+    stall: std::time::Duration,
     cb: &mut dyn FnMut(Option<f32>, String),
 ) -> Result<u64> {
     let args = master_args(input);
     crate::burn::run_streaming(
         &tools.xorriso,
         &args,
+        stall,
         &mut |line| match parse_progress_line(line) {
             Some(pct) => cb(Some(pct), strip_update(line).trim().to_string()),
             None => {
@@ -318,9 +320,8 @@ pub fn write_recovery(out: &Path, label: &str, payloads: &[Payload]) -> Result<(
 pub fn report_lba(tools: &Tools, iso: &Path, out: &Path) -> Result<()> {
     let mut args: Vec<String> = vec!["-indev".into(), iso.display().to_string()];
     args.extend(["-find", "/", "-exec", "report_lba", "--"].map(String::from));
-    let output = crate::burn::spawn_retrying(&tools.xorriso, &args)?
-        .wait_with_output()
-        .with_context(|| format!("wait for {}", tools.xorriso.display()))?;
+    let output =
+        crate::proc::output_deadline(&tools.xorriso, &args, crate::proc::SHORT_OP_DEADLINE)?;
     if !output.status.success() {
         let err = String::from_utf8_lossy(&output.stderr);
         let tail: Vec<&str> = err.lines().rev().take(8).collect();
@@ -676,7 +677,10 @@ mod tests {
             out_iso: &iso,
         };
         let mut events = Vec::new();
-        let size = build_iso(&tools, &input, &mut |p, l| events.push((p, l))).unwrap();
+        let size = build_iso(&tools, &input, std::time::Duration::ZERO, &mut |p, l| {
+            events.push((p, l))
+        })
+        .unwrap();
         assert_eq!(size, "iso-bytes-here".len() as u64);
         assert!(events.iter().any(|(p, _)| *p == Some(0.52)));
         assert!(events.iter().any(|(p, _)| *p == Some(52.22)));
@@ -707,7 +711,7 @@ mod tests {
             recovery: Path::new("/r"),
             out_iso: &dir.path().join("never.iso"),
         };
-        let err = build_iso(&tools, &input, &mut |_, _| {}).unwrap_err();
+        let err = build_iso(&tools, &input, std::time::Duration::ZERO, &mut |_, _| {}).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("Cannot find source"), "{msg}");
     }

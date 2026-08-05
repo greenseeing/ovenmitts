@@ -1,8 +1,8 @@
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 
@@ -14,6 +14,7 @@ use crate::tools::Tools;
 pub fn format_defect_management(
     tools: &Tools,
     device: &str,
+    stall: Duration,
     cb: &mut dyn FnMut(Option<f32>, String),
 ) -> Result<()> {
     let args: Vec<String> = vec![
@@ -22,7 +23,9 @@ pub fn format_defect_management(
         "-format".into(),
         "as_needed".into(),
     ];
-    run_streaming(&tools.xorriso, &args, &mut |line| forward(line, 0, cb))
+    run_streaming(&tools.xorriso, &args, stall, &mut |line| {
+        forward(line, 0, cb)
+    })
 }
 
 /// Burn: `xorriso -as cdrecord -v dev=<dev> [speed=<n>] fs=64m blank=as_needed -eject <iso>`.
@@ -33,6 +36,7 @@ pub fn burn_iso(
     device: &str,
     iso: &Path,
     speed: Option<u32>,
+    stall: Duration,
     cb: &mut dyn FnMut(Option<f32>, String),
 ) -> Result<()> {
     let total_bytes = std::fs::metadata(iso)
@@ -40,7 +44,7 @@ pub fn burn_iso(
         .len();
     let args = burn_args(device, iso, speed);
     let mut log = std::fs::File::create(burn_log_path(iso)).ok();
-    run_streaming(&tools.xorriso, &args, &mut |line| {
+    run_streaming(&tools.xorriso, &args, stall, &mut |line| {
         if let Some(f) = log.as_mut() {
             let _ = writeln!(f, "{line}");
         }
@@ -155,50 +159,24 @@ fn push_capped(buf: &mut VecDeque<String>, line: String) {
     buf.push_back(line);
 }
 
-// Live child PIDs of long-running external tools, so an interactive
-// force-quit can terminate them instead of orphaning a burn in progress.
-static ACTIVE_CHILDREN: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
-
-pub(crate) struct ChildGuard(i32);
-
-impl ChildGuard {
-    pub(crate) fn new(pid: u32) -> Self {
-        let pid = pid as i32;
-        if let Ok(mut v) = ACTIVE_CHILDREN.lock() {
-            v.push(pid);
-        }
-        Self(pid)
-    }
-}
-
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        if let Ok(mut v) = ACTIVE_CHILDREN.lock() {
-            v.retain(|p| *p != self.0);
-        }
-    }
-}
-
-/// Signal every registered child (force-quit path); best effort.
-pub fn terminate_active(force: bool) {
-    let sig = if force { libc::SIGKILL } else { libc::SIGTERM };
-    if let Ok(v) = ACTIVE_CHILDREN.lock() {
-        for pid in v.iter() {
-            unsafe { libc::kill(*pid, sig) };
-        }
-    }
-}
+// Poll cadence for the inactivity watchdog, and how long a tool may be silent
+// before we surface a reassuring "still working" note (not a kill).
+const WATCH_POLL: Duration = Duration::from_secs(5);
+const WARN_AFTER: Duration = Duration::from_secs(120);
 
 // libburn rewrites progress in place with '\r'; split on both terminators.
+// `stall` kills the child after that long with no output at all (Duration::ZERO
+// disables). A healthy xorriso/par2 emits keepalives every second, so only a
+// genuinely wedged drive stays silent that long.
 pub(crate) fn run_streaming(
     bin: &Path,
     args: &[String],
+    stall: Duration,
     on_line: &mut dyn FnMut(&str),
 ) -> Result<()> {
-    let mut child = spawn_retrying(bin, args)?;
-    let _guard = ChildGuard::new(child.id());
-    let stdout = child.stdout.take().context("no stdout pipe")?;
-    let stderr = child.stderr.take().context("no stderr pipe")?;
+    let mut reaper = crate::proc::Reaper::spawn(bin, args)?;
+    let stdout = reaper.stdout().context("no stdout pipe")?;
+    let stderr = reaper.stderr().context("no stderr pipe")?;
     let (tx, rx) = mpsc::channel::<(bool, String)>();
     let tx_err = tx.clone();
     let t_out = std::thread::spawn(move || pump(stdout, false, tx));
@@ -206,47 +184,51 @@ pub(crate) fn run_streaming(
 
     let mut tail: VecDeque<String> = VecDeque::with_capacity(STDERR_TAIL);
     let mut diags: VecDeque<String> = VecDeque::with_capacity(STDERR_TAIL);
-    for (is_err, line) in rx {
-        if is_err {
-            if is_diagnostic(&line) {
-                push_capped(&mut diags, line.clone());
+    let mut last_activity = Instant::now();
+    let mut last_warn = Instant::now();
+    let mut stalled = false;
+    loop {
+        match rx.recv_timeout(WATCH_POLL) {
+            Ok((is_err, line)) => {
+                last_activity = Instant::now();
+                if is_err {
+                    if is_diagnostic(&line) {
+                        push_capped(&mut diags, line.clone());
+                    }
+                    push_capped(&mut tail, line.clone());
+                }
+                on_line(&line);
             }
-            push_capped(&mut tail, line.clone());
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let quiet = last_activity.elapsed();
+                if quiet >= WARN_AFTER && last_warn.elapsed() >= Duration::from_secs(60) {
+                    on_line(&format!("(no tool output for {}s)", quiet.as_secs()));
+                    last_warn = Instant::now();
+                }
+                if !stall.is_zero() && quiet >= stall {
+                    reaper.kill_now();
+                    stalled = true;
+                    break;
+                }
+            }
         }
-        on_line(&line);
     }
     let _ = t_out.join();
     let _ = t_err.join();
-    let status = child
-        .wait()
-        .with_context(|| format!("wait for {}", bin.display()))?;
+    if stalled {
+        bail!(
+            "{}: no output for {}s - terminated (wedged drive?)",
+            bin.display(),
+            stall.as_secs()
+        );
+    }
+    let status = reaper.wait()?;
     if !status.success() {
         let lines: Vec<String> = if diags.is_empty() { tail } else { diags }.into();
         bail!("{} failed ({status}): {}", bin.display(), lines.join("\n"));
     }
     Ok(())
-}
-
-// ETXTBSY at exec is a transient fork/exec race (a concurrent fork briefly
-// inherits a write fd to the binary); it only ever fires in tests with fake
-// scripts, never on an installed xorriso.
-pub(crate) fn spawn_retrying(bin: &Path, args: &[String]) -> Result<std::process::Child> {
-    let mut tries = 0;
-    loop {
-        match crate::proc::command(bin)
-            .args(args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-        {
-            Ok(child) => return Ok(child),
-            Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && tries < 20 => {
-                tries += 1;
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            Err(e) => return Err(e).with_context(|| format!("spawn {}", bin.display())),
-        }
-    }
 }
 
 fn pump(mut r: impl Read, is_err: bool, tx: mpsc::Sender<(bool, String)>) {
@@ -416,9 +398,14 @@ mod tests {
         );
         let tools = fake_tools(&script, dir.path());
         let mut events = Vec::new();
-        burn_iso(&tools, "/dev/sr0", &iso, Some(4), &mut |p, l| {
-            events.push((p, l))
-        })
+        burn_iso(
+            &tools,
+            "/dev/sr0",
+            &iso,
+            Some(4),
+            Duration::ZERO,
+            &mut |p, l| events.push((p, l)),
+        )
         .unwrap();
 
         let argv = std::fs::read_to_string(dir.path().join("argv.txt")).unwrap();
@@ -456,7 +443,15 @@ mod tests {
                       echo \"xorriso : aborting : -abort_on 'FAILURE' encountered 'FATAL'\" >&2\n\
                       exit 5\n";
         let tools = fake_tools(script, dir.path());
-        let err = burn_iso(&tools, "/dev/sr0", &iso, None, &mut |_, _| {}).unwrap_err();
+        let err = burn_iso(
+            &tools,
+            "/dev/sr0",
+            &iso,
+            None,
+            Duration::ZERO,
+            &mut |_, _| {},
+        )
+        .unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.lines().next().unwrap().contains(" FAILURE : "), "{msg}");
         assert!(msg.contains("aborting"), "{msg}");
@@ -483,7 +478,15 @@ mod tests {
                       done\n\
                       exit 5\n";
         let tools = fake_tools(script, dir.path());
-        let err = burn_iso(&tools, "/dev/sr0", &iso, None, &mut |_, _| {}).unwrap_err();
+        let err = burn_iso(
+            &tools,
+            "/dev/sr0",
+            &iso,
+            None,
+            Duration::ZERO,
+            &mut |_, _| {},
+        )
+        .unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("Medium error"), "{msg}");
         assert!(!msg.contains("patient"), "{msg}");
@@ -499,7 +502,15 @@ mod tests {
                       echo 'no severity markers here' >&2\n\
                       exit 1\n";
         let tools = fake_tools(script, dir.path());
-        let err = burn_iso(&tools, "/dev/sr0", &iso, None, &mut |_, _| {}).unwrap_err();
+        let err = burn_iso(
+            &tools,
+            "/dev/sr0",
+            &iso,
+            None,
+            Duration::ZERO,
+            &mut |_, _| {},
+        )
+        .unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("something went sideways"), "{msg}");
         assert!(msg.contains("no severity markers here"), "{msg}");
@@ -515,7 +526,15 @@ mod tests {
                       echo 'libburn : FATAL : SCSI error on write(268416,16): [3 0C 00] Medium error.' >&2\n\
                       exit 32\n";
         let tools = fake_tools(script, dir.path());
-        let err = burn_iso(&tools, "/dev/sr0", &iso, None, &mut |_, _| {}).unwrap_err();
+        let err = burn_iso(
+            &tools,
+            "/dev/sr0",
+            &iso,
+            None,
+            Duration::ZERO,
+            &mut |_, _| {},
+        )
+        .unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("Medium error"), "{msg}");
         assert!(msg.contains("failed"), "{msg}");
@@ -526,7 +545,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tools = fake_tools("#!/bin/sh\nexit 0\n", dir.path());
         let missing = PathBuf::from("/nonexistent/x.iso");
-        let err = burn_iso(&tools, "/dev/sr0", &missing, None, &mut |_, _| {}).unwrap_err();
+        let err = burn_iso(
+            &tools,
+            "/dev/sr0",
+            &missing,
+            None,
+            Duration::ZERO,
+            &mut |_, _| {},
+        )
+        .unwrap_err();
         assert!(format!("{err:#}").contains("stat ISO"));
     }
 
@@ -542,7 +569,10 @@ mod tests {
         );
         let tools = fake_tools(&script, dir.path());
         let mut events = Vec::new();
-        format_defect_management(&tools, "/dev/sr0", &mut |p, l| events.push((p, l))).unwrap();
+        format_defect_management(&tools, "/dev/sr0", Duration::ZERO, &mut |p, l| {
+            events.push((p, l))
+        })
+        .unwrap();
         let argv = std::fs::read_to_string(dir.path().join("argv.txt")).unwrap();
         assert_eq!(
             argv.lines().collect::<Vec<_>>(),
@@ -561,7 +591,45 @@ mod tests {
                       printf 'a\\rb\\r\\nc' >&2\n";
         let tools = fake_tools(script, dir.path());
         let mut lines = Vec::new();
-        run_streaming(&tools.xorriso, &[], &mut |l| lines.push(l.to_string())).unwrap();
+        run_streaming(&tools.xorriso, &[], Duration::ZERO, &mut |l| {
+            lines.push(l.to_string())
+        })
+        .unwrap();
         assert_eq!(lines, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn watchdog_kills_a_stalled_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        // one line, then silence forever. `exec` so the process under the
+        // watchdog is a single process (like real xorriso), not a shell whose
+        // orphaned `sleep` child would keep the pipe open after a kill.
+        let script = "#!/bin/sh\nprintf 'started\\n'\nexec sleep 30\n";
+        let tools = fake_tools(script, dir.path());
+        let start = Instant::now();
+        let err =
+            run_streaming(&tools.xorriso, &[], Duration::from_secs(1), &mut |_| {}).unwrap_err();
+        assert!(err.to_string().contains("no output"), "{err}");
+        // must not wait for the 30s sleep
+        assert!(
+            start.elapsed() < Duration::from_secs(15),
+            "watchdog too slow"
+        );
+    }
+
+    #[test]
+    fn watchdog_does_not_kill_a_chatty_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        // steady keepalives for ~3s, then exit cleanly - inactivity never trips
+        let script = "#!/bin/sh\n\
+                      i=0\n\
+                      while [ $i -lt 15 ]; do printf 'working %s\\n' \"$i\"; sleep 0.2; i=$((i+1)); done\n";
+        let tools = fake_tools(script, dir.path());
+        let mut lines = Vec::new();
+        run_streaming(&tools.xorriso, &[], Duration::from_secs(1), &mut |l| {
+            lines.push(l.to_string())
+        })
+        .unwrap();
+        assert!(lines.len() >= 15, "expected keepalives, got {lines:?}");
     }
 }
