@@ -668,4 +668,139 @@ proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0
         let got = mount_ro(&no_tools(), &dev).unwrap();
         assert_eq!(got, PathBuf::from(expected));
     }
+
+    fn fake_bin(dir: &std::path::Path, name: &str, script: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.join(name);
+        std::fs::write(&p, script).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p
+    }
+
+    #[test]
+    fn mount_ro_new_udisks_accepts_ro_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let device = dir.path().join("no-such-device");
+        let udisksctl = fake_bin(
+            dir.path(),
+            "udisksctl",
+            "#!/bin/sh\n\
+             if [ \"$4\" = \"-o\" ]; then\n\
+             echo \"Mounted /dev/x at /run/media/u/DISC\"\n\
+             exit 0\n\
+             fi\n\
+             echo \"unexpected: plain mount should not run when -o succeeds\" >&2\n\
+             exit 1\n",
+        );
+        let mut tools = no_tools();
+        tools.udisksctl = Some(udisksctl);
+        let mp = mount_ro(&tools, device.to_str().unwrap()).unwrap();
+        assert_eq!(mp, PathBuf::from("/run/media/u/DISC"));
+    }
+
+    #[test]
+    fn mount_ro_falls_back_to_plain_mount_for_old_udisks() {
+        let dir = tempfile::tempdir().unwrap();
+        let device = dir.path().join("no-such-device");
+        let udisksctl = fake_bin(
+            dir.path(),
+            "udisksctl",
+            "#!/bin/sh\n\
+             if [ \"$4\" = \"-o\" ]; then\n\
+             echo \"mount: unknown option -o\" >&2\n\
+             exit 1\n\
+             fi\n\
+             echo \"Mounted /dev/x at /run/media/u/DISC.\"\n\
+             exit 0\n",
+        );
+        let mut tools = no_tools();
+        tools.udisksctl = Some(udisksctl);
+        let mp = mount_ro(&tools, device.to_str().unwrap()).unwrap();
+        assert_eq!(mp, PathBuf::from("/run/media/u/DISC"));
+    }
+
+    #[test]
+    fn mount_ro_errors_when_both_mount_forms_fail() {
+        let dir = tempfile::tempdir().unwrap();
+        let device = dir.path().join("no-such-device");
+        let udisksctl = fake_bin(
+            dir.path(),
+            "udisksctl",
+            "#!/bin/sh\n\
+             echo \"org.freedesktop.UDisks2.Error.Failed: no polkit agent\" >&2\n\
+             exit 1\n",
+        );
+        let mut tools = no_tools();
+        tools.udisksctl = Some(udisksctl);
+        let err = mount_ro(&tools, device.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("udisksctl mount -b"));
+        assert!(err.contains("no polkit agent"));
+    }
+
+    #[test]
+    fn ensure_unmounted_ok_when_device_not_mounted() {
+        let dir = tempfile::tempdir().unwrap();
+        let device = dir.path().join("no-such-device");
+        ensure_unmounted(&no_tools(), device.to_str().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn unmount_errors_when_udisksctl_not_authorized() {
+        let dir = tempfile::tempdir().unwrap();
+        let udisksctl = fake_bin(
+            dir.path(),
+            "udisksctl",
+            "#!/bin/sh\n\
+             echo \"not authorized\" >&2\n\
+             exit 2\n",
+        );
+        let mut tools = no_tools();
+        tools.udisksctl = Some(udisksctl);
+        let err = unmount(&tools, "/dev/whatever").unwrap_err().to_string();
+        assert!(err.contains("not authorized"));
+    }
+
+    #[test]
+    fn unmount_ok_without_udisksctl() {
+        unmount(&no_tools(), "/dev/whatever").unwrap();
+    }
+
+    #[test]
+    fn check_media_errors_when_output_lacks_media_checks_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = fake_bin(
+            dir.path(),
+            "xorriso",
+            "#!/bin/sh\n\
+             echo \"stray stdout noise\"\n\
+             echo \"FATAL : cannot open device\" >&2\n\
+             exit 32\n",
+        );
+        let mut tools = no_tools();
+        tools.xorriso = fake;
+        let err = check_media(&tools, "/dev/whatever", Duration::ZERO, &mut |_, _| {})
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("-check_media failed"));
+        assert!(err.contains("cannot open device"));
+    }
+
+    #[test]
+    fn check_media_tolerates_nonzero_exit_with_media_checks_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = fake_bin(
+            dir.path(),
+            "xorriso",
+            "#!/bin/sh\n\
+             printf 'Media checks :        lba ,       size , quality\\n'\n\
+             printf 'Media region :          0 ,       2048 , + good\\n'\n\
+             exit 1\n",
+        );
+        let mut tools = no_tools();
+        tools.xorriso = fake;
+        let clean = check_media(&tools, "/dev/whatever", Duration::ZERO, &mut |_, _| {}).unwrap();
+        assert!(clean);
+    }
 }
