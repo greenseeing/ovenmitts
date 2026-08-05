@@ -16,6 +16,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   version, tool paths, and the par2 version banner. `burn-iso` writes both
   next to the ISO. Until now a crash or closed terminal erased the whole
   story of a burn.
+- **Multi-disc sets: a file too big for one disc spans automatically.**
+  `burn` now plans N balanced data discs plus one parity disc whose single
+  par2 recovery set rebuilds the entire contents of any ONE lost disc from
+  the survivors (recovery block count derived from the parity disc's
+  capacity — `redundancy_pct` is not consulted for sets). Everything is
+  prepared before anything burns: the source splits into cross-checked
+  parts, one par2 set covers them all, and every disc's image is mastered,
+  RS02-augmented, truncation-checked and hashed up front — so each disc is
+  exactly a `burn-iso`, which is also the whole resume story after an abort
+  or crash (the failure lists one `burn-iso` command per remaining disc; no
+  state file exists to go stale). Disc swaps prompt with labeling
+  instructions and probe the blank (kind, blankness, capacity) before
+  committing; a failed burn offers an inline retry on a fresh blank. Every
+  disc carries `SET.txt`: the catalog of the whole set with the `cat`
+  reassembly line and the exact `par2 r` walkthrough, identical on all
+  discs, readable with standard tools alone. v1 spans exactly one file
+  payload (tar a directory first).
 - **Sector-level ECC layer (dvdisaster RS02).** File-level par2 cannot help
   when the disc's filesystem metadata itself decays; a dvdisaster RS02 layer
   can, because it protects raw sectors and self-identifies inside the image.

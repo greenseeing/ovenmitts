@@ -231,6 +231,7 @@ the disc up and verification continues unattended.
 /checksums.sha256                SHA-256 of every payload and parity file
 /MANIFEST.txt                    parameters, sizes, hashes, date
 /RECOVERY.txt                    exact restore and repair commands
+/SET.txt                         multi-disc sets only: the whole-set catalog
 ```
 
 The staging directory keeps off-disc copies of everything that repairs a
@@ -270,6 +271,31 @@ cp -r /mnt/extras . && par2 r -B. /mnt/parity/extras.par2
 # 4. Map damaged sectors to files, if you want to know what was hit
 xorriso -indev recovered.iso -find / -exec report_lba --
 ```
+
+## Multi-disc sets
+
+A single file too big for one disc burns as a **set**: N data discs carrying
+balanced parts of the file plus one **parity disc** whose single par2
+recovery set can rebuild the entire contents of any ONE lost disc from the
+survivors. Nothing to configure — when the plan doesn't fit, `burn` plans
+the set, shows the per-disc table, states the staging cost, and prompts at
+every disc swap (label each disc as the prompt tells you). `plan` and
+`--dry-run` print the table without burning.
+
+The layering: sha256 detects damage, the embedded RS02 layer repairs sectors
+within a disc, the set-level par2 rebuilds a lost disc, and a second copy of
+the set is the backstop for anything worse. Every disc carries `SET.txt` —
+the full catalog with the `cat` reassembly line and the exact `par2 r`
+walkthrough — so any single disc is enough to know what the whole set holds.
+
+Practical notes: v1 spans exactly one file payload (tar a directory first);
+staging must hold the parts, the recovery volumes and every disc image at
+once (the confirm prompt states the exact peak); a failed burn prompts to
+retry that disc on a fresh blank, and an aborted or crashed set finishes
+disc by disc with the listed `ovenmitts burn-iso` commands — the staged
+images are the resume state, there is no state file. `redundancy_pct` is
+not consulted for sets (the recovery block count is derived from the parity
+disc's capacity).
 
 ## Caring for your discs
 
