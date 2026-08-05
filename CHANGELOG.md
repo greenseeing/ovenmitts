@@ -20,6 +20,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Signals shut down cleanly instead of orphaning the burn.** SIGTERM/SIGHUP
+  (terminal closed, `systemctl stop`) used to kill ovenmitts instantly and
+  leave the burning xorriso running; line-mode Ctrl-C did no cleanup. All three
+  now run the same graceful sequence the TUI already used for Ctrl-C — abort the
+  runner, SIGTERM the tools, wait, then SIGKILL — and report that the disc may
+  be partially written. A main-thread panic also terminates running tools now,
+  and a TUI draw error mid-burn no longer orphans the tool.
 - **Tools are never orphaned on error or panic.** Every external process is now
   owned by a guard that kills and reaps it on any early return or unwind, so a
   burning xorriso can't be left running when ovenmitts exits abnormally. The

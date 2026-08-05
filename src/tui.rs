@@ -57,15 +57,28 @@ pub fn run(cfg: Config, tools: Tools, req: BurnRequest) -> Result<()> {
         ack_rx,
     };
     let worker = std::thread::spawn(move || runner::run_burn(&ctx, &req));
+    // SIGTERM/SIGHUP (terminal closed, `systemctl stop`) arrive as signals, not
+    // key events; the loop polls this so they trigger the same clean shutdown
+    // as Ctrl-C. (Ctrl-C itself reaches the loop as a key in raw mode.)
+    let stop = crate::shutdown::install();
 
     let mut terminal = ratatui::init();
     // keys queued before this screen existed (shell autorepeat, the picker's
     // confirm Enter) must not leak into the wizard
     flush_input();
     let mut app = App::new(cfg, payloads, params, ack_tx);
-    let loop_result = app.event_loop(&mut terminal, &rx);
+    let loop_result = app.event_loop(&mut terminal, &rx, &stop);
     ratatui::restore();
-    loop_result?;
+
+    // A UI-loop error (e.g. a draw failure) while the burn is still live must
+    // not orphan the tool: shut it down before surfacing the error.
+    if loop_result.is_err() {
+        if !worker.is_finished() {
+            crate::shutdown::escalate(|| worker.is_finished(), &app.ack_tx);
+            let _ = worker.join();
+        }
+        return loop_result;
+    }
 
     if worker.is_finished() || app.disconnected {
         return match worker.join() {
@@ -77,21 +90,7 @@ pub fn run(cfg: Config, tools: Tools, req: BurnRequest) -> Result<()> {
         anyhow::bail!("{msg}");
     }
     if app.force_quit {
-        // a runner blocked on a prompt needs the abort ack, not a signal
-        let _ = app.ack_tx.send(Ack::Abort);
-        // never orphan a running xorriso/par2: SIGTERM, bounded wait, SIGKILL
-        crate::proc::terminate_active(false);
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !worker.is_finished() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        if !worker.is_finished() {
-            crate::proc::terminate_active(true);
-            let deadline = Instant::now() + Duration::from_secs(3);
-            while !worker.is_finished() && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(100));
-            }
-        }
+        crate::shutdown::escalate(|| worker.is_finished(), &app.ack_tx);
         let _ = worker.is_finished().then(|| worker.join());
         anyhow::bail!(
             "interrupted; running tool terminated - the disc in the drive may be \
@@ -257,8 +256,13 @@ impl App {
         &mut self,
         terminal: &mut DefaultTerminal,
         rx: &Receiver<StageEvent>,
+        stop: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<()> {
         while !self.quit {
+            if crate::shutdown::stopping(stop) {
+                self.force_quit = true;
+                return Ok(());
+            }
             self.drain(rx);
             terminal.draw(|frame| self.render(frame))?;
             if self.pending_ack.is_some() && self.ack_shown.is_none() {

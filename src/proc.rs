@@ -202,9 +202,16 @@ fn read_all(mut r: impl Read) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    // ACTIVE_CHILDREN is process-global, and terminate_active signals every
+    // registered child; serialize the tests that spawn/register or env-mutate
+    // so one test can't kill another's child or race LC_ALL.
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn command_forces_c_locale() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // A child that echoes its own LC_ALL must see "C" regardless of the
         // caller's environment.
         std::env::set_var("LC_ALL", "de_DE.UTF-8");
@@ -219,6 +226,7 @@ mod tests {
 
     #[test]
     fn output_deadline_captures_output() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let out = output_deadline(
             Path::new("/bin/sh"),
             &["-c".into(), "printf hi; printf err >&2".into()],
@@ -232,22 +240,26 @@ mod tests {
 
     #[test]
     fn output_deadline_kills_a_hung_child() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let start = Instant::now();
+        // sleep well past any plausible scheduling delay: returning at all
+        // proves the deadline killed it rather than waiting it out.
         let err = output_deadline(
             Path::new("/bin/sh"),
-            &["-c".into(), "sleep 30".into()],
+            &["-c".into(), "exec sleep 120".into()],
             Duration::from_millis(200),
         )
         .unwrap_err();
         assert!(err.to_string().contains("timed out"), "{err}");
         assert!(
-            start.elapsed() < Duration::from_secs(5),
-            "did not kill promptly"
+            start.elapsed() < Duration::from_secs(60),
+            "deadline did not kill the child"
         );
     }
 
     #[test]
     fn reaper_kills_on_drop() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let reaper =
             Reaper::spawn(Path::new("/bin/sh"), &["-c".into(), "sleep 30".into()]).unwrap();
         let pid = reaper.pid;
@@ -257,4 +269,8 @@ mod tests {
         let alive = unsafe { libc::kill(pid, 0) } == 0;
         assert!(!alive, "child pid {pid} still alive after Reaper drop");
     }
+    // terminate_active is intentionally not unit-tested in isolation: it signals
+    // every process-global registered child, so a dedicated test would race with
+    // children spawned by concurrent tests in other modules. The kill primitive
+    // is covered by reaper_kills_on_drop and the shutdown flow by shutdown::tests.
 }

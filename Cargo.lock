@@ -930,6 +930,7 @@ dependencies = [
  "ratatui",
  "serde",
  "sha2",
+ "signal-hook",
  "tempfile",
  "toml",
  "toml_edit",

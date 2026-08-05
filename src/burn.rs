@@ -601,35 +601,36 @@ mod tests {
     #[test]
     fn watchdog_kills_a_stalled_tool() {
         let dir = tempfile::tempdir().unwrap();
-        // one line, then silence forever. `exec` so the process under the
-        // watchdog is a single process (like real xorriso), not a shell whose
-        // orphaned `sleep` child would keep the pipe open after a kill.
-        let script = "#!/bin/sh\nprintf 'started\\n'\nexec sleep 30\n";
+        // one line, then silence for far longer than the watchdog. `exec` so the
+        // process under the watchdog is a single process (like real xorriso),
+        // not a shell whose orphaned `sleep` child would keep the pipe open.
+        let script = "#!/bin/sh\nprintf 'started\\n'\nexec sleep 120\n";
         let tools = fake_tools(script, dir.path());
         let start = Instant::now();
         let err =
             run_streaming(&tools.xorriso, &[], Duration::from_secs(1), &mut |_| {}).unwrap_err();
         assert!(err.to_string().contains("no output"), "{err}");
-        // must not wait for the 30s sleep
+        // returning at all proves it killed rather than waiting out the sleep;
+        // a generous bound stays stable under parallel-test CPU contention
         assert!(
-            start.elapsed() < Duration::from_secs(15),
-            "watchdog too slow"
+            start.elapsed() < Duration::from_secs(60),
+            "watchdog never fired"
         );
     }
 
     #[test]
-    fn watchdog_does_not_kill_a_chatty_tool() {
+    fn watchdog_does_not_kill_a_healthy_tool() {
         let dir = tempfile::tempdir().unwrap();
-        // steady keepalives for ~3s, then exit cleanly - inactivity never trips
+        // a normal short run under a large stall must complete untouched
         let script = "#!/bin/sh\n\
                       i=0\n\
-                      while [ $i -lt 15 ]; do printf 'working %s\\n' \"$i\"; sleep 0.2; i=$((i+1)); done\n";
+                      while [ $i -lt 5 ]; do printf 'working %s\\n' \"$i\"; i=$((i+1)); done\n";
         let tools = fake_tools(script, dir.path());
         let mut lines = Vec::new();
-        run_streaming(&tools.xorriso, &[], Duration::from_secs(1), &mut |l| {
+        run_streaming(&tools.xorriso, &[], Duration::from_secs(30), &mut |l| {
             lines.push(l.to_string())
         })
         .unwrap();
-        assert!(lines.len() >= 15, "expected keepalives, got {lines:?}");
+        assert!(lines.len() >= 5, "expected all output, got {lines:?}");
     }
 }

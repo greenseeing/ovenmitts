@@ -12,6 +12,16 @@ use ovenmitts::runner::{self, Ack, RunReport, RunnerCtx, StageEvent};
 use ovenmitts::tools::Tools;
 
 fn main() -> ExitCode {
+    // A panic anywhere (e.g. a TUI render on the main thread) must not leave a
+    // burning xorriso running: terminate registered tools before the default
+    // hook prints and unwinds. Worker-thread panics are already covered by the
+    // per-child reaper guards; this covers a main-thread panic.
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        ovenmitts::proc::terminate_active(false);
+        prev(info);
+    }));
+
     let cli = Cli::parse();
     match dispatch(cli) {
         Ok(()) => ExitCode::SUCCESS,
@@ -196,10 +206,29 @@ where
         ack_rx,
     };
     let worker = std::thread::spawn(move || run(&ctx));
+    let stop = ovenmitts::shutdown::install();
 
     let mut line = LinePrinter::default();
     let mut failed_rendered = false;
-    for ev in rx {
+    loop {
+        let ev = match rx.recv_timeout(std::time::Duration::from_millis(200)) {
+            Ok(ev) => ev,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if ovenmitts::shutdown::stopping(&stop) {
+                    line.close();
+                    eprintln!(
+                        "\nsignal received - terminating running tools; the disc in the \
+                         drive may be partially written and must not be trusted without \
+                         a verify run"
+                    );
+                    ovenmitts::shutdown::escalate(|| worker.is_finished(), &ack_tx);
+                    let _ = worker.join();
+                    return Err(anyhow::anyhow!("interrupted by signal").context(AlreadyReported));
+                }
+                continue;
+            }
+        };
         match ev {
             StageEvent::Plan {
                 device,
