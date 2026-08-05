@@ -16,6 +16,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   version, tool paths, and the par2 version banner. `burn-iso` writes both
   next to the ISO. Until now a crash or closed terminal erased the whole
   story of a burn.
+- **ISO truncation self-check.** A truncated image (torn copy, disk that
+  filled mid-master) burns into a disc that fails verification 20 minutes
+  later — or worse, a disc missing its tail. The mastered image's ISO 9660
+  volume descriptor is now parsed natively and the run hard-fails before any
+  burn when the file holds fewer bytes than the descriptor declares; the
+  same check guards `burn-iso`'s second-copy path. Appended data past the
+  declared size (sector run-out, ECC augmentation) stays legitimate.
+- **Re-verification guidance.** README gains a "Caring for your discs"
+  section and every `RECOVERY.txt` now ends with the honest version of the
+  schedule: re-verify each disc every 6–12 months (no authoritative interval
+  exists; the DPC's 6-month fixity baseline is the reference) so decay is
+  caught while the parity needed to repair it is still readable.
 - **Stale staging dirs are flagged, never deleted.** Preflight lists earlier
   run dirs older than 30 days (or big enough to crowd out the current plan)
   with a reminder to remove ones already burned and verified. The staging

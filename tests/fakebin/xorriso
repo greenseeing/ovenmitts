@@ -47,6 +47,27 @@ if [ "${1:-}" = "-as" ] && [ "${2:-}" = "mkisofs" ]; then
             cat "$source" >> "$iso"
         fi
     done
+    # Wrap the concatenated payload in a minimal ISO 9660 shell (16 zero
+    # sectors + a PVD declaring the exact block count) so the truncation
+    # self-check can parse the image like a real one.
+    data_size=$(wc -c < "$iso")
+    pad=$(( (2048 - data_size % 2048) % 2048 ))
+    total=$(( 32768 + 2048 + data_size + pad ))
+    blocks=$(( total / 2048 ))
+    {
+        head -c 32768 /dev/zero
+        printf '\001CD001\001'
+        head -c 73 /dev/zero
+        # volume space size, little-endian u32 at PVD offset 80
+        printf "$(printf '\\%03o\\%03o\\%03o\\%03o' $((blocks & 255)) $(((blocks >> 8) & 255)) $(((blocks >> 16) & 255)) $(((blocks >> 24) & 255)))"
+        head -c 44 /dev/zero
+        # logical block size 2048, little-endian u16 at offset 128
+        printf '\000\010'
+        head -c 1918 /dev/zero
+        cat "$iso"
+        if [ "$pad" -gt 0 ]; then head -c "$pad" /dev/zero; fi
+    } > "$iso.wrap"
+    mv "$iso.wrap" "$iso"
     printf 'xorriso : UPDATE :  25.00%% done\n' >&2
     printf 'xorriso : UPDATE :  50.00%% done, estimate finish Thu Jul 17 00:00:00 2026\n' >&2
     printf 'xorriso : UPDATE :  99.05%% done\n' >&2

@@ -684,11 +684,31 @@ fn discard_iso_drops_iso_from_written_files_but_keeps_sidecars() {
     }
 }
 
+// Minimal valid ISO 9660 wrapper around `data` (the truncation self-check
+// parses the PVD, so a bare byte blob no longer passes as an image).
+fn synthetic_iso_bytes(data: &[u8]) -> Vec<u8> {
+    let pad = (2048 - data.len() % 2048) % 2048;
+    let total_blocks = ((32768 + 2048 + data.len() + pad) / 2048) as u32;
+    let mut v = vec![0u8; 32768];
+    let mut pvd = [0u8; 2048];
+    pvd[0] = 1;
+    pvd[1..6].copy_from_slice(b"CD001");
+    pvd[6] = 1;
+    pvd[80..84].copy_from_slice(&total_blocks.to_le_bytes());
+    pvd[84..88].copy_from_slice(&total_blocks.to_be_bytes());
+    pvd[128..130].copy_from_slice(&2048u16.to_le_bytes());
+    pvd[130..132].copy_from_slice(&2048u16.to_be_bytes());
+    v.extend_from_slice(&pvd);
+    v.extend_from_slice(data);
+    v.extend(std::iter::repeat(0u8).take(pad));
+    v
+}
+
 #[test]
 fn burn_iso_writes_forensics_next_to_iso() {
     let h = Harness::new();
     let iso = h.dir.path().join("copy.iso");
-    std::fs::write(&iso, pseudo_random(64 * 1024, 3)).unwrap();
+    std::fs::write(&iso, synthetic_iso_bytes(&pseudo_random(64 * 1024, 3))).unwrap();
 
     let (ctx, rx, _ack) = h.ctx();
     runner::run_burn_iso(&ctx, &iso, true).unwrap();

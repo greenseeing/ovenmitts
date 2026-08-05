@@ -738,6 +738,8 @@ impl<'a> BurnRun<'a> {
                 ctx.progress(Stage::Master, pct, line);
             },
         )?;
+        // a truncated master (torn write, full disk) must die here, not on a disc
+        master::check_iso_truncation(&iso)?;
         let lba_path = staging.dir.join(format!("{label}.lba.txt"));
         master::report_lba(&ctx.tools, &iso, &lba_path)?;
         let iso_sha = {
@@ -1004,6 +1006,9 @@ pub fn run_burn_iso(ctx: &RunnerCtx, iso: &Path, assume_yes: bool) -> Result<()>
             .with_context(|| format!("stat ISO {}", iso.display()))?
             .len();
         ensure!(iso_bytes > 0, "ISO is empty: {}", iso.display());
+        // a staged ISO can rot between burns (torn copy, truncation): the
+        // second-copy path gets the same self-check as a fresh master
+        master::check_iso_truncation(iso)?;
         let run_log_path = iso.with_extension("run.log");
         ctx.tee_events_to(&run_log_path);
         let (device, media) = resolve_device(ctx)?;
@@ -2015,7 +2020,10 @@ mod tests {
                      if [ \"$prev\" = \"-o\" ]; then out=\"$a\"; fi\n\
                      prev=\"$a\"\n\
                    done\n\
-                   head -c 8192 /dev/zero > \"$out\"\n\
+                   {{ head -c 32768 /dev/zero; printf '\\001CD001\\001'; \
+                      head -c 73 /dev/zero; printf '\\021\\000\\000\\000'; \
+                      head -c 44 /dev/zero; printf '\\000\\010'; \
+                      head -c 1918 /dev/zero; }} > \"$out\"\n\
                    printf 'xorriso : UPDATE :  52.22%% done\\n' >&2\n\
                    exit 0\nfi\n\
                  if [ \"$1\" = \"-outdev\" ] && [ \"$3\" = \"-format\" ]; then\n\
@@ -3016,7 +3024,8 @@ mod tests {
             ]
         );
         assert_eq!(report.stages.len(), 7);
-        assert_eq!(report.iso_bytes, 8192);
+        // the fake master emits a minimal valid ISO: 16 zero sectors + PVD
+        assert_eq!(report.iso_bytes, 34816);
 
         let stage_dir = dir.path().join("staging").join("T1");
         let iso = stage_dir.join("T1.iso");
@@ -3045,11 +3054,31 @@ mod tests {
         ));
     }
 
+    // Minimal valid ISO 9660 wrapper around `data` (the truncation self-check
+    // parses the PVD, so a bare byte blob no longer passes as an image).
+    fn synthetic_iso_bytes(data: &[u8]) -> Vec<u8> {
+        let pad = (2048 - data.len() % 2048) % 2048;
+        let total_blocks = ((32768 + 2048 + data.len() + pad) / 2048) as u32;
+        let mut v = vec![0u8; 32768];
+        let mut pvd = [0u8; 2048];
+        pvd[0] = 1;
+        pvd[1..6].copy_from_slice(b"CD001");
+        pvd[6] = 1;
+        pvd[80..84].copy_from_slice(&total_blocks.to_le_bytes());
+        pvd[84..88].copy_from_slice(&total_blocks.to_be_bytes());
+        pvd[128..130].copy_from_slice(&2048u16.to_le_bytes());
+        pvd[130..132].copy_from_slice(&2048u16.to_be_bytes());
+        v.extend_from_slice(&pvd);
+        v.extend_from_slice(data);
+        v.extend(std::iter::repeat(0u8).take(pad));
+        v
+    }
+
     #[test]
     fn run_burn_iso_verifies_against_sidecar() {
         let dir = tempfile::tempdir().unwrap();
         let iso = dir.path().join("copy.iso");
-        std::fs::write(&iso, vec![9u8; 8192]).unwrap();
+        std::fs::write(&iso, synthetic_iso_bytes(&[9u8; 8192])).unwrap();
         let sha = hashing::sha256_file(&iso, &mut |_, _| {}).unwrap();
         hashing::write_checksums(
             &[(sha.clone(), "copy.iso".into())],
@@ -3085,7 +3114,7 @@ mod tests {
     fn run_burn_iso_flags_readback_mismatch() {
         let dir = tempfile::tempdir().unwrap();
         let iso = dir.path().join("copy.iso");
-        std::fs::write(&iso, vec![9u8; 8192]).unwrap();
+        std::fs::write(&iso, synthetic_iso_bytes(&[9u8; 8192])).unwrap();
         hashing::write_checksums(
             &[("ab".repeat(32), "copy.iso".into())],
             &dir.path().join("copy.iso.sha256"),

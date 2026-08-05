@@ -205,7 +205,7 @@ stall_timeout_secs = 900   # kill a streaming tool after this many seconds of
 | preflight | inspects payloads — a directory expands to its member files, warning about symlinks/special files and 0-byte files — refuses mounted VeraCrypt containers, selects the drive and probes the disc (`xorriso -toc -list_formats -list_speeds`), fit-checks with headroom, checks staging space; in the TUI the plan then stays open for editing until confirmed |
 | parity | one recovery set per top-level payload: `par2 create -B<parent> -r<pct> -n1 -s<slice> -m<mem>` with every member file as a relative operand (a directory's files share one set; 0-byte files excluded — par2 cannot repair them); slice size computed toward the PAR2 32768-block ceiling (~2 MiB slices on 93 GiB) — never the default 2000 blocks that defeat 15% parity |
 | checksums | streaming SHA-256 of every payload file (directory members by their relative disc path) and parity file → `checksums.sha256` |
-| master | re-checks staging space (the ISO is the big late allocation), writes `MANIFEST.txt` + `RECOVERY.txt`, then `xorriso -as mkisofs -iso-level 3 -rock --md5`, extracts the file→LBA map, hashes the ISO |
+| master | re-checks staging space (the ISO is the big late allocation), writes `MANIFEST.txt` + `RECOVERY.txt`, then `xorriso -as mkisofs -iso-level 3 -rock --md5`; the finished image passes a truncation self-check (its ISO 9660 volume descriptor must not declare more bytes than the file holds) before the file→LBA map and ISO hash |
 | format | only with `--defect-management`: `xorriso -format as_needed`, then re-reads the reduced capacity and re-checks fit |
 | burn | `xorriso -as cdrecord -v dev=<dev> [speed=<n>] fs=64m blank=as_needed -eject <iso>` — stream recording on unformatted BD-R; the full xorriso transcript tees to `<label>.burn.log` next to the staged ISO, and a failure reports xorriso's diagnostic lines plus the `burn-iso` retry hint (the staged ISO survives) |
 | verify image | reloads the tray, polls drive readiness, reads exactly ISO-size bytes from the device (O_DIRECT, buffered fallback) and compares SHA-256 to the staged ISO |
@@ -266,6 +266,27 @@ cp -r /mnt/extras . && par2 r -B. /mnt/parity/extras.par2
 # 4. Map damaged sectors to files, if you want to know what was hit
 xorriso -indev recovered.iso -find / -exec report_lba --
 ```
+
+## Caring for your discs
+
+Optical archives fail quietly: a disc that verified perfectly on burn day
+can decay in storage, and the only way to notice before it matters is to
+re-read it. Re-run a check periodically — insert the disc and:
+
+```sh
+ovenmitts check            # fast, source-free: embedded MD5 tags + read check
+ovenmitts verify           # deeper: re-hashes every file against the disc's checksums
+ovenmitts verify --iso …   # byte-exact against your kept staged ISO
+```
+
+How often? There is no authoritative interval; the Digital Preservation
+Coalition's fixity guidance uses six months as its baseline, and every 6–12
+months is a defensible schedule for M-DISC/BD-R in decent storage (cool,
+dark, dry, in a case, handled by the edges). What matters more than the
+exact cadence is that a failing disc is caught while its siblings — your
+second copy and the off-disc parity in staging — are still healthy, because
+that is when `RECOVERY.txt`'s ddrescue + par2 path can still reconstruct
+everything.
 
 ## Notes
 

@@ -315,7 +315,70 @@ pub fn write_recovery(out: &Path, label: &str, payloads: &[Payload]) -> Result<(
             "   header at the end of the container is the first fallback."
         );
     }
+    let _ = writeln!(t);
+    let _ = writeln!(
+        t,
+        "Prevention: re-verify this disc every 6-12 months (no consensus interval"
+    );
+    let _ = writeln!(
+        t,
+        "exists; the Digital Preservation Coalition's 6-month fixity baseline is"
+    );
+    let _ = writeln!(
+        t,
+        "the reference). Decay caught while the parity above is still readable is"
+    );
+    let _ = writeln!(t, "decay these files can repair.");
     crate::fsutil::write_durable(out, t)
+}
+
+/// ISO 9660 truncation self-check (isolyzer-inspired, native): the Primary
+/// Volume Descriptor at sector 16 declares the volume size; a staged image
+/// shorter than its own declaration is truncated (torn copy, full disk,
+/// interrupted master) and must never reach a disc. Bytes past the declared
+/// size are legitimate - sector run-out or appended ECC data.
+pub fn check_iso_truncation(iso: &Path) -> Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(iso).with_context(|| format!("open {}", iso.display()))?;
+    let actual = f
+        .metadata()
+        .with_context(|| format!("stat {}", iso.display()))?
+        .len();
+    let mut pvd = [0u8; 2048];
+    if f.seek(SeekFrom::Start(32768))
+        .and_then(|_| f.read_exact(&mut pvd))
+        .is_err()
+    {
+        bail!(
+            "{}: too short ({actual} bytes) to hold an ISO 9660 volume \
+             descriptor - truncated image? re-master before burning",
+            iso.display()
+        );
+    }
+    let expected = pvd_declared_bytes(&pvd).with_context(|| iso.display().to_string())?;
+    ensure!(
+        actual >= expected,
+        "ISO TRUNCATED - DO NOT BURN: {} is {actual} bytes but its own volume \
+         descriptor declares {expected}; re-master the image",
+        iso.display()
+    );
+    Ok(())
+}
+
+/// Pure: declared volume bytes from the PVD sector (both-endian fields; the
+/// little-endian halves at offsets 80 and 128 suffice on every platform).
+fn pvd_declared_bytes(pvd: &[u8; 2048]) -> Result<u64> {
+    ensure!(
+        pvd[0] == 1 && &pvd[1..6] == b"CD001",
+        "no ISO 9660 Primary Volume Descriptor at sector 16"
+    );
+    let blocks = u32::from_le_bytes(pvd[80..84].try_into().unwrap()) as u64;
+    let block_size = u16::from_le_bytes(pvd[128..130].try_into().unwrap()) as u64;
+    ensure!(
+        blocks > 0 && block_size > 0,
+        "volume descriptor declares a zero-size volume"
+    );
+    Ok(blocks * block_size)
 }
 
 /// After mastering: `xorriso -indev <iso> -find / -exec report_lba --`,
@@ -588,6 +651,8 @@ mod tests {
         }
         assert!(text.contains("xorriso -indev /dev/sr0 -find / -exec report_lba --"));
         assert!(text.contains("Restore Volume Header"));
+        assert!(text.contains("every 6-12 months"), "{text}");
+        assert!(text.contains("fixity"), "{text}");
         assert!(
             !text.contains("ovenmitts"),
             "on-disc files carry no tool branding: {text}"
@@ -709,6 +774,66 @@ mod tests {
         let err = build_iso(&tools, &input, std::time::Duration::ZERO, &mut |_, _| {}).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("Cannot find source"), "{msg}");
+    }
+
+    // Minimal valid ISO 9660 shell: 16 zero sectors, a PVD declaring the
+    // exact block count, then `data_sectors` of payload.
+    fn synthetic_iso(data_sectors: u32) -> Vec<u8> {
+        let total_blocks = 16 + 1 + data_sectors;
+        let mut v = vec![0u8; 32768];
+        let mut pvd = [0u8; 2048];
+        pvd[0] = 1;
+        pvd[1..6].copy_from_slice(b"CD001");
+        pvd[6] = 1;
+        pvd[80..84].copy_from_slice(&total_blocks.to_le_bytes());
+        pvd[84..88].copy_from_slice(&total_blocks.to_be_bytes());
+        pvd[128..130].copy_from_slice(&2048u16.to_le_bytes());
+        pvd[130..132].copy_from_slice(&2048u16.to_be_bytes());
+        v.extend_from_slice(&pvd);
+        v.extend(std::iter::repeat(7u8).take(data_sectors as usize * 2048));
+        v
+    }
+
+    #[test]
+    fn truncation_check_accepts_intact_and_padded_images() {
+        let dir = tempfile::tempdir().unwrap();
+        let iso = dir.path().join("ok.iso");
+        std::fs::write(&iso, synthetic_iso(4)).unwrap();
+        check_iso_truncation(&iso).unwrap();
+        // run-out or appended ECC beyond the declared size is legitimate
+        let mut padded = synthetic_iso(4);
+        padded.extend_from_slice(&[0u8; 4096]);
+        std::fs::write(&iso, padded).unwrap();
+        check_iso_truncation(&iso).unwrap();
+    }
+
+    #[test]
+    fn truncation_check_flags_short_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let iso = dir.path().join("cut.iso");
+        let mut bytes = synthetic_iso(4);
+        bytes.truncate(bytes.len() - 2048);
+        std::fs::write(&iso, bytes).unwrap();
+        let err = check_iso_truncation(&iso).unwrap_err();
+        assert!(err.to_string().contains("TRUNCATED"), "{err:#}");
+        assert!(err.to_string().contains("DO NOT BURN"), "{err:#}");
+    }
+
+    #[test]
+    fn truncation_check_flags_missing_or_garbage_pvd() {
+        let dir = tempfile::tempdir().unwrap();
+        let iso = dir.path().join("no-pvd.iso");
+        // long enough to read sector 16, but no CD001 signature
+        std::fs::write(&iso, vec![0u8; 40 * 2048]).unwrap();
+        let err = check_iso_truncation(&iso).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("Primary Volume Descriptor"),
+            "{err:#}"
+        );
+        // shorter than the descriptor offset entirely
+        std::fs::write(&iso, b"tiny").unwrap();
+        let err = check_iso_truncation(&iso).unwrap_err();
+        assert!(err.to_string().contains("too short"), "{err:#}");
     }
 
     #[test]
