@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Declared MSRV corrected to 1.88.** The manifest claimed 1.80, but the
+  locked dependency tree was never buildable there (ratatui 0.30's crates
+  use edition 2024 and declare `rust-version` 1.88) — the CI MSRV check
+  caught it on its first-ever run. `rust-version` and the CI job now say
+  what has been true all along.
+
 ## [0.2.0] - 2026-08-06
 
 ### Added
