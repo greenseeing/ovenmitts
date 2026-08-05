@@ -90,7 +90,11 @@ pub fn save_device(path: &Path, device: &str) -> Result<()> {
         .with_context(|| format!("parsing config {}", path.display()))?;
     doc["device"] = toml_edit::value(device);
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
     // write-then-rename: a torn write would brick every later load. The tmp
@@ -100,6 +104,25 @@ pub fn save_device(path: &Path, device: &str) -> Result<()> {
     crate::fsutil::write_durable(&tmp, doc.to_string())?;
     std::fs::rename(&tmp, path).with_context(|| format!("replacing config {}", path.display()))?;
     crate::fsutil::fsync_dir(path.parent().unwrap_or(Path::new(".")))
+}
+
+/// Device strings reach `xorriso dev=<device>` and udisksctl argv verbatim:
+/// whitespace, '=' and ',' change how those parse, and a relative or
+/// `stdio:/...` pseudo-path silently redirects the burn into a file. A block
+/// device is deliberately NOT required (image files are legitimate targets
+/// in tests and dry runs).
+pub fn validate_device(device: &str) -> Result<()> {
+    anyhow::ensure!(
+        device.starts_with('/'),
+        "device must be an absolute path like /dev/sr0 (got '{device}')"
+    );
+    anyhow::ensure!(
+        !device
+            .chars()
+            .any(|c| c.is_whitespace() || c == '=' || c == ','),
+        "device path must not contain whitespace, '=' or ',' (got '{device}')"
+    );
+    Ok(())
 }
 
 impl Config {
@@ -115,6 +138,9 @@ impl Config {
             headroom_pct <= 50,
             "config: headroom_pct must be 0..=50 (got {headroom_pct})"
         );
+        if let Some(device) = &file.device {
+            validate_device(device)?;
+        }
         Ok(Self {
             // a config-file device is a soft preference (tried first, may be
             // swapped by auto-detection); only --device pins, set in main
@@ -211,6 +237,27 @@ mod tests {
     #[test]
     fn unknown_keys_rejected() {
         assert!(toml::from_str::<FileConfig>("nope = 1\n").is_err());
+    }
+
+    #[test]
+    fn device_shapes_that_break_tool_argv_are_rejected() {
+        for bad in [
+            "sr0",
+            "stdio:/tmp/fake.iso",
+            "/dev/sr0 extra",
+            "/dev/sr,0",
+            "/dev/sr=0",
+            "/dev/sr\t0",
+        ] {
+            assert!(validate_device(bad).is_err(), "accepted {bad:?}");
+            let f = FileConfig {
+                device: Some(bad.to_string()),
+                ..FileConfig::default()
+            };
+            assert!(Config::resolve(f).is_err(), "resolve accepted {bad:?}");
+        }
+        assert!(validate_device("/dev/sr0").is_ok());
+        assert!(validate_device("/tmp/.tmpX/fake-device").is_ok());
     }
 
     #[test]

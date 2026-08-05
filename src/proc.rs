@@ -23,12 +23,19 @@ use anyhow::{bail, Context, Result};
 /// configurable inactivity watchdog instead (they legitimately run for an hour).
 pub(crate) const SHORT_OP_DEADLINE: Duration = Duration::from_secs(120);
 
-/// A `Command` for `bin` with a C locale and no stdin. Callers add args and
-/// choose how to capture output (`.output()`, `.status()`, piped streaming).
+/// A `Command` for `bin` with a C locale, no stdin, and its own process
+/// group. Callers add args and choose how to capture output.
+///
+/// The dedicated group means kill(-pid) takes any grandchildren a tool forks
+/// along with it, so a watchdog kill or force-quit can never orphan one that
+/// would keep the output pipes open. It also detaches children from the
+/// terminal's foreground group - deliberate: signal delivery to tools is
+/// ovenmitts's job (shutdown::escalate), never the terminal driver's.
 pub(crate) fn command(bin: &Path) -> Command {
+    use std::os::unix::process::CommandExt;
     let mut cmd = Command::new(bin);
     // LC_ALL overrides LANG and every LC_* category, so one variable is enough.
-    cmd.env("LC_ALL", "C").stdin(Stdio::null());
+    cmd.env("LC_ALL", "C").stdin(Stdio::null()).process_group(0);
     cmd
 }
 
@@ -50,12 +57,14 @@ fn deregister(pid: i32) {
     }
 }
 
-/// Signal every registered child (force-quit path); best effort.
+/// Signal every registered child's process group (force-quit path); best
+/// effort. Children are group leaders (command() uses process_group(0)), so
+/// -pid addresses the tool and any grandchildren it forked.
 pub fn terminate_active(force: bool) {
     let sig = if force { libc::SIGKILL } else { libc::SIGTERM };
     if let Ok(v) = ACTIVE_CHILDREN.lock() {
         for pid in v.iter() {
-            unsafe { libc::kill(*pid, sig) };
+            unsafe { libc::kill(-*pid, sig) };
         }
     }
 }
@@ -118,20 +127,22 @@ impl Reaper {
         self.child.stderr.take()
     }
 
-    /// Terminate the child now (SIGTERM, brief grace, SIGKILL) and reap it.
-    /// Used by the inactivity watchdog.
+    /// Terminate the child's process group now (SIGTERM, brief grace,
+    /// SIGKILL) and reap the child. Used by the inactivity watchdog. Group
+    /// signaling means a grandchild holding the output pipes dies too -
+    /// otherwise the pump threads would block on the open pipe forever.
     pub(crate) fn kill_now(&mut self) {
         if self.reaped {
             return;
         }
-        unsafe { libc::kill(self.pid, libc::SIGTERM) };
+        unsafe { libc::kill(-self.pid, libc::SIGTERM) };
         for _ in 0..200 {
             if matches!(self.reap_if_exited(), Ok(Some(_))) {
                 return;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        unsafe { libc::kill(self.pid, libc::SIGKILL) };
+        unsafe { libc::kill(-self.pid, libc::SIGKILL) };
         // SIGKILL cannot be ignored: deregister-then-wait keeps the invariant.
         deregister(self.pid);
         self.reaped = true;

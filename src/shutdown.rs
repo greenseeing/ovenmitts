@@ -14,12 +14,18 @@ use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 use crate::runner::Ack;
 
 /// Arm INT/TERM/HUP; the returned flag flips true on the first such signal.
-/// SIGQUIT is deliberately left at its default so a core dump stays reachable.
+/// A SECOND signal restores the default disposition - the operator's
+/// hard-exit escape hatch if the graceful escalation wedges. SIGQUIT is
+/// deliberately left at its default so a core dump stays reachable.
 pub fn install() -> Arc<AtomicBool> {
     let flag = Arc::new(AtomicBool::new(false));
     for sig in [SIGINT, SIGTERM, SIGHUP] {
         // A failure to register a handler must not abort the whole run; the
         // worst case is the pre-existing behaviour (signal kills the process).
+        // Registration order matters: the conditional-default action runs
+        // first, sees the flag still false on the first signal, and only
+        // terminates on a repeat (flag already true).
+        let _ = signal_hook::flag::register_conditional_default(sig, Arc::clone(&flag));
         let _ = signal_hook::flag::register(sig, Arc::clone(&flag));
     }
     flag

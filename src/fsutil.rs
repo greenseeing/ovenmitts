@@ -5,14 +5,26 @@
 
 use std::fs::File;
 use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use anyhow::{Context, Result};
 
-/// Write `contents` to `path`, fsync the file, then fsync the parent
+/// Write `contents` to `path` (0600 - checksums, manifests and reports
+/// describe private archive contents), fsync the file, then fsync the parent
 /// directory so the new entry survives a crash.
 pub fn write_durable(path: &Path, contents: impl AsRef<[u8]>) -> Result<()> {
-    let mut f = File::create(path).with_context(|| format!("write {}", path.display()))?;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("write {}", path.display()))?;
+    // mode() applies only at creation; tighten pre-existing files too
+    f.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("chmod {}", path.display()))?;
     f.write_all(contents.as_ref())
         .with_context(|| format!("write {}", path.display()))?;
     f.sync_all()
@@ -51,6 +63,20 @@ mod tests {
             std::fs::read_to_string(&p).unwrap(),
             "second, shorter or longer"
         );
+    }
+
+    #[test]
+    fn write_durable_is_owner_only_even_on_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("f.txt");
+        write_durable(&p, "x").unwrap();
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        // a pre-existing world-readable file must be tightened, not kept
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_durable(&p, "y").unwrap();
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     #[test]

@@ -43,12 +43,17 @@ pub fn burn_iso(
         .len();
     let args = burn_args(device, iso, speed);
     // Append, never truncate: a retry must keep the failed attempt's
-    // transcript. Each attempt starts under its own dated header.
-    let mut log = std::fs::OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(burn_log_path(iso))
-        .ok();
+    // transcript. Each attempt starts under its own dated header. 0600: the
+    // transcript names the private archive contents.
+    let mut log = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .mode(0o600)
+            .open(burn_log_path(iso))
+            .ok()
+    };
     if let Some(f) = log.as_mut() {
         let _ = writeln!(
             f,
@@ -95,6 +100,8 @@ pub fn burn_args(device: &str, iso: &Path, speed: Option<u32>) -> Vec<String> {
     args.push("fs=64m".into());
     args.push("blank=as_needed".into());
     args.push("-eject".into());
+    // absolute operand: a leading-'-' ISO name must never parse as an option
+    let iso = std::path::absolute(iso).unwrap_or_else(|_| iso.to_path_buf());
     args.push(iso.display().to_string());
     args
 }
@@ -183,7 +190,10 @@ mod tests {
         let args = burn_args("/dev/sr1", Path::new("x.iso"), None);
         assert!(!args.iter().any(|a| a.starts_with("speed=")));
         assert_eq!(args[3], "dev=/dev/sr1");
-        assert_eq!(args.last().map(String::as_str), Some("x.iso"));
+        let iso = args.last().unwrap();
+        // relative operands are absolutized (a leading '-' must not become an option)
+        assert!(iso.starts_with('/'), "{iso}");
+        assert!(iso.ends_with("/x.iso"), "{iso}");
     }
 
     fn approx(a: f32, b: f32) {
@@ -535,6 +545,41 @@ mod tests {
             start.elapsed() < Duration::from_secs(60),
             "watchdog never fired"
         );
+    }
+
+    #[test]
+    fn watchdog_kill_takes_the_whole_process_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("grandchild.pid");
+        // the tool forks a grandchild that inherits the output pipes; a
+        // single-PID kill would leave it holding the pipes open (pump join
+        // blocks) and orphan it - the group kill must take both
+        let script = format!(
+            "#!/bin/sh\nsleep 120 &\necho $! > {pidfile}\nprintf 'started\\n'\nwait\n",
+            pidfile = pidfile.display()
+        );
+        let tools = fake_tools(&script, dir.path());
+        let start = Instant::now();
+        let err =
+            run_streaming(&tools.xorriso, &[], Duration::from_secs(1), &mut |_| {}).unwrap_err();
+        assert!(err.to_string().contains("no output"), "{err}");
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "pump join blocked on a pipe held by an orphaned grandchild"
+        );
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // give the kernel a moment to deliver the group SIGTERM/SIGKILL
+        for _ in 0..100 {
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("grandchild {pid} survived the group kill");
     }
 
     #[test]

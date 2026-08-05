@@ -54,6 +54,7 @@ fn dispatch(cli: Cli) -> anyhow::Result<()> {
     let file_cfg = ovenmitts::config::load(cli.config.as_deref())?;
     let mut cfg = ovenmitts::config::Config::resolve(file_cfg)?;
     if let Some(dev) = &cli.device {
+        ovenmitts::config::validate_device(dev)?;
         cfg.device = dev.clone();
         cfg.device_explicit = true;
     }

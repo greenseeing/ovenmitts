@@ -278,9 +278,11 @@ struct RunLog {
 impl RunLog {
     fn open(path: &Path) -> std::io::Result<Self> {
         use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt;
         let mut file = std::fs::OpenOptions::new()
             .append(true)
             .create(true)
+            .mode(0o600)
             .open(path)?;
         writeln!(
             file,
@@ -571,10 +573,9 @@ impl<'a> BurnRun<'a> {
     }
 
     fn staging(&mut self, params: &BurnParams) -> Result<StagingDir> {
-        let label = unique_label(&params.staging, &params.label);
-        let dir = params.staging.join(&label);
-        std::fs::create_dir_all(dir.join("parity"))
-            .with_context(|| format!("create staging dir {}", dir.display()))?;
+        let (label, dir) = claim_stage_dir(&params.staging, &params.label)?;
+        std::fs::create_dir(dir.join("parity"))
+            .with_context(|| format!("create staging dir {}", dir.join("parity").display()))?;
         let run_log = dir.join("run.log");
         self.ctx.tee_events_to(&run_log);
         self.ctx.info(format!("staging into {}", dir.display()));
@@ -1737,19 +1738,35 @@ fn sanitize_label(raw: &str) -> String {
     }
 }
 
-fn unique_label(staging: &Path, base: &str) -> String {
-    if !staging.join(base).exists() {
-        return base.to_string();
-    }
-    let mut n = 2u64;
+/// Atomically claim a fresh run dir under staging: mkdir(0700) either
+/// succeeds (ours alone - no check-then-create race, and mkdir never follows
+/// a symlink) or already exists, in which case the label gets a numeric
+/// suffix and the claim retries. The staging ROOT keeps create_dir_all: it
+/// is the user's own configured path and a symlinked root is legitimate.
+fn claim_stage_dir(staging: &Path, base: &str) -> Result<(String, PathBuf)> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(staging)
+        .with_context(|| format!("create staging dir {}", staging.display()))?;
+    let mut n = 1u64;
     loop {
-        let suffix = format!("_{n}");
-        let keep = 32usize.saturating_sub(suffix.len()).min(base.len());
-        let candidate = format!("{}{suffix}", &base[..keep]);
-        if !staging.join(&candidate).exists() {
-            return candidate;
+        let label = if n == 1 {
+            base.to_string()
+        } else {
+            let suffix = format!("_{n}");
+            let keep = 32usize.saturating_sub(suffix.len()).min(base.len());
+            format!("{}{suffix}", &base[..keep])
+        };
+        let dir = staging.join(&label);
+        match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+            Ok(()) => return Ok((label, dir)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => n += 1,
+            Err(e) => {
+                return Err(e).with_context(|| format!("create staging dir {}", dir.display()))
+            }
         }
-        n += 1;
     }
 }
 
@@ -2354,16 +2371,24 @@ mod tests {
     }
 
     #[test]
-    fn unique_label_dedupes_with_numeric_suffix() {
+    fn claim_stage_dir_dedupes_with_numeric_suffix_and_claims_atomically() {
+        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(unique_label(dir.path(), "T1"), "T1");
-        std::fs::create_dir(dir.path().join("T1")).unwrap();
-        assert_eq!(unique_label(dir.path(), "T1"), "T1_2");
-        std::fs::create_dir(dir.path().join("T1_2")).unwrap();
-        assert_eq!(unique_label(dir.path(), "T1"), "T1_3");
+        let (label, path) = claim_stage_dir(dir.path(), "T1").unwrap();
+        assert_eq!(label, "T1");
+        assert!(path.is_dir(), "claim must create the dir, not just name it");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "run dirs hold archive material - owner-only"
+        );
+        let (label, _) = claim_stage_dir(dir.path(), "T1").unwrap();
+        assert_eq!(label, "T1_2");
+        let (label, _) = claim_stage_dir(dir.path(), "T1").unwrap();
+        assert_eq!(label, "T1_3");
         let base = "B".repeat(32);
         std::fs::create_dir(dir.path().join(&base)).unwrap();
-        let next = unique_label(dir.path(), &base);
+        let (next, _) = claim_stage_dir(dir.path(), &base).unwrap();
         assert_eq!(next.len(), 32);
         assert!(next.ends_with("_2"));
     }
