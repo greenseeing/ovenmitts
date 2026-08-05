@@ -28,8 +28,9 @@ const LOG_CAP: usize = 200;
 /// (type-ahead Enter — double-tap, held key — must never answer it).
 const ACK_ARM_DELAY: Duration = Duration::from_millis(500);
 
-const STAGE_ORDER: [Stage; 9] = [
+const STAGE_ORDER: [Stage; 10] = [
     Stage::Preflight,
+    Stage::Split,
     Stage::Parity,
     Stage::Checksums,
     Stage::Format,
@@ -410,9 +411,13 @@ impl App {
     }
 
     fn visible_stages(&self) -> Vec<(Stage, StageState)> {
+        // Format and Split render only once they run: single-disc burns never
+        // split, and formatting is opt-in
         self.stages
             .iter()
-            .filter(|(s, st)| *s != Stage::Format || !matches!(st, StageState::Pending))
+            .filter(|(s, st)| {
+                !matches!(s, Stage::Format | Stage::Split) || !matches!(st, StageState::Pending)
+            })
             .cloned()
             .collect()
     }
@@ -521,8 +526,16 @@ impl App {
                 self.begin_edit();
                 true
             }
-            // a non-fitting plan can only be amended or aborted, never confirmed
-            KeyCode::Enter if self.plan.as_ref().is_some_and(|p| !p.fits) => true,
+            // a non-fitting plan can only be amended or aborted, never
+            // confirmed - unless it spans a multi-disc set
+            KeyCode::Enter
+                if self
+                    .plan
+                    .as_ref()
+                    .is_some_and(|p| !p.fits && p.span.is_none()) =>
+            {
+                true
+            }
             _ => false,
         }
     }
@@ -764,7 +777,41 @@ impl App {
                 human_bytes(plan.capacity)
             ),
         ));
-        if !plan.fits {
+        if let Some(span) = &plan.span {
+            let data = span.discs.iter().filter(|d| d.part.is_some()).count();
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "  SPANS {} DISCS ({} data + {} parity) — staging peaks at ~{}; \
+                     every disc swap will prompt",
+                    span.discs.len(),
+                    data,
+                    span.discs.len() - data,
+                    human_bytes(span.staging_peak)
+                ),
+                Style::new().fg(WARN).add_modifier(Modifier::BOLD),
+            )));
+            for d in &span.discs {
+                lines.push(Line::from(Span::styled(
+                    match &d.part {
+                        Some(p) => format!(
+                            "    disc {}/{}  {}  {} ({})",
+                            d.index,
+                            span.discs.len(),
+                            d.label,
+                            p.file_name,
+                            human_bytes(p.bytes)
+                        ),
+                        None => format!(
+                            "    disc {}/{}  {}  par2 recovery volumes",
+                            d.index,
+                            span.discs.len(),
+                            d.label
+                        ),
+                    },
+                    Style::new().fg(DIM),
+                )));
+            }
+        } else if !plan.fits {
             lines.push(Line::from(Span::styled(
                 "  DOES NOT FIT — lower redundancy, disable parity, or use larger media",
                 Style::new().fg(ERR).add_modifier(Modifier::BOLD),
@@ -810,7 +857,7 @@ impl App {
         let prompt_line = if self.replanning || self.edit_dirty {
             Line::from(Span::styled("  re-planning…", Style::new().fg(DIM)))
         } else if let Some(prompt) = &self.pending_ack {
-            if plan.fits {
+            if plan.fits || plan.span.is_some() {
                 Line::from(vec![
                     Span::styled(
                         format!("  {prompt}  "),
@@ -1373,6 +1420,52 @@ mod tests {
             ),
             ack_rx,
         )
+    }
+
+    #[test]
+    fn disc_start_resets_only_the_per_disc_stages() {
+        let (mut app, _rx) = test_app();
+        for s in STAGE_ORDER {
+            app.apply(StageEvent::StageStart(s));
+            app.apply(StageEvent::StageDone {
+                stage: s,
+                summary: "ok".into(),
+            });
+        }
+        app.apply(StageEvent::DiscStart {
+            index: 2,
+            total: 4,
+            label: "VAULT_2OF4".into(),
+            parity: false,
+        });
+        let state = |stage: Stage| {
+            app.stages
+                .iter()
+                .find(|(s, _)| *s == stage)
+                .map(|(_, st)| st.clone())
+                .unwrap()
+        };
+        for s in [
+            Stage::Format,
+            Stage::Burn,
+            Stage::VerifyImage,
+            Stage::VerifyFiles,
+        ] {
+            assert!(
+                matches!(state(s), StageState::Pending),
+                "{s:?} must reset for the next disc"
+            );
+        }
+        for s in [Stage::Split, Stage::Parity, Stage::Checksums, Stage::Master] {
+            assert!(
+                matches!(state(s), StageState::Done),
+                "{s:?} is set-scoped and must stay done"
+            );
+        }
+        assert!(app
+            .log
+            .tail(usize::MAX)
+            .any(|(_, text)| text.contains("disc 2 of 4")));
     }
 
     /// Prompt applied AND rendered long enough ago that Proceed is live —
