@@ -250,6 +250,18 @@ where
                 line.close();
                 println!("info: {text}");
             }
+            StageEvent::DiscStart {
+                index,
+                total,
+                label,
+                parity,
+            } => {
+                line.close();
+                println!(
+                    "=== disc {index} of {total} - {label}{} ===",
+                    if parity { " (parity)" } else { "" }
+                );
+            }
             StageEvent::Out(text) => {
                 line.close();
                 println!("{text}");

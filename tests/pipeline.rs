@@ -755,12 +755,18 @@ fn burn_iso_writes_forensics_next_to_iso() {
 #[test]
 fn preflight_rejects_oversized_payload_before_parity() {
     let h = Harness::new();
-    let big = h.dir.path().join("big.hc");
-    let f = std::fs::File::create(&big).unwrap();
-    f.set_len(26 * 1024 * 1024 * 1024).unwrap();
+    // two oversized payloads: a single big file would legitimately span a
+    // multi-disc set, so the does-not-fit bail needs a non-spannable mix
+    let mut bigs = Vec::new();
+    for name in ["big.hc", "big2.hc"] {
+        let big = h.dir.path().join(name);
+        let f = std::fs::File::create(&big).unwrap();
+        f.set_len(26 * 1024 * 1024 * 1024).unwrap();
+        bigs.push(big);
+    }
 
     let (ctx, rx, _ack) = h.ctx();
-    let err = runner::run_burn(&ctx, &burn_request(vec![big], "BIG")).unwrap_err();
+    let err = runner::run_burn(&ctx, &burn_request(bigs, "BIG")).unwrap_err();
     let events = drain(ctx, rx);
 
     let msg = format!("{err:#}");

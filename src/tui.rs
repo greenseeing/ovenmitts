@@ -341,6 +341,29 @@ impl App {
             StageEvent::Info(text) => self.log.push(false, text),
             StageEvent::Out(text) => self.log.push(false, text),
             StageEvent::Warn(text) => self.log.push(true, text),
+            StageEvent::DiscStart {
+                index,
+                total,
+                label,
+                parity,
+            } => {
+                // per-disc stages start over; set-scoped stages stay Done
+                for s in [
+                    Stage::Format,
+                    Stage::Burn,
+                    Stage::VerifyImage,
+                    Stage::VerifyFiles,
+                ] {
+                    self.set_stage(s, StageState::Pending);
+                }
+                self.log.push(
+                    false,
+                    format!(
+                        "disc {index} of {total}: {label}{}",
+                        if parity { " (parity)" } else { "" }
+                    ),
+                );
+            }
             StageEvent::NeedAck { prompt } => {
                 // the runner grants one ack slot per NeedAck: spend it on queued
                 // edits first; a mid-run NeedAck must never get a stale Amend

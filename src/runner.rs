@@ -8,13 +8,14 @@ use anyhow::{bail, ensure, Context, Result};
 use crate::config::Config;
 use crate::plan::{self, human_bytes, ArchivePlan, MediaInfo, Payload, PlanInput};
 use crate::tools::Tools;
-use crate::{burn, ecc, hashing, master, media, parity, verify};
+use crate::{burn, ecc, hashing, master, media, parity, span, verify};
 
 const READY_TIMEOUT: Duration = Duration::from_secs(180);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Stage {
     Preflight,
+    Split,
     Parity,
     Checksums,
     Format,
@@ -29,6 +30,7 @@ impl Stage {
     pub fn label(&self) -> &'static str {
         match self {
             Stage::Preflight => "preflight",
+            Stage::Split => "split",
             Stage::Parity => "parity",
             Stage::Checksums => "checksums",
             Stage::Format => "format",
@@ -67,6 +69,13 @@ pub enum StageEvent {
     /// Runner blocks until an Ack arrives (reinsert disc, confirm burn, ...)
     NeedAck {
         prompt: String,
+    },
+    /// A multi-disc set moves to its next disc; per-disc stages start over.
+    DiscStart {
+        index: u32,
+        total: u32,
+        label: String,
+        parity: bool,
     },
     Finished {
         report: RunReport,
@@ -325,6 +334,15 @@ impl RunLog {
             } => Some(format!("[{}] {detail}", stage.label())),
             StageEvent::Info(t) => Some(format!("info: {t}")),
             StageEvent::Warn(t) => Some(format!("warning: {t}")),
+            StageEvent::DiscStart {
+                index,
+                total,
+                label,
+                parity,
+            } => Some(format!(
+                "=== disc {index} of {total} - {label}{} ===",
+                if *parity { " (parity)" } else { "" }
+            )),
             StageEvent::Failed { stage, error } => {
                 Some(format!("error: [{}] {error}", stage.label()))
             }
@@ -370,6 +388,18 @@ fn burn_pipeline(ctx: &RunnerCtx, req: &BurnRequest, stage: &mut Stage) -> Resul
     let Some((params, plan)) = run.confirm(req, &payloads, &device, &media)? else {
         return Ok(()); // dry run: plan rendered, Finished already sent
     };
+    if let Some(span) = plan.span.clone() {
+        let cx = SetContext {
+            req,
+            params: &params,
+            plan: &plan,
+            span: &span,
+            device: &device,
+            media: &media,
+            payloads: &payloads,
+        };
+        return run.burn_set(stage, &cx);
+    }
     let staging = run.staging(&params)?;
 
     *stage = Stage::Parity;
@@ -480,7 +510,22 @@ impl<'a> BurnRun<'a> {
         let mut prev_staging_warn: Option<String> = None;
         let mut staging_note_pending = true;
         let (params, plan) = loop {
-            let plan = plan::build_plan(&params.plan_input(payloads, ctx.cfg.headroom_pct), media);
+            let mut plan =
+                plan::build_plan(&params.plan_input(payloads, ctx.cfg.headroom_pct), media);
+            if !plan.fits {
+                // ecc flag only sizes the estimates: the RS02 layer fills
+                // every set image to the budget when it will actually run
+                let ecc = ctx.cfg.ecc && ctx.tools.dvdisaster.is_some();
+                plan.span = span::plan_span(
+                    payloads,
+                    &params.label,
+                    plan.budget,
+                    plan.overhead_bytes_est,
+                    params.parity,
+                    ecc,
+                )?
+                .map(Box::new);
+            }
             if staging_note_pending {
                 staging_note_pending = false;
                 let needed = plan.parity_bytes_est + plan.total_bytes_est;
@@ -501,6 +546,11 @@ impl<'a> BurnRun<'a> {
 
             if req.dry_run {
                 confirm_gate(ctx, &plan, &params.staging)?;
+                if let Some(span) = &plan.span {
+                    for line in span_table(span) {
+                        ctx.info(line);
+                    }
+                }
                 ctx.info("dry run - stopping after plan".into());
                 ctx.send(StageEvent::Finished {
                     report: RunReport::default(),
@@ -522,7 +572,19 @@ impl<'a> BurnRun<'a> {
                 }
             }
 
-            let prompt = if plan.fits {
+            let prompt = if let Some(span) = &plan.span {
+                let data = span.discs.iter().filter(|d| d.part.is_some()).count();
+                format!(
+                    "does not fit one disc - spans {} x {} ({} data + {} parity; parity \
+                     computation is hours-scale; staging peaks at ~{}); every disc swap \
+                     will prompt - burn the set?",
+                    span.discs.len(),
+                    media.kind.label(),
+                    data,
+                    span.discs.len() - data,
+                    human_bytes(span.staging_peak)
+                )
+            } else if plan.fits {
                 format!(
                     "burn {} to {} ({})?",
                     human_bytes(plan.total_bytes_est),
@@ -748,46 +810,7 @@ impl<'a> BurnRun<'a> {
         )?;
         // a truncated master (torn write, full disk) must die here, not on a disc
         master::check_iso_truncation(&iso)?;
-        if let Some(dvdisaster) = ctx.tools.dvdisaster.as_ref().filter(|_| ctx.cfg.ecc) {
-            match ecc::augment_target(iso_bytes, plan.budget, staging_free_bytes(&params.staging)?)
-            {
-                Some(target) => {
-                    ctx.info(format!(
-                        "embedding RS02 sector ECC (dvdisaster): filling the image to \
-                         {target} sectors"
-                    ));
-                    iso_bytes = ecc::augment(
-                        dvdisaster,
-                        &iso,
-                        target,
-                        ctx.cfg.stall_timeout(),
-                        &mut |line| {
-                            let l = line.trim();
-                            if !l.is_empty() {
-                                ctx.progress(Stage::Master, None, l.to_string());
-                            }
-                        },
-                    )?;
-                    // descriptors must still parse after in-place augmentation
-                    master::check_iso_truncation(&iso)?;
-                    ctx.info(format!(
-                        "RS02 ECC embedded - image now {}",
-                        human_bytes(iso_bytes)
-                    ));
-                }
-                None => ctx.warn(
-                    "not enough free disc or staging space for a meaningful RS02 \
-                     ECC layer (needs >=5% of the image) - skipped"
-                        .into(),
-                ),
-            }
-        } else if ctx.cfg.ecc {
-            ctx.info(
-                "dvdisaster not found - no sector-level ECC layer on this disc \
-                 (install the speed47 fork; par2 parity remains)"
-                    .into(),
-            );
-        }
+        iso_bytes = self.ecc_augment(&iso, iso_bytes, plan.budget, &params.staging)?;
         let lba_path = staging.dir.join(format!("{label}.lba.txt"));
         master::report_lba(&ctx.tools, &iso, &lba_path)?;
         let iso_sha = {
@@ -946,6 +969,618 @@ impl<'a> BurnRun<'a> {
         send_finished(ctx, report, &report_path);
         Ok(())
     }
+
+    /// RS02 augmentation decision + run for one mastered image; returns the
+    /// (possibly grown) size. Shared by the single-disc master stage and
+    /// every disc of a set.
+    fn ecc_augment(
+        &mut self,
+        iso: &Path,
+        iso_bytes: u64,
+        budget: u64,
+        staging: &Path,
+    ) -> Result<u64> {
+        let ctx = self.ctx;
+        let Some(dvdisaster) = ctx.tools.dvdisaster.as_ref().filter(|_| ctx.cfg.ecc) else {
+            if ctx.cfg.ecc {
+                ctx.info(
+                    "dvdisaster not found - no sector-level ECC layer on this disc \
+                     (install the speed47 fork; par2 parity remains)"
+                        .into(),
+                );
+            }
+            return Ok(iso_bytes);
+        };
+        match ecc::augment_target(iso_bytes, budget, staging_free_bytes(staging)?) {
+            Some(target) => {
+                ctx.info(format!(
+                    "embedding RS02 sector ECC (dvdisaster): filling the image to \
+                     {target} sectors"
+                ));
+                let after = ecc::augment(
+                    dvdisaster,
+                    iso,
+                    target,
+                    ctx.cfg.stall_timeout(),
+                    &mut |line| {
+                        let l = line.trim();
+                        if !l.is_empty() {
+                            ctx.progress(Stage::Master, None, l.to_string());
+                        }
+                    },
+                )?;
+                // descriptors must still parse after in-place augmentation
+                master::check_iso_truncation(iso)?;
+                ctx.info(format!(
+                    "RS02 ECC embedded - image now {}",
+                    human_bytes(after)
+                ));
+                Ok(after)
+            }
+            None => {
+                ctx.warn(
+                    "not enough free disc or staging space for a meaningful RS02 \
+                     ECC layer (needs >=5% of the image) - skipped"
+                        .into(),
+                );
+                Ok(iso_bytes)
+            }
+        }
+    }
+
+    /// Multi-disc set: prepare EVERYTHING first (split, the one par2 set,
+    /// per-disc docs, every image), then burn disc by disc behind swap
+    /// prompts. After Phase A each disc is exactly a burn-iso - that is also
+    /// the resume story: any failure mid-set lists one `ovenmitts burn-iso`
+    /// line per remaining disc, and no state file exists to go stale.
+    fn burn_set(&mut self, stage: &mut Stage, cx: &SetContext) -> Result<()> {
+        let ctx = self.ctx;
+        for line in span_table(cx.span) {
+            ctx.info(line);
+        }
+        let staging = self.staging(cx.params)?;
+        let set_dir = staging.dir.join("set");
+        std::fs::create_dir(&set_dir).with_context(|| format!("create {}", set_dir.display()))?;
+
+        // ---- Phase A: nothing burns until every disc's image exists
+        *stage = Stage::Split;
+        ctx.start(Stage::Split);
+        let source = &cx.payloads[0];
+        let parts: Vec<span::PartPlan> = cx
+            .span
+            .discs
+            .iter()
+            .filter_map(|d| d.part.clone())
+            .collect();
+        let set = {
+            let mut th = Throttle::default();
+            span::split(&source.root, &parts, &set_dir, &mut |done, total| {
+                emit_pct(ctx, Stage::Split, &mut th, done, total, "splitting source");
+            })?
+        };
+        self.done(
+            Stage::Split,
+            format!(
+                "{} parts of {} ({} per disc)",
+                parts.len(),
+                human_bytes(cx.span.source_bytes),
+                human_bytes(parts[0].bytes)
+            ),
+        );
+
+        *stage = Stage::Parity;
+        let (index_file, volume_files) = if cx.span.recovery_blocks > 0 {
+            ctx.start(Stage::Parity);
+            let produced = parity::create_set(
+                &ctx.tools,
+                cx.span,
+                &set_dir,
+                &staging.dir.join("parity"),
+                ctx.cfg.stall_timeout(),
+                &mut |pct, line| {
+                    let detail = if line.is_empty() {
+                        "par2 set".to_string()
+                    } else {
+                        line
+                    };
+                    ctx.progress(Stage::Parity, pct, detail);
+                },
+            )?;
+            let index = staging
+                .dir
+                .join("parity")
+                .join(format!("{}.par2", cx.span.source_name));
+            ensure!(produced.contains(&index), "par2 produced no index file");
+            let volumes: Vec<PathBuf> = produced.into_iter().filter(|p| *p != index).collect();
+            ensure!(!volumes.is_empty(), "par2 produced no recovery volumes");
+            self.done(
+                Stage::Parity,
+                format!(
+                    "{} recovery blocks in {} volume file(s) - rebuilds any ONE lost disc",
+                    cx.span.recovery_blocks,
+                    volumes.len()
+                ),
+            );
+            (Some(index), volumes)
+        } else {
+            ctx.warn("parity disabled - losing any ONE disc loses the payload".into());
+            (None, Vec::new())
+        };
+
+        *stage = Stage::Checksums;
+        ctx.start(Stage::Checksums);
+        // hours of parity ran since Split: re-read every part against its
+        // split-time hash before a single disc is committed
+        {
+            let total: u64 = parts.iter().map(|p| p.bytes).sum();
+            let mut base = 0u64;
+            let mut th = Throttle::default();
+            for ((sha, name), part) in set.part_shas.iter().zip(&parts) {
+                let path = set_dir.join(name);
+                let now = hashing::sha256_file(&path, &mut |done, _| {
+                    emit_pct(ctx, Stage::Checksums, &mut th, base + done, total, name);
+                })?;
+                ensure!(
+                    now == *sha,
+                    "staging corruption: {} no longer matches its split-time hash - re-run",
+                    path.display()
+                );
+                base += part.bytes;
+            }
+        }
+        let mut parity_shas: Vec<(String, String)> = Vec::new();
+        if let Some(index) = &index_file {
+            for f in std::iter::once(index).chain(volume_files.iter()) {
+                let sha = hashing::sha256_file(f, &mut |_, _| {})?;
+                parity_shas.push((sha, format!("parity/{}", master::file_name_of(f))));
+            }
+        }
+        let set_txt = staging.dir.join("SET.txt");
+        span::write_set_txt(
+            &set_txt,
+            cx.span,
+            &set,
+            &parity_shas,
+            cx.media.kind.label(),
+            chrono::Utc::now(),
+        )?;
+        let set_txt_sha = hashing::sha256_file(&set_txt, &mut |_, _| {})?;
+        self.done(
+            Stage::Checksums,
+            format!(
+                "{} parts cross-checked; SET.txt catalogs the {}-disc set",
+                parts.len(),
+                cx.span.discs.len()
+            ),
+        );
+
+        *stage = Stage::Master;
+        ctx.start(Stage::Master);
+        let total_discs = cx.span.discs.len() as u32;
+        let ecc_on = ctx.cfg.ecc && ctx.tools.dvdisaster.is_some();
+        let mut discs: Vec<SetDisc> = Vec::with_capacity(cx.span.discs.len());
+        for (i, disc) in cx.span.discs.iter().enumerate() {
+            // the remaining images are the big late allocations
+            let remaining = (cx.span.discs.len() - i) as u64;
+            ensure_staging_free(
+                &cx.params.staging,
+                cx.span.per_disc_iso_est * remaining,
+                &format!("{remaining} remaining set image(s)"),
+            )?;
+            let disc_dir = staging.dir.join(format!("disc{:02}", disc.index));
+            std::fs::create_dir(&disc_dir)
+                .with_context(|| format!("create {}", disc_dir.display()))?;
+            let note = span::SpanNote {
+                disc: disc.index,
+                of: total_discs,
+                role: disc.role,
+                source_name: cx.span.source_name.clone(),
+                source_bytes: cx.span.source_bytes,
+                source_sha256: set.whole_sha.clone(),
+                source_container: source.looks_like_container(),
+                recovery_blocks: cx.span.recovery_blocks,
+                block: cx.span.block,
+            };
+
+            let mut entries: Vec<(String, String)> = Vec::new();
+            let mut manifest_rows: Vec<master::ManifestEntry> = Vec::new();
+            let mut disc_payloads: Vec<Payload> = Vec::new();
+            let mut disc_parity: Vec<PathBuf> = Vec::new();
+            if let Some(part) = &disc.part {
+                let (sha, _) = set
+                    .part_shas
+                    .iter()
+                    .find(|(_, n)| *n == part.file_name)
+                    .expect("split produced every planned part")
+                    .clone();
+                entries.push((sha.clone(), part.file_name.clone()));
+                manifest_rows.push(master::ManifestEntry {
+                    name: part.file_name.clone(),
+                    bytes: part.bytes,
+                    files: 1,
+                    is_dir: false,
+                    sha256: Some(sha),
+                    par2: None,
+                });
+                disc_payloads.push(part_payload(&set_dir, part));
+                if let Some(index) = &index_file {
+                    disc_parity.push(index.clone());
+                }
+            } else if let Some(index) = &index_file {
+                disc_parity.push(index.clone());
+                disc_parity.extend(volume_files.iter().cloned());
+            }
+            for f in &disc_parity {
+                let rel = format!("parity/{}", master::file_name_of(f));
+                if let Some((sha, _)) = parity_shas.iter().find(|(_, r)| *r == rel) {
+                    entries.push((sha.clone(), rel));
+                }
+            }
+            entries.push((set_txt_sha.clone(), "SET.txt".to_string()));
+
+            let checksums_path = disc_dir.join("checksums.sha256");
+            hashing::write_checksums(&entries, &checksums_path)?;
+            let manifest_path = disc_dir.join("MANIFEST.txt");
+            let recovery_path = disc_dir.join("RECOVERY.txt");
+            master::write_manifest(
+                &manifest_path,
+                &disc.label,
+                &manifest_rows,
+                None,
+                cx.params.defect_management,
+                ecc_on,
+                Some(&note),
+            )?;
+            master::write_recovery(
+                &recovery_path,
+                &disc.label,
+                &disc_payloads,
+                ecc_on,
+                Some(&note),
+            )?;
+
+            let iso = staging.dir.join(format!("{}.iso", disc.label));
+            let input = master::MasterInput {
+                label: &disc.label,
+                payloads: &disc_payloads,
+                parity_files: &disc_parity,
+                checksums: &checksums_path,
+                manifest: &manifest_path,
+                recovery: &recovery_path,
+                set_txt: Some(&set_txt),
+                out_iso: &iso,
+            };
+            let base_pct = i as f32 * 100.0;
+            let n = cx.span.discs.len() as f32;
+            let disc_no = disc.index;
+            let mut iso_bytes = master::build_iso(
+                &ctx.tools,
+                &input,
+                ctx.cfg.stall_timeout(),
+                &mut |pct, line| {
+                    let overall = pct.map(|v| (base_pct + v) / n);
+                    ctx.progress(Stage::Master, overall, format!("disc {disc_no}: {line}"));
+                },
+            )?;
+            master::check_iso_truncation(&iso)?;
+            iso_bytes = self.ecc_augment(&iso, iso_bytes, cx.plan.budget, &cx.params.staging)?;
+            let lba_path = staging.dir.join(format!("{}.lba.txt", disc.label));
+            master::report_lba(&ctx.tools, &iso, &lba_path)?;
+            let iso_sha = hashing::sha256_file(&iso, &mut |_, _| {})?;
+            let iso_sha_path = staging.dir.join(format!("{}.iso.sha256", disc.label));
+            hashing::write_checksums(
+                &[(iso_sha.clone(), format!("{}.iso", disc.label))],
+                &iso_sha_path,
+            )?;
+            discs.push(SetDisc {
+                label: disc.label.clone(),
+                parity: disc.part.is_none(),
+                mastered: Mastered {
+                    iso,
+                    iso_bytes,
+                    iso_sha,
+                    manifest_path,
+                    recovery_path,
+                    lba_path,
+                    iso_sha_path,
+                },
+                entries,
+                checksums_path,
+            });
+        }
+        self.done(
+            Stage::Master,
+            format!("{} images mastered and self-checked", discs.len()),
+        );
+
+        // ---- Phase B: burn loop; each disc is now exactly a burn-iso
+        let total = discs.len() as u32;
+        for (i, d) in discs.iter().enumerate() {
+            let k = (i + 1) as u32;
+            ctx.send(StageEvent::DiscStart {
+                index: k,
+                total,
+                label: d.label.clone(),
+                parity: d.parity,
+            });
+            if i > 0 {
+                self.await_blank(
+                    cx,
+                    &discs[i - 1].label,
+                    &d.label,
+                    k,
+                    total,
+                    d.mastered.iso_bytes,
+                )?;
+            }
+            loop {
+                let mark = self.stages.len();
+                let res = (|| -> Result<()> {
+                    if cx.params.defect_management {
+                        *stage = Stage::Format;
+                        self.format(cx.device, d.mastered.iso_bytes)?;
+                    }
+                    *stage = Stage::Burn;
+                    self.burn(cx.device, cx.params.speed, &d.mastered)?;
+                    *stage = Stage::VerifyImage;
+                    self.ctx.start(Stage::VerifyImage);
+                    verify_image_stage(
+                        self.ctx,
+                        &mut self.stages,
+                        cx.device,
+                        d.mastered.iso_bytes,
+                        &d.mastered.iso_sha,
+                        true,
+                        &mut self.degradations,
+                    )?;
+                    *stage = Stage::VerifyFiles;
+                    verify_files_stage(
+                        self.ctx,
+                        &mut self.stages,
+                        cx.device,
+                        EntriesSource::InMemory(&d.entries),
+                    )?;
+                    Ok(())
+                })();
+                match res {
+                    Ok(()) => {
+                        for (_, s) in &mut self.stages[mark..] {
+                            *s = format!("disc {k}/{total}: {s}");
+                        }
+                        break;
+                    }
+                    Err(e) => {
+                        // partial stage rows from the failed attempt would
+                        // read as successes in the report
+                        self.stages.truncate(mark);
+                        ctx.warn(format!("disc {k}/{total} FAILED: {e:#}"));
+                        match ctx.ask_raw(&format!(
+                            "that disc is likely ruined - mark it BAD, do NOT label it {}. \
+                             insert a fresh blank and confirm to retry disc {k}/{total}, \
+                             or abort (completed discs stay valid)",
+                            d.label
+                        ))? {
+                            Ack::Proceed => {
+                                wait_ready(ctx, cx.device)?;
+                                continue;
+                            }
+                            _ => {
+                                let remaining: Vec<String> = discs[i..]
+                                    .iter()
+                                    .map(|r| {
+                                        format!("  ovenmitts burn-iso {}", r.mastered.iso.display())
+                                    })
+                                    .collect();
+                                bail!(
+                                    "set aborted at disc {k}/{total}; earlier discs stay \
+                                     valid - finish the set with:\n{}",
+                                    remaining.join("\n")
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            if (i + 1) < discs.len() {
+                match verify::eject(&ctx.tools, cx.device) {
+                    Ok(()) => ctx.info(format!(
+                        "ejected {} - label this disc {} now",
+                        cx.device, d.label
+                    )),
+                    Err(e) => ctx.warn(format!("could not eject {}: {e:#}", cx.device)),
+                }
+            } else {
+                eject_if_configured(ctx, cx.device, cx.req.amend);
+            }
+            if cx.req.discard_iso {
+                match std::fs::remove_file(&d.mastered.iso) {
+                    Ok(()) => ctx.info(format!(
+                        "discarded {} after successful verification",
+                        d.mastered.iso.display()
+                    )),
+                    Err(e) => ctx.warn(format!(
+                        "could not discard {}: {e:#} - remove it manually",
+                        d.mastered.iso.display()
+                    )),
+                }
+            }
+        }
+
+        // the parts live on verified discs now; the source file is untouched
+        // and SET.txt records every offset needed to re-cut a part
+        match std::fs::remove_dir_all(&set_dir) {
+            Ok(()) => ctx.info(format!(
+                "removed {} - parts are on the discs; SET.txt records their offsets",
+                set_dir.display()
+            )),
+            Err(e) => ctx.warn(format!("could not remove {}: {e:#}", set_dir.display())),
+        }
+        let keep_iso = !cx.req.discard_iso;
+        let mut reminders = Vec::new();
+        if keep_iso {
+            reminders.push(format!(
+                "second copy of the set: insert fresh discs and burn each image again:{}",
+                discs
+                    .iter()
+                    .map(|d| format!("\n  ovenmitts burn-iso {}", d.mastered.iso.display()))
+                    .collect::<String>()
+            ));
+        }
+        reminders.push(format!(
+            "keep {} off-disc: the recovery volumes, SET.txt, lba maps and checksums \
+             are what rebuild a lost disc",
+            staging.dir.display()
+        ));
+        if source.looks_like_container() {
+            reminders.push(
+                "VeraCrypt: keep an EXTERNAL volume-header backup (Tools > Backup Volume Header); \
+                 create a fresh container per archive generation"
+                    .into(),
+            );
+        }
+        let mut written_files = Vec::new();
+        if staging.run_log.is_file() {
+            written_files.push(staging.run_log.clone());
+        }
+        if let Some(index) = &index_file {
+            written_files.push(index.clone());
+        }
+        written_files.extend(volume_files.iter().cloned());
+        written_files.push(set_txt.clone());
+        for d in &discs {
+            written_files.push(d.checksums_path.clone());
+            written_files.push(d.mastered.manifest_path.clone());
+            written_files.push(d.mastered.recovery_path.clone());
+            if keep_iso {
+                written_files.push(d.mastered.iso.clone());
+            }
+            written_files.push(d.mastered.lba_path.clone());
+            written_files.push(d.mastered.iso_sha_path.clone());
+            let burn_log = burn::burn_log_path(&d.mastered.iso);
+            if burn_log.is_file() {
+                written_files.push(burn_log);
+            }
+        }
+        let report_path = staging.dir.join(format!("{}.report.txt", staging.label));
+        written_files.push(report_path.clone());
+        let report = RunReport {
+            iso_path: None,
+            iso_sha256: None,
+            iso_bytes: 0,
+            stages: std::mem::take(&mut self.stages),
+            reminders,
+            written_files,
+            degradations: std::mem::take(&mut self.degradations),
+        };
+        send_finished(ctx, report, &report_path);
+        Ok(())
+    }
+
+    /// Swap gate: block until the operator loads a blank of the right kind
+    /// with room for the next image. Wrong discs warn and re-prompt.
+    fn await_blank(
+        &self,
+        cx: &SetContext,
+        prev_label: &str,
+        label: &str,
+        k: u32,
+        total: u32,
+        iso_bytes: u64,
+    ) -> Result<()> {
+        let ctx = self.ctx;
+        loop {
+            ctx.ask(&format!(
+                "disc {}/{total} verified - LABEL IT NOW: {prev_label}. insert a blank {} \
+                 for disc {k}/{total} ({label}), close the tray, then confirm",
+                k - 1,
+                cx.media.kind.label(),
+            ))?;
+            wait_ready(ctx, cx.device)?;
+            match media::probe(&ctx.tools, cx.device) {
+                Ok(m) if m.blank && m.kind == cx.media.kind && m.free_bytes >= iso_bytes => {
+                    return Ok(())
+                }
+                Ok(m) => ctx.warn(format!(
+                    "wrong disc: {} ({}, {} free) - need a blank {} with at least {}",
+                    m.kind.label(),
+                    if m.blank { "blank" } else { "written" },
+                    human_bytes(m.free_bytes),
+                    cx.media.kind.label(),
+                    human_bytes(iso_bytes)
+                )),
+                Err(e) => ctx.warn(format!("cannot probe {}: {e:#}", cx.device)),
+            }
+        }
+    }
+}
+
+/// Everything a set burn needs from the confirm phase.
+struct SetContext<'a> {
+    req: &'a BurnRequest,
+    params: &'a BurnParams,
+    plan: &'a ArchivePlan,
+    span: &'a span::SpanPlan,
+    device: &'a str,
+    media: &'a MediaInfo,
+    payloads: &'a [Payload],
+}
+
+/// One disc of a prepared set: exactly a burn-iso plus its on-disc entries.
+struct SetDisc {
+    label: String,
+    parity: bool,
+    mastered: Mastered,
+    entries: Vec<(String, String)>,
+    checksums_path: PathBuf,
+}
+
+fn part_payload(set_dir: &Path, part: &span::PartPlan) -> Payload {
+    Payload {
+        root: set_dir.join(&part.file_name),
+        is_dir: false,
+        files: vec![plan::PayloadMember {
+            abs: set_dir.join(&part.file_name),
+            rel: part.file_name.clone(),
+            size: part.bytes,
+            container: false,
+        }],
+        dirs: 0,
+        total_size: part.bytes,
+        name: part.file_name.clone(),
+    }
+}
+
+/// One Info line per disc plus a set summary - the plan the operator says
+/// yes to, in line mode and the run log alike.
+fn span_table(span: &span::SpanPlan) -> Vec<String> {
+    let total = span.discs.len();
+    let data = span.discs.iter().filter(|d| d.part.is_some()).count();
+    let mut rows = Vec::with_capacity(total + 1);
+    rows.push(format!(
+        "set: {total} discs = {data} data + {} parity; par2 block {} bytes, {} recovery \
+         blocks; staging peak ~{}",
+        total - data,
+        span.block,
+        span.recovery_blocks,
+        human_bytes(span.staging_peak)
+    ));
+    for d in &span.discs {
+        rows.push(match &d.part {
+            Some(p) => format!(
+                "  disc {}/{total}  {}  {} ({}, offset {})",
+                d.index,
+                d.label,
+                p.file_name,
+                human_bytes(p.bytes),
+                p.offset
+            ),
+            None => format!(
+                "  disc {}/{total}  {}  par2 recovery volumes",
+                d.index, d.label
+            ),
+        });
+    }
+    rows
 }
 
 /// Write the report file and emit Finished. The disc is already verified at
@@ -1374,9 +2009,27 @@ pub fn run_plan(
             defect_management: ctx.cfg.defect_management,
             staging: ctx.cfg.staging.clone(),
         };
-        let plan = plan::build_plan(&params.plan_input(&payloads, ctx.cfg.headroom_pct), &media);
+        let mut plan =
+            plan::build_plan(&params.plan_input(&payloads, ctx.cfg.headroom_pct), &media);
+        if !plan.fits {
+            let ecc = ctx.cfg.ecc && ctx.tools.dvdisaster.is_some();
+            plan.span = span::plan_span(
+                &payloads,
+                &params.label,
+                plan.budget,
+                plan.overhead_bytes_est,
+                params.parity,
+                ecc,
+            )?
+            .map(Box::new);
+        }
         for w in &plan.warnings {
             ctx.warn(w.clone());
+        }
+        if let Some(span) = &plan.span {
+            for line in span_table(span) {
+                ctx.info(line);
+            }
         }
         ctx.send(StageEvent::Plan {
             device,
@@ -1559,9 +2212,14 @@ fn confirm_gate(ctx: &RunnerCtx, plan: &ArchivePlan, staging: &Path) -> Result<(
 }
 
 fn ensure_fits(plan: &ArchivePlan, headroom_pct: u32) -> Result<()> {
+    if plan.span.is_some() {
+        return Ok(());
+    }
     ensure!(
         plan.fits,
-        "does not fit: total {} ({} bytes) exceeds budget {} ({} bytes; {}% headroom off {} capacity)",
+        "does not fit: total {} ({} bytes) exceeds budget {} ({} bytes; {}% headroom off {} \
+         capacity) - multi-disc sets take a single file payload; tar a directory first or \
+         burn payloads separately",
         human_bytes(plan.total_bytes_est),
         plan.total_bytes_est,
         human_bytes(plan.budget),
@@ -1648,6 +2306,17 @@ fn dir_size(dir: &Path) -> u64 {
 
 // payloads stay in place; staging holds parity + the ISO (which contains both)
 fn check_staging_space(plan: &ArchivePlan, staging: &Path) -> Result<()> {
+    if let Some(span) = &plan.span {
+        return ensure_staging_free(
+            staging,
+            span.staging_peak,
+            &format!(
+                "multi-disc set peak: source parts {} + recovery volumes + {} images",
+                human_bytes(span.source_bytes),
+                span.discs.len()
+            ),
+        );
+    }
     ensure_staging_free(
         staging,
         confirm_space_needed(plan),
@@ -2659,24 +3328,30 @@ mod tests {
         );
     }
 
-    fn oversized_setup(dir: &Path) -> (PathBuf, PathBuf) {
-        let payload = dir.join("big.hc");
-        let f = std::fs::File::create(&payload).unwrap();
-        f.set_len(30 * 1024 * 1024 * 1024).unwrap();
+    // TWO oversized payloads: a single big file would legitimately span a
+    // multi-disc set now, so the does-not-fit bail needs a non-spannable mix.
+    fn oversized_setup(dir: &Path) -> (Vec<PathBuf>, PathBuf) {
+        let mut payloads = Vec::new();
+        for name in ["big.hc", "big2.hc"] {
+            let payload = dir.join(name);
+            let f = std::fs::File::create(&payload).unwrap();
+            f.set_len(30 * 1024 * 1024 * 1024).unwrap();
+            payloads.push(payload);
+        }
         let device = dir.join("device");
-        (payload, device)
+        (payloads, device)
     }
 
     #[test]
     fn burn_bails_with_numbers_on_proceed_when_plan_does_not_fit() {
         let dir = tempfile::tempdir().unwrap();
-        let (payload, device) = oversized_setup(dir.path());
+        let (payloads, device) = oversized_setup(dir.path());
         let xorriso = fake_xorriso(dir.path(), &device, CHECK_CLEAN_FIXTURE);
         let tools = tools_with(xorriso, None, None, None);
         let (ctx, rx, ack_tx) = ctx_pair(cfg_with(&device, &dir.path().join("staging")), tools);
         ack_tx.send(Ack::Proceed).unwrap();
         let req = BurnRequest {
-            payloads: vec![payload],
+            payloads,
             label: None,
             parity: true,
             dry_run: false,
@@ -2710,14 +3385,14 @@ mod tests {
     #[test]
     fn cli_burn_without_amend_bails_before_prompt_when_not_fitting() {
         let dir = tempfile::tempdir().unwrap();
-        let (payload, device) = oversized_setup(dir.path());
+        let (payloads, device) = oversized_setup(dir.path());
         let xorriso = fake_xorriso(dir.path(), &device, CHECK_CLEAN_FIXTURE);
         let tools = tools_with(xorriso, None, None, None);
         let (ctx, rx, ack_tx) = ctx_pair(cfg_with(&device, &dir.path().join("staging")), tools);
         // a wrongly-emitted NeedAck must fail as "ui channel closed", not hang
         drop(ack_tx);
         let req = BurnRequest {
-            payloads: vec![payload],
+            payloads,
             label: None,
             parity: true,
             dry_run: false,
