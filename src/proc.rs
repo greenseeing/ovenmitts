@@ -124,15 +124,16 @@ impl Reaper {
         }
         unsafe { libc::kill(self.pid, libc::SIGTERM) };
         for _ in 0..200 {
-            if matches!(self.child.try_wait(), Ok(Some(_))) {
-                self.finish();
+            if matches!(self.reap_if_exited(), Ok(Some(_))) {
                 return;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
         unsafe { libc::kill(self.pid, libc::SIGKILL) };
+        // SIGKILL cannot be ignored: deregister-then-wait keeps the invariant.
+        deregister(self.pid);
+        self.reaped = true;
         let _ = self.child.wait();
-        self.finish();
     }
 
     pub(crate) fn wait(&mut self) -> Result<std::process::ExitStatus> {
@@ -142,9 +143,34 @@ impl Reaper {
         self.child.wait().context("wait for child")
     }
 
-    fn finish(&mut self) {
+    /// Nonblocking exit check that keeps the deregister-before-reap invariant:
+    /// a WNOWAIT peek leaves the child a zombie (its PID cannot be recycled),
+    /// so the PID is deregistered before the actual reap ever frees it. A
+    /// plain try_wait would reap first and leave a recyclable PID registered
+    /// for a moment - the exact window wait() documents as closed.
+    pub(crate) fn reap_if_exited(&mut self) -> Result<Option<std::process::ExitStatus>> {
+        if self.reaped {
+            bail!("child already reaped");
+        }
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                self.pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error()).context("waitid");
+        }
+        // WNOHANG with no state change leaves si_pid untouched (zeroed).
+        if unsafe { info.si_pid() } == 0 {
+            return Ok(None);
+        }
         deregister(self.pid);
         self.reaped = true;
+        self.child.wait().map(Some).context("wait for child")
     }
 }
 
@@ -169,10 +195,8 @@ pub(crate) fn output_deadline(bin: &Path, args: &[String], deadline: Duration) -
 
     let start = Instant::now();
     loop {
-        match reaper.child.try_wait() {
+        match reaper.reap_if_exited() {
             Ok(Some(status)) => {
-                reaper.reaped = true;
-                deregister(reaper.pid);
                 let stdout = out_h.join().unwrap_or_default();
                 let stderr = err_h.join().unwrap_or_default();
                 return Ok(Output {

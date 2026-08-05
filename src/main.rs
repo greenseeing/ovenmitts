@@ -217,14 +217,7 @@ where
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 if ovenmitts::shutdown::stopping(&stop) {
                     line.close();
-                    eprintln!(
-                        "\nsignal received - terminating running tools; the disc in the \
-                         drive may be partially written and must not be trusted without \
-                         a verify run"
-                    );
-                    ovenmitts::shutdown::escalate(|| worker.is_finished(), &ack_tx);
-                    let _ = worker.join();
-                    return Err(anyhow::anyhow!("interrupted by signal").context(AlreadyReported));
+                    return Err(interrupted(worker, &ack_tx));
                 }
                 continue;
             }
@@ -271,17 +264,35 @@ where
                 line.close();
                 print!("{prompt} [Y/n] ");
                 let _ = std::io::stdout().flush();
-                let mut answer = String::new();
-                // EOF (closed/redirected stdin) must NOT read as consent —
-                // an unattended burn needs an explicit --yes
-                let ack = match std::io::stdin().lock().read_line(&mut answer) {
-                    Ok(0) | Err(_) => {
-                        eprintln!(
-                            "warning: no interactive stdin — aborting (use --yes for unattended runs)"
-                        );
-                        Ack::Abort
+                // The answer is read on its own thread: a blocking stdin read
+                // here would stop the signal polling (SA_RESTART restarts the
+                // read), so a SIGTERM at a prompt would hang forever.
+                let (answer_tx, answer_rx) = mpsc::channel();
+                std::thread::spawn(move || {
+                    let mut answer = String::new();
+                    // EOF (closed/redirected stdin) must NOT read as consent —
+                    // an unattended burn needs an explicit --yes
+                    let read = std::io::stdin().lock().read_line(&mut answer);
+                    let _ = answer_tx.send(match read {
+                        Ok(0) | Err(_) => None,
+                        Ok(_) => Some(answer),
+                    });
+                });
+                let ack = loop {
+                    match answer_rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                        Ok(Some(answer)) => break ack_from(&answer),
+                        Ok(None) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            eprintln!(
+                                "warning: no interactive stdin — aborting (use --yes for unattended runs)"
+                            );
+                            break Ack::Abort;
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            if ovenmitts::shutdown::stopping(&stop) {
+                                return Err(interrupted(worker, &ack_tx));
+                            }
+                        }
                     }
-                    Ok(_) => ack_from(&answer),
                 };
                 let _ = ack_tx.send(ack);
             }
@@ -301,6 +312,23 @@ where
         Ok(res) => res,
         Err(_) => anyhow::bail!("pipeline thread panicked"),
     }
+}
+
+/// Shared signal exit: announce, terminate running tools, join the worker,
+/// and produce the (already-reported) error. Consumes the worker handle —
+/// callers return immediately.
+fn interrupted(
+    worker: std::thread::JoinHandle<anyhow::Result<()>>,
+    ack_tx: &mpsc::Sender<Ack>,
+) -> anyhow::Error {
+    eprintln!(
+        "\nsignal received - terminating running tools; the disc in the \
+         drive may be partially written and must not be trusted without \
+         a verify run"
+    );
+    ovenmitts::shutdown::escalate(|| worker.is_finished(), ack_tx);
+    let _ = worker.join();
+    anyhow::anyhow!("interrupted by signal").context(AlreadyReported)
 }
 
 fn ack_from(answer: &str) -> Ack {

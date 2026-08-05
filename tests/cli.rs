@@ -117,6 +117,92 @@ fn no_tui_without_payloads_bails_with_nothing_to_do() {
     assert!(stderr.contains("nothing to do"), "stderr:\n{stderr}");
 }
 
+// A signal while parked at the [Y/n] confirm prompt must abort cleanly.
+// Regression test: the prompt used to block the signal-polling thread on a
+// raw stdin read (SA_RESTART), so SIGTERM at a prompt hung ovenmitts forever.
+#[test]
+fn sigterm_at_confirm_prompt_aborts_instead_of_hanging() {
+    use std::io::Read as _;
+    use std::time::{Duration, Instant};
+
+    let dir = tempfile::tempdir().unwrap();
+    let payload = dir.path().join("vault.hc");
+    std::fs::write(&payload, vec![7u8; 1024 * 1024]).unwrap();
+    let device = dir.path().join("fake-device");
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let old = std::env::var_os("PATH").unwrap_or_default();
+    let mut parts = vec![fakebin()];
+    parts.extend(std::env::split_paths(&old));
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ovenmitts"))
+        .args([
+            "--no-tui",
+            "--device",
+            device.to_str().unwrap(),
+            payload.to_str().unwrap(),
+        ])
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_DATA_HOME", home.join(".local").join("share"))
+        .env("PATH", std::env::join_paths(parts).unwrap())
+        .env("OVENMITTS_FAKE_DEVICE", &device)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // held open, never written: an attended-but-idle terminal, not an EOF
+    let stdin = child.stdin.take().unwrap();
+
+    let mut stdout = child.stdout.take().unwrap();
+    let (prompt_tx, prompt_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        let mut buf = [0u8; 256];
+        loop {
+            match stdout.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    seen.extend_from_slice(&buf[..n]);
+                    if String::from_utf8_lossy(&seen).contains("[Y/n]") {
+                        let _ = prompt_tx.send(());
+                        // keep draining so the child never blocks on the pipe
+                        while matches!(stdout.read(&mut buf), Ok(n) if n > 0) {}
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    prompt_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("confirm prompt never appeared");
+
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!("ovenmitts hung at the confirm prompt after SIGTERM");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(!status.success(), "signal exit must be nonzero");
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(stderr.contains("signal received"), "stderr:\n{stderr}");
+    drop(stdin);
+}
+
 #[test]
 fn config_error_prints_top_level_error_line() {
     let dir = tempfile::tempdir().unwrap();
