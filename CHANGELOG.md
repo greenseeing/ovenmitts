@@ -90,9 +90,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now run the same graceful sequence the TUI already used for Ctrl-C — abort the
   runner, SIGTERM the tools, wait, then SIGKILL — and report that the disc may
   be partially written. A main-thread panic also terminates running tools now,
-  and a TUI draw error mid-burn no longer orphans the tool. A second signal
-  restores the default disposition (hard exit) in case the graceful
-  escalation itself wedges.
+  and a TUI draw error mid-burn no longer orphans the tool. Once the graceful
+  escalation has begun, a further signal restores the default disposition
+  (hard exit) in case the escalation itself wedges — but an impatient double
+  Ctrl-C before it starts stays harmless.
 - **Tools are never orphaned on error or panic.** Every external process is now
   owned by a guard that kills and reaps it on any early return or unwind, so a
   burning xorriso can't be left running when ovenmitts exits abnormally. The

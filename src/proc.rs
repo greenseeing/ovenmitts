@@ -143,10 +143,19 @@ impl Reaper {
             std::thread::sleep(Duration::from_millis(10));
         }
         unsafe { libc::kill(-self.pid, libc::SIGKILL) };
-        // SIGKILL cannot be ignored: deregister-then-wait keeps the invariant.
+        // SIGKILL cannot be ignored - but a child stuck in uninterruptible
+        // sleep (D-state, a genuinely hung drive) cannot die until the I/O
+        // returns, and blocking here forever would hang the very shutdown
+        // paths this watchdog protects. Poll briefly, then abandon the child
+        // as an unreapable zombie; nothing in userspace can free it.
+        for _ in 0..250 {
+            if matches!(self.reap_if_exited(), Ok(Some(_))) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
         deregister(self.pid);
         self.reaped = true;
-        let _ = self.child.wait();
     }
 
     pub(crate) fn wait(&mut self) -> Result<std::process::ExitStatus> {

@@ -15,12 +15,18 @@ const SECTOR: u64 = 2048;
 /// Below this ECC share of the image, augmentation is not worth a layer
 /// (dvdisaster's own presets start well above; a sliver protects nothing).
 const MIN_MARGIN_PCT: u64 = 5;
+/// Staging space the augmentation must leave untouched (reports, logs).
+const STAGING_RESERVE: u64 = 16 * 1024 * 1024;
 
-/// Pure: the augmentation target in sectors, or None when the budget leaves
-/// less than MIN_MARGIN_PCT of the image for ECC.
-pub fn augment_target(iso_bytes: u64, budget_bytes: u64) -> Option<u64> {
-    let target_sectors = budget_bytes / SECTOR;
+/// Pure: the augmentation target in sectors - the disc budget, capped by
+/// what the staging filesystem can actually absorb (the image grows in
+/// staging; a small disc payload on a 100 GB medium must not ENOSPC the
+/// staging disk). None when the affordable margin is under MIN_MARGIN_PCT
+/// of the image.
+pub fn augment_target(iso_bytes: u64, budget_bytes: u64, staging_free: u64) -> Option<u64> {
     let iso_sectors = iso_bytes.div_ceil(SECTOR);
+    let affordable = iso_sectors + staging_free.saturating_sub(STAGING_RESERVE) / SECTOR;
+    let target_sectors = (budget_bytes / SECTOR).min(affordable);
     let margin = target_sectors.saturating_sub(iso_sectors);
     (margin * 100 >= iso_sectors * MIN_MARGIN_PCT && margin > 0).then_some(target_sectors)
 }
@@ -79,19 +85,42 @@ mod tests {
         );
     }
 
+    const ROOMY: u64 = 1 << 40; // staging with a TiB free
+
     #[test]
     fn target_fills_the_budget_or_declines_slivers() {
         // 8 MiB image, 25 GB budget: plenty of margin, target = budget floor
         let budget = 23_774_035_968u64; // BD-R 25 budget after 5% headroom
-        assert_eq!(augment_target(8 * 1024 * 1024, budget), Some(budget / 2048));
+        assert_eq!(
+            augment_target(8 * 1024 * 1024, budget, ROOMY),
+            Some(budget / 2048)
+        );
         // image already fills the budget: no room for a layer
-        assert_eq!(augment_target(budget, budget), None);
+        assert_eq!(augment_target(budget, budget, ROOMY), None);
         // margin under 5% of the image: a sliver protects nothing
         let iso = 20_000_000 * 2048u64;
         let budget = (20_000_000 + 500_000) * 2048u64; // 2.5% margin
-        assert_eq!(augment_target(iso, budget), None);
+        assert_eq!(augment_target(iso, budget, ROOMY), None);
         let budget = (20_000_000 + 1_500_000) * 2048u64; // 7.5% margin
-        assert_eq!(augment_target(iso, budget), Some(21_500_000));
+        assert_eq!(augment_target(iso, budget, ROOMY), Some(21_500_000));
+    }
+
+    #[test]
+    fn target_never_outgrows_the_staging_filesystem() {
+        // 2 GiB image, 100 GB disc budget, but staging has only 10 GiB free:
+        // the image grows in staging, so the target caps at what fits there
+        let iso = 2u64 << 30;
+        let budget = 95u64 << 30;
+        let staging_free = 10u64 << 30;
+        let target = augment_target(iso, budget, staging_free).unwrap();
+        let growth = target * 2048 - iso;
+        assert!(
+            growth <= staging_free,
+            "growth {growth} > free {staging_free}"
+        );
+        assert!(target < budget / 2048, "budget target must be capped");
+        // staging too tight for a meaningful layer: skip, never ENOSPC
+        assert_eq!(augment_target(iso, budget, 32 * 1024 * 1024), None);
     }
 
     #[test]

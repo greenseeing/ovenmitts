@@ -410,7 +410,7 @@ pub fn check_iso_truncation(iso: &Path) -> Result<()> {
 /// little-endian halves at offsets 80 and 128 suffice on every platform).
 fn pvd_declared_bytes(pvd: &[u8; 2048]) -> Result<u64> {
     ensure!(
-        pvd[0] == 1 && &pvd[1..6] == b"CD001",
+        pvd[0] == 1 && &pvd[1..6] == b"CD001" && pvd[6] == 1,
         "no ISO 9660 Primary Volume Descriptor at sector 16"
     );
     let blocks = u32::from_le_bytes(pvd[80..84].try_into().unwrap()) as u64;

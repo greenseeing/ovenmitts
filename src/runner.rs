@@ -747,7 +747,8 @@ impl<'a> BurnRun<'a> {
         // a truncated master (torn write, full disk) must die here, not on a disc
         master::check_iso_truncation(&iso)?;
         if let Some(dvdisaster) = ctx.tools.dvdisaster.as_ref().filter(|_| ctx.cfg.ecc) {
-            match ecc::augment_target(iso_bytes, plan.budget) {
+            match ecc::augment_target(iso_bytes, plan.budget, staging_free_bytes(&params.staging)?)
+            {
                 Some(target) => {
                     ctx.info(format!(
                         "embedding RS02 sector ECC (dvdisaster): filling the image to \
@@ -773,8 +774,8 @@ impl<'a> BurnRun<'a> {
                     ));
                 }
                 None => ctx.warn(
-                    "not enough free disc space for a meaningful RS02 ECC layer \
-                     (needs >=5% of the image) - skipped"
+                    "not enough free disc or staging space for a meaningful RS02 \
+                     ECC layer (needs >=5% of the image) - skipped"
                         .into(),
                 ),
             }
