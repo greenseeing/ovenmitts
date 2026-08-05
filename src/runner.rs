@@ -350,130 +350,254 @@ pub fn run_burn(ctx: &RunnerCtx, req: &BurnRequest) -> Result<()> {
     with_failure(ctx, |stage| burn_pipeline(ctx, req, stage))
 }
 
+// The sequencer: each stage is a BurnRun method (or a shared *_stage helper
+// also used by verify/burn-iso); this function only orders them and keeps the
+// failure-attribution pointer current.
 fn burn_pipeline(ctx: &RunnerCtx, req: &BurnRequest, stage: &mut Stage) -> Result<()> {
-    let mut stages: Vec<(Stage, String)> = Vec::new();
-    let mut degradations: Vec<String> = Vec::new();
-
     *stage = Stage::Preflight;
     ctx.start(Stage::Preflight);
     let (payloads, device, media) = preflight_probe(ctx, &req.payloads)?;
-    let mut params = BurnParams::resolve(&ctx.cfg, req);
-    let mut prev_warnings: Vec<String> = Vec::new();
-    let mut prev_staging_warn: Option<String> = None;
-    let mut staging_note_pending = true;
-    // Confirm loop: the plan on screen is always one this loop computed for the
-    // params it holds; Amend re-plans (pure — media stays probed once).
-    let (params, plan) = loop {
-        let plan = plan::build_plan(&params.plan_input(&payloads, ctx.cfg.headroom_pct), &media);
-        if staging_note_pending {
-            staging_note_pending = false;
-            let needed = plan.parity_bytes_est + plan.total_bytes_est;
-            if let Some(note) = stale_staging_note(&params.staging, needed) {
-                ctx.info(note);
-            }
-        }
-        for w in plan.warnings.iter().filter(|w| !prev_warnings.contains(w)) {
-            ctx.warn(w.clone());
-        }
-        prev_warnings.clone_from(&plan.warnings);
-        ctx.send(StageEvent::Plan {
-            device: device.clone(),
-            media: media.clone(),
-            plan: plan.clone(),
-            params: params.clone(),
-        });
+    let mut run = BurnRun::new(ctx);
+    let Some((params, plan)) = run.confirm(req, &payloads, &device, &media)? else {
+        return Ok(()); // dry run: plan rendered, Finished already sent
+    };
+    let staging = run.staging(&params)?;
 
-        if req.dry_run {
-            confirm_gate(ctx, &plan, &params.staging)?;
-            ctx.info("dry run - stopping after plan".into());
-            ctx.send(StageEvent::Finished {
-                report: RunReport::default(),
+    *stage = Stage::Parity;
+    let parity_files = run.parity(&payloads, &params, &staging)?;
+
+    *stage = Stage::Checksums;
+    let sums = run.checksums(&payloads, &parity_files, &params, &staging)?;
+
+    *stage = Stage::Master;
+    let mastered = run.master(&plan, &params, &staging, &payloads, &parity_files, &sums)?;
+
+    if params.defect_management {
+        *stage = Stage::Format;
+        run.format(&device, mastered.iso_bytes)?;
+    }
+
+    *stage = Stage::Burn;
+    run.burn(&device, params.speed, &mastered)?;
+
+    *stage = Stage::VerifyImage;
+    ctx.start(Stage::VerifyImage);
+    // The burn command carried -eject and readback waits for the reloaded
+    // medium, so a physical reload always defeated the cache here.
+    verify_image_stage(
+        ctx,
+        &mut run.stages,
+        &device,
+        mastered.iso_bytes,
+        &mastered.iso_sha,
+        true,
+        &mut run.degradations,
+    )?;
+
+    *stage = Stage::VerifyFiles;
+    verify_files_stage(
+        ctx,
+        &mut run.stages,
+        &device,
+        EntriesSource::InMemory(&sums.entries),
+    )?;
+
+    // req.amend is only ever set by the TUI, so it doubles as "an operator is
+    // present to take the disc"; unattended runs must not leave the tray open
+    eject_if_configured(ctx, &device, req.amend);
+    run.finish(req, &payloads, staging, parity_files, sums, mastered)
+}
+
+/// Staging directory for one burn: unique label, created tree, run-log tee.
+struct StagingDir {
+    label: String,
+    dir: PathBuf,
+    run_log: PathBuf,
+}
+
+/// Checksums stage output: sha256 entries in disc layout plus the manifest
+/// rows derived while hashing.
+struct ChecksumsOut {
+    entries: Vec<(String, String)>,
+    manifest_rows: Vec<master::ManifestEntry>,
+    path: PathBuf,
+}
+
+/// Everything the master stage leaves in staging.
+struct Mastered {
+    iso: PathBuf,
+    iso_bytes: u64,
+    iso_sha: String,
+    manifest_path: PathBuf,
+    recovery_path: PathBuf,
+    lba_path: PathBuf,
+    iso_sha_path: PathBuf,
+}
+
+/// One full-pipeline burn: accumulates the stage summaries and degradations
+/// the final report carries.
+struct BurnRun<'a> {
+    ctx: &'a RunnerCtx,
+    stages: Vec<(Stage, String)>,
+    degradations: Vec<String>,
+}
+
+impl<'a> BurnRun<'a> {
+    fn new(ctx: &'a RunnerCtx) -> Self {
+        Self {
+            ctx,
+            stages: Vec::new(),
+            degradations: Vec::new(),
+        }
+    }
+
+    fn done(&mut self, stage: Stage, summary: String) {
+        self.ctx.done(&mut self.stages, stage, summary);
+    }
+
+    /// Confirm loop: the plan on screen is always one this loop computed for
+    /// the params it holds; Amend re-plans (pure — media stays probed once).
+    /// Ok(None) = dry run (plan shown, Finished sent).
+    fn confirm(
+        &mut self,
+        req: &BurnRequest,
+        payloads: &[Payload],
+        device: &str,
+        media: &MediaInfo,
+    ) -> Result<Option<(BurnParams, ArchivePlan)>> {
+        let ctx = self.ctx;
+        let mut params = BurnParams::resolve(&ctx.cfg, req);
+        let mut prev_warnings: Vec<String> = Vec::new();
+        let mut prev_staging_warn: Option<String> = None;
+        let mut staging_note_pending = true;
+        let (params, plan) = loop {
+            let plan = plan::build_plan(&params.plan_input(payloads, ctx.cfg.headroom_pct), media);
+            if staging_note_pending {
+                staging_note_pending = false;
+                let needed = plan.parity_bytes_est + plan.total_bytes_est;
+                if let Some(note) = stale_staging_note(&params.staging, needed) {
+                    ctx.info(note);
+                }
+            }
+            for w in plan.warnings.iter().filter(|w| !prev_warnings.contains(w)) {
+                ctx.warn(w.clone());
+            }
+            prev_warnings.clone_from(&plan.warnings);
+            ctx.send(StageEvent::Plan {
+                device: device.to_string(),
+                media: media.clone(),
+                plan: plan.clone(),
+                params: params.clone(),
             });
-            return Ok(());
-        }
-        if req.assume_yes {
-            confirm_gate(ctx, &plan, &params.staging)?;
-            break (params, plan);
-        }
-        if !req.amend {
-            confirm_gate(ctx, &plan, &params.staging)?;
-        } else if let Err(e) = check_staging_space(&plan, &params.staging) {
-            // surfaced pre-confirm: lowering redundancy shrinks the need
-            let msg = format!("{e:#}");
-            if prev_staging_warn.as_deref() != Some(msg.as_str()) {
-                ctx.warn(msg.clone());
-                prev_staging_warn = Some(msg);
-            }
-        }
 
-        let prompt = if plan.fits {
-            format!(
-                "burn {} to {} ({})?",
-                human_bytes(plan.total_bytes_est),
-                device,
-                media.kind.label()
-            )
-        } else {
-            format!(
-                "does not fit: total {} exceeds budget {} — adjust parameters or abort",
-                human_bytes(plan.total_bytes_est),
-                human_bytes(plan.budget)
-            )
-        };
-        match ctx.ask_raw(&prompt)? {
-            Ack::Proceed => {
+            if req.dry_run {
+                confirm_gate(ctx, &plan, &params.staging)?;
+                ctx.info("dry run - stopping after plan".into());
+                ctx.send(StageEvent::Finished {
+                    report: RunReport::default(),
+                });
+                return Ok(None);
+            }
+            if req.assume_yes {
                 confirm_gate(ctx, &plan, &params.staging)?;
                 break (params, plan);
             }
-            Ack::Abort => anyhow::bail!("aborted by user"),
-            Ack::Amend(p) => {
-                let (p, warns) = p.canonicalize();
-                for w in warns {
-                    ctx.warn(w);
+            if !req.amend {
+                confirm_gate(ctx, &plan, &params.staging)?;
+            } else if let Err(e) = check_staging_space(&plan, &params.staging) {
+                // surfaced pre-confirm: lowering redundancy shrinks the need
+                let msg = format!("{e:#}");
+                if prev_staging_warn.as_deref() != Some(msg.as_str()) {
+                    ctx.warn(msg.clone());
+                    prev_staging_warn = Some(msg);
                 }
-                if let Some(s) = p.speed {
-                    if !media.speeds.is_empty()
-                        && !media.speeds.iter().any(|x| x.round() as u32 == s)
-                    {
-                        ctx.warn(format!("{s}x is not in the probed write speeds"));
-                    }
-                }
-                params = p;
             }
+
+            let prompt = if plan.fits {
+                format!(
+                    "burn {} to {} ({})?",
+                    human_bytes(plan.total_bytes_est),
+                    device,
+                    media.kind.label()
+                )
+            } else {
+                format!(
+                    "does not fit: total {} exceeds budget {} — adjust parameters or abort",
+                    human_bytes(plan.total_bytes_est),
+                    human_bytes(plan.budget)
+                )
+            };
+            match ctx.ask_raw(&prompt)? {
+                Ack::Proceed => {
+                    confirm_gate(ctx, &plan, &params.staging)?;
+                    break (params, plan);
+                }
+                Ack::Abort => anyhow::bail!("aborted by user"),
+                Ack::Amend(p) => {
+                    let (p, warns) = p.canonicalize();
+                    for w in warns {
+                        ctx.warn(w);
+                    }
+                    if let Some(s) = p.speed {
+                        if !media.speeds.is_empty()
+                            && !media.speeds.iter().any(|x| x.round() as u32 == s)
+                        {
+                            ctx.warn(format!("{s}x is not in the probed write speeds"));
+                        }
+                    }
+                    params = p;
+                }
+            }
+        };
+
+        self.done(
+            Stage::Preflight,
+            format!(
+                "{}: payload {} + parity ~{} fits {} budget",
+                media.kind.label(),
+                human_bytes(plan.payload_bytes),
+                human_bytes(plan.parity_bytes_est),
+                human_bytes(plan.budget)
+            ),
+        );
+        Ok(Some((params, plan)))
+    }
+
+    fn staging(&mut self, params: &BurnParams) -> Result<StagingDir> {
+        let label = unique_label(&params.staging, &params.label);
+        let dir = params.staging.join(&label);
+        std::fs::create_dir_all(dir.join("parity"))
+            .with_context(|| format!("create staging dir {}", dir.display()))?;
+        let run_log = dir.join("run.log");
+        self.ctx.tee_events_to(&run_log);
+        self.ctx.info(format!("staging into {}", dir.display()));
+        Ok(StagingDir {
+            label,
+            dir,
+            run_log,
+        })
+    }
+
+    fn parity(
+        &mut self,
+        payloads: &[Payload],
+        params: &BurnParams,
+        staging: &StagingDir,
+    ) -> Result<Vec<PathBuf>> {
+        let ctx = self.ctx;
+        if !params.parity {
+            ctx.warn("parity disabled - a single bad sector can cost the whole payload".into());
+            return Ok(Vec::new());
         }
-    };
-
-    ctx.done(
-        &mut stages,
-        Stage::Preflight,
-        format!(
-            "{}: payload {} + parity ~{} fits {} budget",
-            media.kind.label(),
-            human_bytes(plan.payload_bytes),
-            human_bytes(plan.parity_bytes_est),
-            human_bytes(plan.budget)
-        ),
-    );
-
-    let label = unique_label(&params.staging, &params.label);
-    let stage_dir = params.staging.join(&label);
-    std::fs::create_dir_all(stage_dir.join("parity"))
-        .with_context(|| format!("create staging dir {}", stage_dir.display()))?;
-    let run_log_path = stage_dir.join("run.log");
-    ctx.tee_events_to(&run_log_path);
-    ctx.info(format!("staging into {}", stage_dir.display()));
-
-    let mut parity_files: Vec<PathBuf> = Vec::new();
-    if params.parity {
-        *stage = Stage::Parity;
         ctx.start(Stage::Parity);
+        let mut parity_files: Vec<PathBuf> = Vec::new();
         let n = payloads.len() as f32;
         for (i, p) in payloads.iter().enumerate() {
             let name = p.name.clone();
             let mut produced = parity::create(
                 &ctx.tools,
                 p,
-                &stage_dir.join("parity"),
+                &staging.dir.join("parity"),
                 params.redundancy_pct,
                 ctx.cfg.stall_timeout(),
                 &mut |pct, line| {
@@ -492,8 +616,7 @@ fn burn_pipeline(ctx: &RunnerCtx, req: &BurnRequest, stage: &mut Stage) -> Resul
             .iter()
             .map(|f| std::fs::metadata(f).map(|m| m.len()).unwrap_or(0))
             .sum();
-        ctx.done(
-            &mut stages,
+        self.done(
             Stage::Parity,
             format!(
                 "{} recovery files, {} ({}% redundancy)",
@@ -502,15 +625,20 @@ fn burn_pipeline(ctx: &RunnerCtx, req: &BurnRequest, stage: &mut Stage) -> Resul
                 params.redundancy_pct
             ),
         );
-    } else {
-        ctx.warn("parity disabled - a single bad sector can cost the whole payload".into());
+        Ok(parity_files)
     }
 
-    *stage = Stage::Checksums;
-    ctx.start(Stage::Checksums);
-    let mut entries: Vec<(String, String)> = Vec::new();
-    let mut manifest_rows: Vec<master::ManifestEntry> = Vec::new();
-    {
+    fn checksums(
+        &mut self,
+        payloads: &[Payload],
+        parity_files: &[PathBuf],
+        params: &BurnParams,
+        staging: &StagingDir,
+    ) -> Result<ChecksumsOut> {
+        let ctx = self.ctx;
+        ctx.start(Stage::Checksums);
+        let mut entries: Vec<(String, String)> = Vec::new();
+        let mut manifest_rows: Vec<master::ManifestEntry> = Vec::new();
         let parity_sizes: Vec<u64> = parity_files
             .iter()
             .map(|f| std::fs::metadata(f).map(|m| m.len()).unwrap_or(0))
@@ -519,7 +647,7 @@ fn burn_pipeline(ctx: &RunnerCtx, req: &BurnRequest, stage: &mut Stage) -> Resul
             payloads.iter().map(|p| p.total_size).sum::<u64>() + parity_sizes.iter().sum::<u64>();
         let mut base = 0u64;
         let mut th = Throttle::default();
-        for p in &payloads {
+        for p in payloads {
             let mut last_sha = None;
             for m in &p.files {
                 let sha = hashing::sha256_file(&m.abs, &mut |done, _| {
@@ -546,76 +674,99 @@ fn burn_pipeline(ctx: &RunnerCtx, req: &BurnRequest, stage: &mut Stage) -> Resul
             base += size;
             entries.push((sha, rel));
         }
+        let path = staging.dir.join("checksums.sha256");
+        hashing::write_checksums(&entries, &path)?;
+        self.done(
+            Stage::Checksums,
+            format!("{} entries in checksums.sha256", entries.len()),
+        );
+        Ok(ChecksumsOut {
+            entries,
+            manifest_rows,
+            path,
+        })
     }
-    let checksums_path = stage_dir.join("checksums.sha256");
-    hashing::write_checksums(&entries, &checksums_path)?;
-    ctx.done(
-        &mut stages,
-        Stage::Checksums,
-        format!("{} entries in checksums.sha256", entries.len()),
-    );
 
-    *stage = Stage::Master;
-    ctx.start(Stage::Master);
-    // The ISO is the big late allocation: parity above (or a parallel run)
-    // may have consumed the space that was free at confirm time.
-    check_staging_space(&plan, &params.staging)?;
-    let manifest_path = stage_dir.join("MANIFEST.txt");
-    let recovery_path = stage_dir.join("RECOVERY.txt");
-    master::write_manifest(
-        &manifest_path,
-        &label,
-        &manifest_rows,
-        params.parity.then_some(params.redundancy_pct),
-        params.defect_management,
-    )?;
-    master::write_recovery(&recovery_path, &label, &payloads)?;
-    let iso = stage_dir.join(format!("{label}.iso"));
-    let input = master::MasterInput {
-        label: &label,
-        payloads: &payloads,
-        parity_files: &parity_files,
-        checksums: &checksums_path,
-        manifest: &manifest_path,
-        recovery: &recovery_path,
-        out_iso: &iso,
-    };
-    let iso_bytes = master::build_iso(
-        &ctx.tools,
-        &input,
-        ctx.cfg.stall_timeout(),
-        &mut |pct, line| {
-            ctx.progress(Stage::Master, pct, line);
-        },
-    )?;
-    let lba_path = stage_dir.join(format!("{label}.lba.txt"));
-    master::report_lba(&ctx.tools, &iso, &lba_path)?;
-    let iso_sha = {
-        let mut th = Throttle::default();
-        hashing::sha256_file(&iso, &mut |done, total| {
-            emit_pct(ctx, Stage::Master, &mut th, done, total, "hashing ISO");
-        })?
-    };
-    let iso_sha_path = stage_dir.join(format!("{label}.iso.sha256"));
-    hashing::write_checksums(&[(iso_sha.clone(), format!("{label}.iso"))], &iso_sha_path)?;
-    ctx.done(
-        &mut stages,
-        Stage::Master,
-        format!("{label}.iso {} sha256 {iso_sha}", human_bytes(iso_bytes)),
-    );
+    fn master(
+        &mut self,
+        plan: &ArchivePlan,
+        params: &BurnParams,
+        staging: &StagingDir,
+        payloads: &[Payload],
+        parity_files: &[PathBuf],
+        sums: &ChecksumsOut,
+    ) -> Result<Mastered> {
+        let ctx = self.ctx;
+        ctx.start(Stage::Master);
+        // The ISO is the big late allocation: parity above (or a parallel run)
+        // may have consumed the space that was free at confirm time.
+        check_staging_space(plan, &params.staging)?;
+        let label = &staging.label;
+        let manifest_path = staging.dir.join("MANIFEST.txt");
+        let recovery_path = staging.dir.join("RECOVERY.txt");
+        master::write_manifest(
+            &manifest_path,
+            label,
+            &sums.manifest_rows,
+            params.parity.then_some(params.redundancy_pct),
+            params.defect_management,
+        )?;
+        master::write_recovery(&recovery_path, label, payloads)?;
+        let iso = staging.dir.join(format!("{label}.iso"));
+        let input = master::MasterInput {
+            label,
+            payloads,
+            parity_files,
+            checksums: &sums.path,
+            manifest: &manifest_path,
+            recovery: &recovery_path,
+            out_iso: &iso,
+        };
+        let iso_bytes = master::build_iso(
+            &ctx.tools,
+            &input,
+            ctx.cfg.stall_timeout(),
+            &mut |pct, line| {
+                ctx.progress(Stage::Master, pct, line);
+            },
+        )?;
+        let lba_path = staging.dir.join(format!("{label}.lba.txt"));
+        master::report_lba(&ctx.tools, &iso, &lba_path)?;
+        let iso_sha = {
+            let mut th = Throttle::default();
+            hashing::sha256_file(&iso, &mut |done, total| {
+                emit_pct(ctx, Stage::Master, &mut th, done, total, "hashing ISO");
+            })?
+        };
+        let iso_sha_path = staging.dir.join(format!("{label}.iso.sha256"));
+        hashing::write_checksums(&[(iso_sha.clone(), format!("{label}.iso"))], &iso_sha_path)?;
+        self.done(
+            Stage::Master,
+            format!("{label}.iso {} sha256 {iso_sha}", human_bytes(iso_bytes)),
+        );
+        Ok(Mastered {
+            iso,
+            iso_bytes,
+            iso_sha,
+            manifest_path,
+            recovery_path,
+            lba_path,
+            iso_sha_path,
+        })
+    }
 
-    if params.defect_management {
-        *stage = Stage::Format;
+    fn format(&mut self, device: &str, iso_bytes: u64) -> Result<()> {
+        let ctx = self.ctx;
         ctx.start(Stage::Format);
         burn::format_defect_management(
             &ctx.tools,
-            &device,
+            device,
             ctx.cfg.stall_timeout(),
             &mut |pct, line| {
                 ctx.progress(Stage::Format, pct, line);
             },
         )?;
-        let formatted = media::probe(&ctx.tools, &device)?;
+        let formatted = media::probe(&ctx.tools, device)?;
         let capacity = formatted.formatted_capacity.unwrap_or(formatted.free_bytes);
         ensure!(
             iso_bytes <= capacity,
@@ -623,145 +774,196 @@ fn burn_pipeline(ctx: &RunnerCtx, req: &BurnRequest, stage: &mut Stage) -> Resul
             human_bytes(iso_bytes),
             human_bytes(capacity)
         );
-        ctx.done(
-            &mut stages,
+        self.done(
             Stage::Format,
             format!(
                 "spare areas formatted, capacity now {}",
                 human_bytes(capacity)
             ),
         );
+        Ok(())
     }
 
-    *stage = Stage::Burn;
-    ctx.start(Stage::Burn);
-    burn::burn_iso(
-        &ctx.tools,
-        &device,
-        &iso,
-        params.speed,
-        ctx.cfg.stall_timeout(),
-        &mut |pct, line| {
-            ctx.progress(Stage::Burn, pct, line);
-        },
-    )
-    .inspect_err(|_| {
-        ctx.info(format!(
-            "burn transcript: {}",
-            burn::burn_log_path(&iso).display()
-        ));
-        ctx.info(format!(
-            "staged ISO survives - insert a fresh disc and retry: ovenmitts burn-iso {}",
-            iso.display()
-        ));
-    })?;
-    ctx.done(
-        &mut stages,
-        Stage::Burn,
-        format!("{} written, disc ejected", human_bytes(iso_bytes)),
-    );
+    fn burn(&mut self, device: &str, speed: Option<u32>, mastered: &Mastered) -> Result<()> {
+        let ctx = self.ctx;
+        ctx.start(Stage::Burn);
+        burn::burn_iso(
+            &ctx.tools,
+            device,
+            &mastered.iso,
+            speed,
+            ctx.cfg.stall_timeout(),
+            &mut |pct, line| {
+                ctx.progress(Stage::Burn, pct, line);
+            },
+        )
+        .inspect_err(|_| {
+            ctx.info(format!(
+                "burn transcript: {}",
+                burn::burn_log_path(&mastered.iso).display()
+            ));
+            ctx.info(format!(
+                "staged ISO survives - insert a fresh disc and retry: ovenmitts burn-iso {}",
+                mastered.iso.display()
+            ));
+        })?;
+        self.done(
+            Stage::Burn,
+            format!("{} written, disc ejected", human_bytes(mastered.iso_bytes)),
+        );
+        Ok(())
+    }
 
-    *stage = Stage::VerifyImage;
-    ctx.start(Stage::VerifyImage);
-    // The burn command carried -eject and readback waits for the reloaded
-    // medium, so a physical reload always defeated the cache here.
-    let (disc_sha, o_direct) = readback_stage(ctx, &device, iso_bytes, true, &mut degradations)?;
+    fn finish(
+        self,
+        req: &BurnRequest,
+        payloads: &[Payload],
+        staging: StagingDir,
+        parity_files: Vec<PathBuf>,
+        sums: ChecksumsOut,
+        mastered: Mastered,
+    ) -> Result<()> {
+        let ctx = self.ctx;
+        let label = &staging.label;
+        let mut reminders = Vec::new();
+        let keep_iso = !req.discard_iso;
+        if keep_iso {
+            reminders.push(format!(
+                "second copy: insert a fresh disc and run `ovenmitts burn-iso {}`",
+                mastered.iso.display()
+            ));
+        } else {
+            std::fs::remove_file(&mastered.iso)
+                .with_context(|| format!("remove {}", mastered.iso.display()))?;
+            ctx.info(format!(
+                "discarded {} after successful verification",
+                mastered.iso.display()
+            ));
+        }
+        reminders.push(format!(
+            "keep {} off-disc: parity, {label}.lba.txt and checksums.sha256 are what repair a damaged disc",
+            staging.dir.display()
+        ));
+        if payloads.iter().any(|p| p.looks_like_container()) {
+            reminders.push(
+                "VeraCrypt: keep an EXTERNAL volume-header backup (Tools > Backup Volume Header); \
+                 create a fresh container per archive generation"
+                    .into(),
+            );
+        }
+        let mut written_files = Vec::new();
+        if staging.run_log.is_file() {
+            written_files.push(staging.run_log);
+        }
+        written_files.extend(parity_files);
+        written_files.push(sums.path);
+        written_files.push(mastered.manifest_path);
+        written_files.push(mastered.recovery_path);
+        let burn_log = burn::burn_log_path(&mastered.iso);
+        if keep_iso {
+            written_files.push(mastered.iso.clone());
+        }
+        written_files.push(mastered.lba_path);
+        written_files.push(mastered.iso_sha_path);
+        if burn_log.is_file() {
+            written_files.push(burn_log);
+        }
+        let report_path = staging.dir.join(format!("{label}.report.txt"));
+        written_files.push(report_path.clone());
+        let report = RunReport {
+            iso_path: keep_iso.then_some(mastered.iso),
+            iso_sha256: Some(mastered.iso_sha),
+            iso_bytes: mastered.iso_bytes,
+            stages: self.stages,
+            reminders,
+            written_files,
+            degradations: self.degradations,
+        };
+        crate::fsutil::write_durable(&report_path, report_text(&report, &ctx.tools))?;
+        ctx.send(StageEvent::Finished { report });
+        Ok(())
+    }
+}
+
+/// Where a VerifyFiles stage gets its checksum entries: the burn pipeline
+/// verifies against the in-memory list it just wrote; a standalone verify
+/// parses checksums.sha256 off the (untrusted) disc.
+enum EntriesSource<'a> {
+    InMemory(&'a [(String, String)]),
+    FromDisc,
+}
+
+/// Shared read-back guard (burn, burn-iso, verify --iso): hash the disc,
+/// compare to the expected ISO hash - the mismatch wording is part of the
+/// tool's contract - and record the stage. The caller emits StageStart
+/// (expected-hash computation may already progress under it).
+fn verify_image_stage(
+    ctx: &RunnerCtx,
+    stages: &mut Vec<(Stage, String)>,
+    device: &str,
+    iso_bytes: u64,
+    expected: &str,
+    reloaded: bool,
+    degradations: &mut Vec<String>,
+) -> Result<()> {
+    let (disc_sha, o_direct) = readback_stage(ctx, device, iso_bytes, reloaded, degradations)?;
     ensure!(
-        disc_sha == iso_sha,
-        "READ-BACK MISMATCH - DO NOT TRUST THIS DISC: disc sha256 {disc_sha} != ISO sha256 {iso_sha}"
+        disc_sha == expected,
+        "READ-BACK MISMATCH - DO NOT TRUST THIS DISC: disc sha256 {disc_sha} != ISO sha256 {expected}"
     );
     ctx.done(
-        &mut stages,
+        stages,
         Stage::VerifyImage,
         readback_summary(iso_bytes, o_direct),
     );
+    Ok(())
+}
 
-    *stage = Stage::VerifyFiles;
+/// Shared mount / hash-every-file / unmount stage (burn pipeline + verify).
+fn verify_files_stage(
+    ctx: &RunnerCtx,
+    stages: &mut Vec<(Stage, String)>,
+    device: &str,
+    source: EntriesSource,
+) -> Result<()> {
     ctx.start(Stage::VerifyFiles);
-    let mountpoint = verify::mount_ro(&ctx.tools, &device)?;
+    let mountpoint = verify::mount_ro(&ctx.tools, device)?;
     let verified = {
-        let mut th = Throttle::default();
-        let res = hashing::verify_checksums(&mountpoint, &entries, &mut |done, total| {
-            emit_pct(
-                ctx,
-                Stage::VerifyFiles,
-                &mut th,
-                done,
-                total,
-                "hashing files on disc",
-            );
-        });
-        if let Err(e) = verify::unmount(&ctx.tools, &device) {
+        let res = (|| {
+            let parsed;
+            let entries: &[(String, String)] = match source {
+                EntriesSource::InMemory(entries) => entries,
+                EntriesSource::FromDisc => {
+                    let path = mountpoint.join("checksums.sha256");
+                    let text = std::fs::read_to_string(&path)
+                        .with_context(|| format!("reading {} from the disc", path.display()))?;
+                    parsed = hashing::parse_checksums(&text)?;
+                    &parsed
+                }
+            };
+            let mut th = Throttle::default();
+            hashing::verify_checksums(&mountpoint, entries, &mut |done, total| {
+                emit_pct(
+                    ctx,
+                    Stage::VerifyFiles,
+                    &mut th,
+                    done,
+                    total,
+                    "hashing files on disc",
+                );
+            })
+        })();
+        if let Err(e) = verify::unmount(&ctx.tools, device) {
             ctx.warn(format!("could not unmount {device}: {e:#}"));
         }
         res?
     };
     ensure_all_match(&verified)?;
     ctx.done(
-        &mut stages,
+        stages,
         Stage::VerifyFiles,
         format!("{} files on disc match checksums.sha256", verified.len()),
     );
-
-    // req.amend is only ever set by the TUI, so it doubles as "an operator is
-    // present to take the disc"; unattended runs must not leave the tray open
-    eject_if_configured(ctx, &device, req.amend);
-
-    let mut reminders = Vec::new();
-    let keep_iso = !req.discard_iso;
-    if keep_iso {
-        reminders.push(format!(
-            "second copy: insert a fresh disc and run `ovenmitts burn-iso {}`",
-            iso.display()
-        ));
-    } else {
-        std::fs::remove_file(&iso).with_context(|| format!("remove {}", iso.display()))?;
-        ctx.info(format!(
-            "discarded {} after successful verification",
-            iso.display()
-        ));
-    }
-    reminders.push(format!(
-        "keep {} off-disc: parity, {label}.lba.txt and checksums.sha256 are what repair a damaged disc",
-        stage_dir.display()
-    ));
-    if payloads.iter().any(|p| p.looks_like_container()) {
-        reminders.push(
-            "VeraCrypt: keep an EXTERNAL volume-header backup (Tools > Backup Volume Header); \
-             create a fresh container per archive generation"
-                .into(),
-        );
-    }
-    let mut written_files = Vec::new();
-    if run_log_path.is_file() {
-        written_files.push(run_log_path);
-    }
-    written_files.extend(parity_files);
-    written_files.push(checksums_path);
-    written_files.push(manifest_path);
-    written_files.push(recovery_path);
-    let burn_log = burn::burn_log_path(&iso);
-    if keep_iso {
-        written_files.push(iso.clone());
-    }
-    written_files.push(lba_path);
-    written_files.push(iso_sha_path);
-    if burn_log.is_file() {
-        written_files.push(burn_log);
-    }
-    let report_path = stage_dir.join(format!("{label}.report.txt"));
-    written_files.push(report_path.clone());
-    let report = RunReport {
-        iso_path: keep_iso.then_some(iso),
-        iso_sha256: Some(iso_sha),
-        iso_bytes,
-        stages,
-        reminders,
-        written_files,
-        degradations,
-    };
-    crate::fsutil::write_durable(&report_path, report_text(&report, &ctx.tools))?;
-    ctx.send(StageEvent::Finished { report });
     Ok(())
 }
 
@@ -846,17 +1048,15 @@ pub fn run_burn_iso(ctx: &RunnerCtx, iso: &Path, assume_yes: bool) -> Result<()>
         ctx.start(Stage::VerifyImage);
         let expected = expected_iso_sha(ctx, Stage::VerifyImage, iso)?;
         // Burn carried -eject; readback waits for the reloaded medium.
-        let (disc_sha, o_direct) =
-            readback_stage(ctx, &device, iso_bytes, true, &mut degradations)?;
-        ensure!(
-            disc_sha == expected,
-            "READ-BACK MISMATCH - DO NOT TRUST THIS DISC: disc sha256 {disc_sha} != ISO sha256 {expected}"
-        );
-        ctx.done(
+        verify_image_stage(
+            ctx,
             &mut stages,
-            Stage::VerifyImage,
-            readback_summary(iso_bytes, o_direct),
-        );
+            &device,
+            iso_bytes,
+            &expected,
+            true,
+            &mut degradations,
+        )?;
 
         // burn-iso is always line mode; only an explicit config opt-in ejects
         eject_if_configured(ctx, &device, false);
@@ -919,17 +1119,15 @@ pub fn run_verify(ctx: &RunnerCtx, iso: Option<&Path>) -> Result<()> {
                     false
                 }
             };
-            let (disc_sha, o_direct) =
-                readback_stage(ctx, &device, iso_bytes, reloaded, &mut degradations)?;
-            ensure!(
-                disc_sha == expected,
-                "READ-BACK MISMATCH - DO NOT TRUST THIS DISC: disc sha256 {disc_sha} != ISO sha256 {expected}"
-            );
-            ctx.done(
+            verify_image_stage(
+                ctx,
                 &mut stages,
-                Stage::VerifyImage,
-                readback_summary(iso_bytes, o_direct),
-            );
+                &device,
+                iso_bytes,
+                &expected,
+                reloaded,
+                &mut degradations,
+            )?;
             report_sha = Some(expected);
             report_bytes = iso_bytes;
         } else {
@@ -945,37 +1143,7 @@ pub fn run_verify(ctx: &RunnerCtx, iso: Option<&Path>) -> Result<()> {
         }
 
         *stage = Stage::VerifyFiles;
-        ctx.start(Stage::VerifyFiles);
-        let mountpoint = verify::mount_ro(&ctx.tools, &device)?;
-        let verified = {
-            let res = (|| {
-                let path = mountpoint.join("checksums.sha256");
-                let text = std::fs::read_to_string(&path)
-                    .with_context(|| format!("reading {} from the disc", path.display()))?;
-                let entries = hashing::parse_checksums(&text)?;
-                let mut th = Throttle::default();
-                hashing::verify_checksums(&mountpoint, &entries, &mut |done, total| {
-                    emit_pct(
-                        ctx,
-                        Stage::VerifyFiles,
-                        &mut th,
-                        done,
-                        total,
-                        "hashing files on disc",
-                    );
-                })
-            })();
-            if let Err(e) = verify::unmount(&ctx.tools, &device) {
-                ctx.warn(format!("could not unmount {device}: {e:#}"));
-            }
-            res?
-        };
-        ensure_all_match(&verified)?;
-        ctx.done(
-            &mut stages,
-            Stage::VerifyFiles,
-            format!("{} files on disc match checksums.sha256", verified.len()),
-        );
+        verify_files_stage(ctx, &mut stages, &device, EntriesSource::FromDisc)?;
 
         *stage = Stage::CheckMedia;
         ctx.start(Stage::CheckMedia);
