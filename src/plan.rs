@@ -5,7 +5,6 @@ pub const BD_R_50: u64 = 50_050_629_632;
 pub const BDXL_100: u64 = 100_103_356_416;
 pub const BD_R_XL_128: u64 = 128_001_769_472;
 pub const DVD_R: u64 = 4_707_319_808;
-pub const DVD_PLUS_R: u64 = 4_700_372_992;
 
 pub const PAR2_MAX_BLOCKS: u64 = 32_768;
 pub const SECTOR: u64 = 2048;
@@ -31,18 +30,6 @@ impl MediaKind {
             MediaKind::DvdR => "DVD-R 4.7 GB",
             MediaKind::DvdPlusR => "DVD+R 4.7 GB",
             MediaKind::Unknown => "unknown media",
-        }
-    }
-
-    pub fn nominal_bytes(&self) -> Option<u64> {
-        match self {
-            MediaKind::BdR25 => Some(BD_R_25),
-            MediaKind::BdR50 => Some(BD_R_50),
-            MediaKind::Bdxl100 => Some(BDXL_100),
-            MediaKind::BdRXl128 => Some(BD_R_XL_128),
-            MediaKind::DvdR => Some(DVD_R),
-            MediaKind::DvdPlusR => Some(DVD_PLUS_R),
-            MediaKind::Unknown => None,
         }
     }
 }

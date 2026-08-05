@@ -13,6 +13,21 @@ pub struct Tools {
     pub mediainfo: Option<PathBuf>,
 }
 
+impl Tools {
+    /// Minimal Tools: just an xorriso path, every optional tool absent.
+    pub fn bare(xorriso: impl Into<std::path::PathBuf>) -> Tools {
+        Tools {
+            xorriso: xorriso.into(),
+            par2: None,
+            par2_version: None,
+            udisksctl: None,
+            veracrypt: None,
+            eject: None,
+            mediainfo: None,
+        }
+    }
+}
+
 pub fn which(name: &str) -> Option<PathBuf> {
     let paths = std::env::var_os("PATH")?;
     std::env::split_paths(&paths)
@@ -30,15 +45,9 @@ fn is_executable(p: &std::path::Path) -> bool {
 /// For commands that work without xorriso (plan): placeholder path whose
 /// spawn failure routes callers onto their synthetic-media fallback.
 pub fn lenient() -> Tools {
-    Tools {
-        xorriso: PathBuf::from("xorriso"),
-        par2: which("par2"),
-        par2_version: None,
-        udisksctl: None,
-        veracrypt: None,
-        eject: None,
-        mediainfo: None,
-    }
+    let mut t = Tools::bare("xorriso");
+    t.par2 = which("par2");
+    t
 }
 
 pub fn discover() -> Result<Tools> {

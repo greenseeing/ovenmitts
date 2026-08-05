@@ -271,21 +271,16 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let tools = Tools {
-            xorriso: "/bin/true".into(),
-            par2: Some(fake),
-            par2_version: None,
-            udisksctl: None,
-            veracrypt: None,
-            eject: None,
-            mediainfo: None,
-        };
+        let mut tools = Tools::bare("/bin/true");
+        tools.par2 = Some(fake);
         let mut events = Vec::new();
-        create_retrying(
+        create(
             &tools,
             &inspect(&payload),
             &dir.path().join("out"),
-            &mut events,
+            15,
+            Duration::ZERO,
+            &mut |p, l| events.push((p, l)),
         )
         .unwrap();
         let pcts: Vec<f32> = events.iter().filter_map(|(p, _)| *p).collect();
@@ -306,15 +301,8 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let tools = Tools {
-            xorriso: "/bin/true".into(),
-            par2: Some(fake),
-            par2_version: None,
-            udisksctl: None,
-            veracrypt: None,
-            eject: None,
-            mediainfo: None,
-        };
+        let mut tools = Tools::bare("/bin/true");
+        tools.par2 = Some(fake);
         let start = std::time::Instant::now();
         let err = create(
             &tools,
@@ -345,27 +333,6 @@ mod tests {
         plan::Payload::inspect(path.to_path_buf()).unwrap().0
     }
 
-    // fork/exec ETXTBSY race: another test thread may hold a just-written fake
-    // script open for write at our child's execve; retry, never in prod code.
-    fn create_retrying(
-        tools: &Tools,
-        payload: &plan::Payload,
-        out_dir: &Path,
-        events: &mut Vec<(Option<f32>, String)>,
-    ) -> Result<Vec<PathBuf>> {
-        loop {
-            events.clear();
-            match create(tools, payload, out_dir, 15, Duration::ZERO, &mut |p, l| {
-                events.push((p, l))
-            }) {
-                Err(e) if format!("{e:#}").contains("Text file busy") => {
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                }
-                r => return r,
-            }
-        }
-    }
-
     #[test]
     fn create_runs_par2_in_payload_dir_and_collects_outputs() {
         use std::os::unix::fs::PermissionsExt;
@@ -389,18 +356,19 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let tools = Tools {
-            xorriso: "/bin/true".into(),
-            par2: Some(fake),
-            par2_version: None,
-            udisksctl: None,
-            veracrypt: None,
-            eject: None,
-            mediainfo: None,
-        };
+        let mut tools = Tools::bare("/bin/true");
+        tools.par2 = Some(fake);
 
         let mut events = Vec::new();
-        let files = create_retrying(&tools, &inspect(&payload), &out_dir, &mut events).unwrap();
+        let files = create(
+            &tools,
+            &inspect(&payload),
+            &out_dir,
+            15,
+            Duration::ZERO,
+            &mut |p, l| events.push((p, l)),
+        )
+        .unwrap();
 
         let names: Vec<_> = files
             .iter()
@@ -432,15 +400,7 @@ mod tests {
 
     #[test]
     fn create_fails_cleanly_without_par2() {
-        let tools = Tools {
-            xorriso: "/bin/true".into(),
-            par2: None,
-            par2_version: None,
-            udisksctl: None,
-            veracrypt: None,
-            eject: None,
-            mediainfo: None,
-        };
+        let tools = Tools::bare("/bin/true");
         let dir = tempfile::tempdir().unwrap();
         let payload = dir.path().join("v");
         std::fs::write(&payload, b"x").unwrap();
@@ -462,15 +422,8 @@ mod tests {
         let extras = dir.path().join("extras");
         std::fs::create_dir(&extras).unwrap();
         std::fs::write(extras.join("empty.bin"), b"").unwrap();
-        let tools = Tools {
-            xorriso: "/bin/true".into(),
-            par2: Some("/bin/true".into()),
-            par2_version: None,
-            udisksctl: None,
-            veracrypt: None,
-            eject: None,
-            mediainfo: None,
-        };
+        let mut tools = Tools::bare("/bin/true");
+        tools.par2 = Some("/bin/true".into());
         let err = create(
             &tools,
             &inspect(&extras),
@@ -495,21 +448,16 @@ mod tests {
         let fake = dir.path().join("par2");
         std::fs::write(&fake, "#!/bin/sh\necho 'boom' >&2\nexit 3\n").unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let tools = Tools {
-            xorriso: "/bin/true".into(),
-            par2: Some(fake),
-            par2_version: None,
-            udisksctl: None,
-            veracrypt: None,
-            eject: None,
-            mediainfo: None,
-        };
+        let mut tools = Tools::bare("/bin/true");
+        tools.par2 = Some(fake);
         let mut events = Vec::new();
-        let err = create_retrying(
+        let err = create(
             &tools,
             &inspect(&payload),
             &dir.path().join("out"),
-            &mut events,
+            15,
+            Duration::ZERO,
+            &mut |p, l| events.push((p, l)),
         )
         .unwrap_err();
         let msg = err.to_string();

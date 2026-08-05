@@ -675,7 +675,7 @@ impl<'a> BurnRun<'a> {
             });
         }
         for (f, size) in parity_files.iter().zip(&parity_sizes) {
-            let rel = format!("parity/{}", file_name_string(f));
+            let rel = format!("parity/{}", master::file_name_of(f));
             let sha = hashing::sha256_file(f, &mut |done, _| {
                 emit_pct(ctx, Stage::Checksums, &mut th, base + done, total, &rel);
             })?;
@@ -1538,7 +1538,7 @@ fn stale_staging_note(staging: &Path, needed: u64) -> Option<String> {
             .and_then(|t| t.elapsed().ok())
             .map(|d| d.as_secs() / 86_400)
             .unwrap_or(0);
-        dirs.push((file_name_string(&p), age_days, dir_size(&p)));
+        dirs.push((master::file_name_of(&p), age_days, dir_size(&p)));
     }
     let total: u64 = dirs.iter().map(|(_, _, b)| *b).sum();
     let stale: Vec<&(String, u64, u64)> = dirs
@@ -1768,12 +1768,6 @@ fn claim_stage_dir(staging: &Path, base: &str) -> Result<(String, PathBuf)> {
             }
         }
     }
-}
-
-fn file_name_string(p: &Path) -> String {
-    p.file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| p.display().to_string())
 }
 
 /// One line per failed file, each stating whether it is a bad burn
@@ -2096,15 +2090,11 @@ mod tests {
         udisksctl: Option<PathBuf>,
         veracrypt: Option<PathBuf>,
     ) -> Tools {
-        Tools {
-            xorriso,
-            par2,
-            par2_version: None,
-            udisksctl,
-            veracrypt,
-            eject: None,
-            mediainfo: None,
-        }
+        let mut t = Tools::bare(xorriso);
+        t.par2 = par2;
+        t.udisksctl = udisksctl;
+        t.veracrypt = veracrypt;
+        t
     }
 
     fn cfg_with(device: &Path, staging: &Path) -> Config {
@@ -2134,41 +2124,35 @@ mod tests {
         eject_when_done: Option<bool>,
         interactive: bool,
     ) -> (PathBuf, Vec<StageEvent>, tempfile::TempDir) {
-        loop {
-            let dir = tempfile::tempdir().unwrap();
-            let payload = dir.path().join("vault.hc");
-            std::fs::write(&payload, vec![7u8; 128 * 1024]).unwrap();
-            let device = dir.path().join("device");
-            let staging = dir.path().join("staging");
-            let stage_dir = staging.join("T1");
-            let mnt = dir.path().join("mnt");
-            let xorriso = fake_xorriso(dir.path(), &device, CHECK_CLEAN_FIXTURE);
-            let par2 = fake_par2(dir.path());
-            let udisksctl = fake_udisksctl(dir.path(), &mnt, &payload, &stage_dir);
-            let mut tools = tools_with(xorriso, Some(par2), Some(udisksctl), None);
-            tools.eject = Some(fake_eject(dir.path()));
-            let mut cfg = cfg_with(&device, &staging);
-            cfg.eject_when_done = eject_when_done;
-            let (ctx, rx, ack_tx) = ctx_pair(cfg, tools);
-            if interactive {
-                ack_tx.send(Ack::Proceed).unwrap();
-            }
-            let req = BurnRequest {
-                payloads: vec![payload.clone()],
-                label: Some("T1".into()),
-                parity: true,
-                dry_run: false,
-                assume_yes: !interactive,
-                amend: interactive,
-                discard_iso: false,
-            };
-            match run_burn(&ctx, &req) {
-                Err(e) if is_busy(&e) => continue,
-                Err(e) => panic!("{e:#}"),
-                Ok(()) => {}
-            }
-            return (device, rx.try_iter().collect(), dir);
+        let dir = tempfile::tempdir().unwrap();
+        let payload = dir.path().join("vault.hc");
+        std::fs::write(&payload, vec![7u8; 128 * 1024]).unwrap();
+        let device = dir.path().join("device");
+        let staging = dir.path().join("staging");
+        let stage_dir = staging.join("T1");
+        let mnt = dir.path().join("mnt");
+        let xorriso = fake_xorriso(dir.path(), &device, CHECK_CLEAN_FIXTURE);
+        let par2 = fake_par2(dir.path());
+        let udisksctl = fake_udisksctl(dir.path(), &mnt, &payload, &stage_dir);
+        let mut tools = tools_with(xorriso, Some(par2), Some(udisksctl), None);
+        tools.eject = Some(fake_eject(dir.path()));
+        let mut cfg = cfg_with(&device, &staging);
+        cfg.eject_when_done = eject_when_done;
+        let (ctx, rx, ack_tx) = ctx_pair(cfg, tools);
+        if interactive {
+            ack_tx.send(Ack::Proceed).unwrap();
         }
+        let req = BurnRequest {
+            payloads: vec![payload.clone()],
+            label: Some("T1".into()),
+            parity: true,
+            dry_run: false,
+            assume_yes: !interactive,
+            amend: interactive,
+            discard_iso: false,
+        };
+        run_burn(&ctx, &req).unwrap_or_else(|e| panic!("{e:#}"));
+        (device, rx.try_iter().collect(), dir)
     }
 
     fn ejected_marker(device: &Path) -> PathBuf {
@@ -2212,10 +2196,6 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let (ack_tx, ack_rx) = mpsc::channel();
         (RunnerCtx::new(cfg, tools, tx, ack_rx), rx, ack_tx)
-    }
-
-    fn is_busy(e: &anyhow::Error) -> bool {
-        format!("{e:#}").contains("Text file busy")
     }
 
     fn set_mtime_days_ago(p: &Path, days: u64) {
@@ -2549,105 +2529,75 @@ mod tests {
 
     #[test]
     fn resolve_device_uses_configured_when_it_has_media() {
-        loop {
-            let dir = tempfile::tempdir().unwrap();
-            let sr0 = dir.path().join("sr0");
-            let sr1 = dir.path().join("sr1");
-            let (ctx, rx) = probe_ctx(dir.path(), &sr0, false, &[&sr0, &sr1]);
-            let candidates = vec![sr0.display().to_string(), sr1.display().to_string()];
-            match resolve_device_from(&ctx, move || candidates) {
-                Err(e) if is_busy(&e) => continue,
-                Err(e) => panic!("{e:#}"),
-                Ok((device, media)) => {
-                    assert_eq!(device, sr0.display().to_string());
-                    assert!(media.blank);
-                    assert!(auto_select_infos(&rx).is_empty());
-                    return;
-                }
-            }
-        }
+        let dir = tempfile::tempdir().unwrap();
+        let sr0 = dir.path().join("sr0");
+        let sr1 = dir.path().join("sr1");
+        let (ctx, rx) = probe_ctx(dir.path(), &sr0, false, &[&sr0, &sr1]);
+        let candidates = vec![sr0.display().to_string(), sr1.display().to_string()];
+        let (device, media) =
+            resolve_device_from(&ctx, move || candidates).unwrap_or_else(|e| panic!("{e:#}"));
+        assert_eq!(device, sr0.display().to_string());
+        assert!(media.blank);
+        assert!(auto_select_infos(&rx).is_empty());
     }
 
     #[test]
     fn resolve_device_auto_selects_single_drive_with_media() {
-        loop {
-            let dir = tempfile::tempdir().unwrap();
-            let sr0 = dir.path().join("sr0");
-            let sr1 = dir.path().join("sr1");
-            let sr2 = dir.path().join("sr2");
-            let (ctx, rx) = probe_ctx(dir.path(), &sr0, false, &[&sr1]);
-            let candidates = vec![
-                sr0.display().to_string(),
-                sr1.display().to_string(),
-                sr2.display().to_string(),
-            ];
-            match resolve_device_from(&ctx, move || candidates) {
-                Err(e) if is_busy(&e) => continue,
-                Err(e) => panic!("{e:#}"),
-                Ok((device, _media)) => {
-                    assert_eq!(device, sr1.display().to_string());
-                    let infos = auto_select_infos(&rx);
-                    assert_eq!(infos.len(), 1, "one loud auto-select line: {infos:?}");
-                    assert!(infos[0].contains(&sr1.display().to_string()));
-                    return;
-                }
-            }
-        }
+        let dir = tempfile::tempdir().unwrap();
+        let sr0 = dir.path().join("sr0");
+        let sr1 = dir.path().join("sr1");
+        let sr2 = dir.path().join("sr2");
+        let (ctx, rx) = probe_ctx(dir.path(), &sr0, false, &[&sr1]);
+        let candidates = vec![
+            sr0.display().to_string(),
+            sr1.display().to_string(),
+            sr2.display().to_string(),
+        ];
+        let (device, _media) =
+            resolve_device_from(&ctx, move || candidates).unwrap_or_else(|e| panic!("{e:#}"));
+        assert_eq!(device, sr1.display().to_string());
+        let infos = auto_select_infos(&rx);
+        assert_eq!(infos.len(), 1, "one loud auto-select line: {infos:?}");
+        assert!(infos[0].contains(&sr1.display().to_string()));
     }
 
     #[test]
     fn resolve_device_error_when_explicit_and_no_medium() {
-        loop {
-            let dir = tempfile::tempdir().unwrap();
-            let sr0 = dir.path().join("sr0");
-            let sr1 = dir.path().join("sr1");
-            let (ctx, rx) = probe_ctx(dir.path(), &sr0, true, &[&sr1]);
-            let candidates = vec![sr0.display().to_string(), sr1.display().to_string()];
-            match resolve_device_from(&ctx, move || candidates) {
-                Err(e) if is_busy(&e) => continue,
-                Err(e) => {
-                    assert!(e.to_string().contains("probing"), "{e:#}");
-                    assert!(
-                        auto_select_infos(&rx).is_empty(),
-                        "an explicit device must never be swapped"
-                    );
-                    return;
-                }
-                Ok((device, _)) => panic!("explicit empty drive must not fall back to {device}"),
-            }
-        }
+        let dir = tempfile::tempdir().unwrap();
+        let sr0 = dir.path().join("sr0");
+        let sr1 = dir.path().join("sr1");
+        let (ctx, rx) = probe_ctx(dir.path(), &sr0, true, &[&sr1]);
+        let candidates = vec![sr0.display().to_string(), sr1.display().to_string()];
+        let e = resolve_device_from(&ctx, move || candidates).unwrap_err();
+        assert!(e.to_string().contains("probing"), "{e:#}");
+        assert!(
+            auto_select_infos(&rx).is_empty(),
+            "an explicit device must never be swapped"
+        );
     }
 
     #[test]
     fn resolve_device_refuses_ambiguous_drives() {
-        loop {
-            let dir = tempfile::tempdir().unwrap();
-            let sr0 = dir.path().join("sr0");
-            let sr1 = dir.path().join("sr1");
-            let sr2 = dir.path().join("sr2");
-            let (ctx, _rx) = probe_ctx(dir.path(), &sr0, false, &[&sr1, &sr2]);
-            let candidates = vec![
-                sr0.display().to_string(),
-                sr1.display().to_string(),
-                sr2.display().to_string(),
-            ];
-            match resolve_device_from(&ctx, move || candidates) {
-                Err(e) if is_busy(&e) => continue,
-                Err(e) => {
-                    let msg = format!("{e:#}");
-                    assert!(msg.contains("multiple drives have media"), "{msg}");
-                    assert!(msg.contains(&sr1.display().to_string()), "{msg}");
-                    assert!(msg.contains(&sr2.display().to_string()), "{msg}");
-                    assert!(msg.contains("--device"), "{msg}");
-                    assert!(
-                        e.downcast_ref::<AmbiguousDrives>().is_some(),
-                        "plan needs the typed error to propagate ambiguity"
-                    );
-                    return;
-                }
-                Ok((device, _)) => panic!("ambiguity must refuse, got {device}"),
-            }
-        }
+        let dir = tempfile::tempdir().unwrap();
+        let sr0 = dir.path().join("sr0");
+        let sr1 = dir.path().join("sr1");
+        let sr2 = dir.path().join("sr2");
+        let (ctx, _rx) = probe_ctx(dir.path(), &sr0, false, &[&sr1, &sr2]);
+        let candidates = vec![
+            sr0.display().to_string(),
+            sr1.display().to_string(),
+            sr2.display().to_string(),
+        ];
+        let e = resolve_device_from(&ctx, move || candidates).unwrap_err();
+        let msg = format!("{e:#}");
+        assert!(msg.contains("multiple drives have media"), "{msg}");
+        assert!(msg.contains(&sr1.display().to_string()), "{msg}");
+        assert!(msg.contains(&sr2.display().to_string()), "{msg}");
+        assert!(msg.contains("--device"), "{msg}");
+        assert!(
+            e.downcast_ref::<AmbiguousDrives>().is_some(),
+            "plan needs the typed error to propagate ambiguity"
+        );
     }
 
     fn oversized_setup(dir: &Path) -> (PathBuf, PathBuf) {
@@ -2660,84 +2610,68 @@ mod tests {
 
     #[test]
     fn burn_bails_with_numbers_on_proceed_when_plan_does_not_fit() {
-        loop {
-            let dir = tempfile::tempdir().unwrap();
-            let (payload, device) = oversized_setup(dir.path());
-            let xorriso = fake_xorriso(dir.path(), &device, CHECK_CLEAN_FIXTURE);
-            let tools = tools_with(xorriso, None, None, None);
-            let (ctx, rx, ack_tx) = ctx_pair(cfg_with(&device, &dir.path().join("staging")), tools);
-            ack_tx.send(Ack::Proceed).unwrap();
-            let req = BurnRequest {
-                payloads: vec![payload],
-                label: None,
-                parity: true,
-                dry_run: false,
-                assume_yes: false,
-                amend: true,
-                discard_iso: false,
-            };
-            match run_burn(&ctx, &req) {
-                Err(e) if is_busy(&e) => continue,
-                Err(e) => {
-                    let msg = format!("{e:#}");
-                    assert!(msg.contains("does not fit"), "{msg}");
-                    assert!(msg.contains("bytes"), "{msg}");
-                    let events: Vec<StageEvent> = rx.try_iter().collect();
-                    assert!(events
-                        .iter()
-                        .any(|ev| matches!(ev, StageEvent::Plan { .. })));
-                    assert!(
-                        events
-                            .iter()
-                            .any(|ev| matches!(ev, StageEvent::NeedAck { .. })),
-                        "amend mode must surface a non-fitting plan instead of bailing early"
-                    );
-                    assert!(matches!(
-                        events.last(),
-                        Some(StageEvent::Failed {
-                            stage: Stage::Preflight,
-                            ..
-                        })
-                    ));
-                    return;
-                }
-                Ok(_) => panic!("30 GiB must not fit a BD-R 25"),
-            }
-        }
+        let dir = tempfile::tempdir().unwrap();
+        let (payload, device) = oversized_setup(dir.path());
+        let xorriso = fake_xorriso(dir.path(), &device, CHECK_CLEAN_FIXTURE);
+        let tools = tools_with(xorriso, None, None, None);
+        let (ctx, rx, ack_tx) = ctx_pair(cfg_with(&device, &dir.path().join("staging")), tools);
+        ack_tx.send(Ack::Proceed).unwrap();
+        let req = BurnRequest {
+            payloads: vec![payload],
+            label: None,
+            parity: true,
+            dry_run: false,
+            assume_yes: false,
+            amend: true,
+            discard_iso: false,
+        };
+        let e = run_burn(&ctx, &req).unwrap_err();
+        let msg = format!("{e:#}");
+        assert!(msg.contains("does not fit"), "{msg}");
+        assert!(msg.contains("bytes"), "{msg}");
+        let events: Vec<StageEvent> = rx.try_iter().collect();
+        assert!(events
+            .iter()
+            .any(|ev| matches!(ev, StageEvent::Plan { .. })));
+        assert!(
+            events
+                .iter()
+                .any(|ev| matches!(ev, StageEvent::NeedAck { .. })),
+            "amend mode must surface a non-fitting plan instead of bailing early"
+        );
+        assert!(matches!(
+            events.last(),
+            Some(StageEvent::Failed {
+                stage: Stage::Preflight,
+                ..
+            })
+        ));
     }
 
     #[test]
     fn cli_burn_without_amend_bails_before_prompt_when_not_fitting() {
-        loop {
-            let dir = tempfile::tempdir().unwrap();
-            let (payload, device) = oversized_setup(dir.path());
-            let xorriso = fake_xorriso(dir.path(), &device, CHECK_CLEAN_FIXTURE);
-            let tools = tools_with(xorriso, None, None, None);
-            let (ctx, rx, ack_tx) = ctx_pair(cfg_with(&device, &dir.path().join("staging")), tools);
-            // a wrongly-emitted NeedAck must fail as "ui channel closed", not hang
-            drop(ack_tx);
-            let req = BurnRequest {
-                payloads: vec![payload],
-                label: None,
-                parity: true,
-                dry_run: false,
-                assume_yes: false,
-                amend: false,
-                discard_iso: false,
-            };
-            match run_burn(&ctx, &req) {
-                Err(e) if is_busy(&e) => continue,
-                Err(e) => {
-                    assert!(format!("{e:#}").contains("does not fit"), "{e:#}");
-                    let events: Vec<StageEvent> = rx.try_iter().collect();
-                    assert!(!events
-                        .iter()
-                        .any(|ev| matches!(ev, StageEvent::NeedAck { .. })));
-                    return;
-                }
-                Ok(_) => panic!("30 GiB must not fit a BD-R 25"),
-            }
-        }
+        let dir = tempfile::tempdir().unwrap();
+        let (payload, device) = oversized_setup(dir.path());
+        let xorriso = fake_xorriso(dir.path(), &device, CHECK_CLEAN_FIXTURE);
+        let tools = tools_with(xorriso, None, None, None);
+        let (ctx, rx, ack_tx) = ctx_pair(cfg_with(&device, &dir.path().join("staging")), tools);
+        // a wrongly-emitted NeedAck must fail as "ui channel closed", not hang
+        drop(ack_tx);
+        let req = BurnRequest {
+            payloads: vec![payload],
+            label: None,
+            parity: true,
+            dry_run: false,
+            assume_yes: false,
+            amend: false,
+            discard_iso: false,
+        };
+        let e = run_burn(&ctx, &req).unwrap_err();
+        assert!(format!("{e:#}").contains("does not fit"), "{e:#}");
+        let events: Vec<StageEvent> = rx.try_iter().collect();
+        assert!(!events
+            .iter()
+            .any(|ev| matches!(ev, StageEvent::NeedAck { .. })));
     }
 
     #[test]
@@ -2788,47 +2722,41 @@ mod tests {
 
     #[test]
     fn amend_replans_and_pipeline_uses_amended_params() {
-        let (events, dir) = loop {
-            let dir = tempfile::tempdir().unwrap();
-            let payload = dir.path().join("vault.hc");
-            // 8 MiB = 128 par2 blocks, so 15% vs 25% redundancy differ visibly
-            std::fs::write(&payload, vec![7u8; 8 * 1024 * 1024]).unwrap();
-            let device = dir.path().join("device");
-            let staging = dir.path().join("staging");
-            let stage_dir = staging.join("T2_");
-            let mnt = dir.path().join("mnt");
-            let xorriso = fake_xorriso(dir.path(), &device, CHECK_CLEAN_FIXTURE);
-            let par2 = fake_par2(dir.path());
-            let udisksctl = fake_udisksctl(dir.path(), &mnt, &payload, &stage_dir);
-            let tools = tools_with(xorriso, Some(par2), Some(udisksctl), None);
-            let (ctx, rx, ack_tx) = ctx_pair(cfg_with(&device, &staging), tools);
-            ack_tx
-                .send(Ack::Amend(BurnParams {
-                    label: "t2!".into(),
-                    speed: Some(6),
-                    redundancy_pct: 25,
-                    parity: true,
-                    defect_management: false,
-                    staging: staging.clone(),
-                }))
-                .unwrap();
-            ack_tx.send(Ack::Proceed).unwrap();
-            let req = BurnRequest {
-                payloads: vec![payload.clone()],
-                label: Some("T1".into()),
+        let dir = tempfile::tempdir().unwrap();
+        let payload = dir.path().join("vault.hc");
+        // 8 MiB = 128 par2 blocks, so 15% vs 25% redundancy differ visibly
+        std::fs::write(&payload, vec![7u8; 8 * 1024 * 1024]).unwrap();
+        let device = dir.path().join("device");
+        let staging = dir.path().join("staging");
+        let stage_dir = staging.join("T2_");
+        let mnt = dir.path().join("mnt");
+        let xorriso = fake_xorriso(dir.path(), &device, CHECK_CLEAN_FIXTURE);
+        let par2 = fake_par2(dir.path());
+        let udisksctl = fake_udisksctl(dir.path(), &mnt, &payload, &stage_dir);
+        let tools = tools_with(xorriso, Some(par2), Some(udisksctl), None);
+        let (ctx, rx, ack_tx) = ctx_pair(cfg_with(&device, &staging), tools);
+        ack_tx
+            .send(Ack::Amend(BurnParams {
+                label: "t2!".into(),
+                speed: Some(6),
+                redundancy_pct: 25,
                 parity: true,
-                dry_run: false,
-                assume_yes: false,
-                amend: true,
-                discard_iso: false,
-            };
-            match run_burn(&ctx, &req) {
-                Err(e) if is_busy(&e) => continue,
-                Err(e) => panic!("{e:#}"),
-                Ok(()) => {}
-            }
-            break (rx.try_iter().collect::<Vec<StageEvent>>(), dir);
+                defect_management: false,
+                staging: staging.clone(),
+            }))
+            .unwrap();
+        ack_tx.send(Ack::Proceed).unwrap();
+        let req = BurnRequest {
+            payloads: vec![payload.clone()],
+            label: Some("T1".into()),
+            parity: true,
+            dry_run: false,
+            assume_yes: false,
+            amend: true,
+            discard_iso: false,
         };
+        run_burn(&ctx, &req).unwrap_or_else(|e| panic!("{e:#}"));
+        let events: Vec<StageEvent> = rx.try_iter().collect();
 
         let plans: Vec<(&BurnParams, u64)> = events
             .iter()
@@ -2862,46 +2790,40 @@ mod tests {
 
     #[test]
     fn amend_toggle_defect_management_runs_format_stage() {
-        let events = loop {
-            let dir = tempfile::tempdir().unwrap();
-            let payload = dir.path().join("vault.hc");
-            std::fs::write(&payload, vec![7u8; 128 * 1024]).unwrap();
-            let device = dir.path().join("device");
-            let staging = dir.path().join("staging");
-            let stage_dir = staging.join("T1");
-            let mnt = dir.path().join("mnt");
-            let xorriso = fake_xorriso(dir.path(), &device, CHECK_CLEAN_FIXTURE);
-            let par2 = fake_par2(dir.path());
-            let udisksctl = fake_udisksctl(dir.path(), &mnt, &payload, &stage_dir);
-            let tools = tools_with(xorriso, Some(par2), Some(udisksctl), None);
-            let (ctx, rx, ack_tx) = ctx_pair(cfg_with(&device, &staging), tools);
-            ack_tx
-                .send(Ack::Amend(BurnParams {
-                    label: "T1".into(),
-                    speed: None,
-                    redundancy_pct: 15,
-                    parity: true,
-                    defect_management: true,
-                    staging: staging.clone(),
-                }))
-                .unwrap();
-            ack_tx.send(Ack::Proceed).unwrap();
-            let req = BurnRequest {
-                payloads: vec![payload.clone()],
-                label: Some("T1".into()),
+        let dir = tempfile::tempdir().unwrap();
+        let payload = dir.path().join("vault.hc");
+        std::fs::write(&payload, vec![7u8; 128 * 1024]).unwrap();
+        let device = dir.path().join("device");
+        let staging = dir.path().join("staging");
+        let stage_dir = staging.join("T1");
+        let mnt = dir.path().join("mnt");
+        let xorriso = fake_xorriso(dir.path(), &device, CHECK_CLEAN_FIXTURE);
+        let par2 = fake_par2(dir.path());
+        let udisksctl = fake_udisksctl(dir.path(), &mnt, &payload, &stage_dir);
+        let tools = tools_with(xorriso, Some(par2), Some(udisksctl), None);
+        let (ctx, rx, ack_tx) = ctx_pair(cfg_with(&device, &staging), tools);
+        ack_tx
+            .send(Ack::Amend(BurnParams {
+                label: "T1".into(),
+                speed: None,
+                redundancy_pct: 15,
                 parity: true,
-                dry_run: false,
-                assume_yes: false,
-                amend: true,
-                discard_iso: false,
-            };
-            match run_burn(&ctx, &req) {
-                Err(e) if is_busy(&e) => continue,
-                Err(e) => panic!("{e:#}"),
-                Ok(()) => {}
-            }
-            break rx.try_iter().collect::<Vec<StageEvent>>();
+                defect_management: true,
+                staging: staging.clone(),
+            }))
+            .unwrap();
+        ack_tx.send(Ack::Proceed).unwrap();
+        let req = BurnRequest {
+            payloads: vec![payload.clone()],
+            label: Some("T1".into()),
+            parity: true,
+            dry_run: false,
+            assume_yes: false,
+            amend: true,
+            discard_iso: false,
         };
+        run_burn(&ctx, &req).unwrap_or_else(|e| panic!("{e:#}"));
+        let events: Vec<StageEvent> = rx.try_iter().collect();
 
         let last_params = events
             .iter()
@@ -2922,184 +2844,156 @@ mod tests {
 
     #[test]
     fn amend_canonicalizes_out_of_range_values() {
-        loop {
-            let dir = tempfile::tempdir().unwrap();
-            let payload = dir.path().join("vault.hc");
-            std::fs::write(&payload, vec![7u8; 4096]).unwrap();
-            let device = dir.path().join("device");
-            let xorriso = fake_xorriso(dir.path(), &device, CHECK_CLEAN_FIXTURE);
-            let tools = tools_with(xorriso, None, None, None);
-            let (ctx, rx, ack_tx) = ctx_pair(cfg_with(&device, &dir.path().join("staging")), tools);
-            ack_tx
-                .send(Ack::Amend(BurnParams {
-                    label: "".into(),
-                    speed: Some(0),
-                    redundancy_pct: 0,
-                    parity: true,
-                    defect_management: false,
-                    staging: dir.path().join("staging"),
-                }))
-                .unwrap();
-            ack_tx.send(Ack::Abort).unwrap();
-            let req = BurnRequest {
-                payloads: vec![payload],
-                label: None,
+        let dir = tempfile::tempdir().unwrap();
+        let payload = dir.path().join("vault.hc");
+        std::fs::write(&payload, vec![7u8; 4096]).unwrap();
+        let device = dir.path().join("device");
+        let xorriso = fake_xorriso(dir.path(), &device, CHECK_CLEAN_FIXTURE);
+        let tools = tools_with(xorriso, None, None, None);
+        let (ctx, rx, ack_tx) = ctx_pair(cfg_with(&device, &dir.path().join("staging")), tools);
+        ack_tx
+            .send(Ack::Amend(BurnParams {
+                label: "".into(),
+                speed: Some(0),
+                redundancy_pct: 0,
                 parity: true,
-                dry_run: false,
-                assume_yes: false,
-                amend: true,
-                discard_iso: false,
-            };
-            match run_burn(&ctx, &req) {
-                Err(e) if is_busy(&e) => continue,
-                Err(e) => assert!(e.to_string().contains("aborted by user"), "{e:#}"),
-                Ok(()) => panic!("abort must fail the run"),
-            }
-            let events: Vec<StageEvent> = rx.try_iter().collect();
-            let last_params = events
-                .iter()
-                .rev()
-                .find_map(|ev| match ev {
-                    StageEvent::Plan { params, .. } => Some(params),
-                    _ => None,
-                })
-                .expect("a Plan event");
-            assert_eq!(last_params.label, "ARCHIVE");
-            assert_eq!(last_params.speed, None);
-            assert_eq!(last_params.redundancy_pct, 1);
-            let warns: Vec<&String> = events
-                .iter()
-                .filter_map(|ev| match ev {
-                    StageEvent::Warn(t) => Some(t),
-                    _ => None,
-                })
-                .collect();
-            assert!(warns.iter().any(|t| t.contains("sanitized")), "{warns:?}");
-            assert!(
-                warns.iter().any(|t| t.contains("out of range")),
-                "{warns:?}"
-            );
-            assert!(
-                warns.iter().any(|t| t.contains("drive default")),
-                "{warns:?}"
-            );
-            return;
-        }
+                defect_management: false,
+                staging: dir.path().join("staging"),
+            }))
+            .unwrap();
+        ack_tx.send(Ack::Abort).unwrap();
+        let req = BurnRequest {
+            payloads: vec![payload],
+            label: None,
+            parity: true,
+            dry_run: false,
+            assume_yes: false,
+            amend: true,
+            discard_iso: false,
+        };
+        let e = run_burn(&ctx, &req).unwrap_err();
+        assert!(e.to_string().contains("aborted by user"), "{e:#}");
+        let events: Vec<StageEvent> = rx.try_iter().collect();
+        let last_params = events
+            .iter()
+            .rev()
+            .find_map(|ev| match ev {
+                StageEvent::Plan { params, .. } => Some(params),
+                _ => None,
+            })
+            .expect("a Plan event");
+        assert_eq!(last_params.label, "ARCHIVE");
+        assert_eq!(last_params.speed, None);
+        assert_eq!(last_params.redundancy_pct, 1);
+        let warns: Vec<&String> = events
+            .iter()
+            .filter_map(|ev| match ev {
+                StageEvent::Warn(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert!(warns.iter().any(|t| t.contains("sanitized")), "{warns:?}");
+        assert!(
+            warns.iter().any(|t| t.contains("out of range")),
+            "{warns:?}"
+        );
+        assert!(
+            warns.iter().any(|t| t.contains("drive default")),
+            "{warns:?}"
+        );
     }
 
     #[test]
     fn run_burn_dry_run_stops_after_plan() {
-        loop {
-            let dir = tempfile::tempdir().unwrap();
-            let payload = dir.path().join("vault.hc");
-            std::fs::write(&payload, vec![7u8; 4096]).unwrap();
-            let device = dir.path().join("device");
-            let xorriso = fake_xorriso(dir.path(), &device, CHECK_CLEAN_FIXTURE);
-            let tools = tools_with(xorriso, None, None, None);
-            let (ctx, rx, _ack) = ctx_pair(cfg_with(&device, &dir.path().join("staging")), tools);
-            let req = BurnRequest {
-                payloads: vec![payload],
-                label: None,
-                parity: true,
-                dry_run: true,
-                assume_yes: false,
-                amend: false,
-                discard_iso: false,
-            };
-            match run_burn(&ctx, &req) {
-                Err(e) if is_busy(&e) => continue,
-                Err(e) => panic!("{e:#}"),
-                Ok(()) => {}
-            }
-            let events: Vec<StageEvent> = rx.try_iter().collect();
-            assert!(matches!(
-                events.first(),
-                Some(StageEvent::StageStart(Stage::Preflight))
-            ));
-            assert!(events
-                .iter()
-                .any(|ev| matches!(ev, StageEvent::Plan { .. })));
-            let Some(StageEvent::Finished { report }) = events.last() else {
-                panic!("expected Finished, got {:?}", events.last());
-            };
-            assert!(report.iso_path.is_none());
-            assert!(report.stages.is_empty());
-            return;
-        }
+        let dir = tempfile::tempdir().unwrap();
+        let payload = dir.path().join("vault.hc");
+        std::fs::write(&payload, vec![7u8; 4096]).unwrap();
+        let device = dir.path().join("device");
+        let xorriso = fake_xorriso(dir.path(), &device, CHECK_CLEAN_FIXTURE);
+        let tools = tools_with(xorriso, None, None, None);
+        let (ctx, rx, _ack) = ctx_pair(cfg_with(&device, &dir.path().join("staging")), tools);
+        let req = BurnRequest {
+            payloads: vec![payload],
+            label: None,
+            parity: true,
+            dry_run: true,
+            assume_yes: false,
+            amend: false,
+            discard_iso: false,
+        };
+        run_burn(&ctx, &req).unwrap_or_else(|e| panic!("{e:#}"));
+        let events: Vec<StageEvent> = rx.try_iter().collect();
+        assert!(matches!(
+            events.first(),
+            Some(StageEvent::StageStart(Stage::Preflight))
+        ));
+        assert!(events
+            .iter()
+            .any(|ev| matches!(ev, StageEvent::Plan { .. })));
+        let Some(StageEvent::Finished { report }) = events.last() else {
+            panic!("expected Finished, got {:?}", events.last());
+        };
+        assert!(report.iso_path.is_none());
+        assert!(report.stages.is_empty());
     }
 
     #[test]
     fn run_burn_aborts_on_nack() {
-        loop {
-            let dir = tempfile::tempdir().unwrap();
-            let payload = dir.path().join("vault.hc");
-            std::fs::write(&payload, vec![7u8; 4096]).unwrap();
-            let device = dir.path().join("device");
-            let xorriso = fake_xorriso(dir.path(), &device, CHECK_CLEAN_FIXTURE);
-            let tools = tools_with(xorriso, None, None, None);
-            let (ctx, rx, ack_tx) = ctx_pair(cfg_with(&device, &dir.path().join("staging")), tools);
-            ack_tx.send(Ack::Abort).unwrap();
-            let req = BurnRequest {
-                payloads: vec![payload],
-                label: None,
-                parity: false,
-                dry_run: false,
-                assume_yes: false,
-                amend: false,
-                discard_iso: false,
-            };
-            match run_burn(&ctx, &req) {
-                Err(e) if is_busy(&e) => continue,
-                Err(e) => {
-                    assert!(e.to_string().contains("aborted by user"));
-                    let events: Vec<StageEvent> = rx.try_iter().collect();
-                    assert!(events
-                        .iter()
-                        .any(|ev| matches!(ev, StageEvent::NeedAck { .. })));
-                    assert!(events
-                        .iter()
-                        .any(|ev| matches!(ev, StageEvent::Failed { .. })));
-                    return;
-                }
-                Ok(()) => panic!("abort must fail the run"),
-            }
-        }
+        let dir = tempfile::tempdir().unwrap();
+        let payload = dir.path().join("vault.hc");
+        std::fs::write(&payload, vec![7u8; 4096]).unwrap();
+        let device = dir.path().join("device");
+        let xorriso = fake_xorriso(dir.path(), &device, CHECK_CLEAN_FIXTURE);
+        let tools = tools_with(xorriso, None, None, None);
+        let (ctx, rx, ack_tx) = ctx_pair(cfg_with(&device, &dir.path().join("staging")), tools);
+        ack_tx.send(Ack::Abort).unwrap();
+        let req = BurnRequest {
+            payloads: vec![payload],
+            label: None,
+            parity: false,
+            dry_run: false,
+            assume_yes: false,
+            amend: false,
+            discard_iso: false,
+        };
+        let e = run_burn(&ctx, &req).unwrap_err();
+        assert!(e.to_string().contains("aborted by user"));
+        let events: Vec<StageEvent> = rx.try_iter().collect();
+        assert!(events
+            .iter()
+            .any(|ev| matches!(ev, StageEvent::NeedAck { .. })));
+        assert!(events
+            .iter()
+            .any(|ev| matches!(ev, StageEvent::Failed { .. })));
     }
 
     #[test]
     fn run_burn_full_pipeline_with_fakes() {
-        let (events, report, dir) = loop {
-            let dir = tempfile::tempdir().unwrap();
-            let payload = dir.path().join("vault.hc");
-            std::fs::write(&payload, vec![7u8; 128 * 1024]).unwrap();
-            let device = dir.path().join("device");
-            let staging = dir.path().join("staging");
-            let stage_dir = staging.join("T1");
-            let mnt = dir.path().join("mnt");
-            let xorriso = fake_xorriso(dir.path(), &device, CHECK_CLEAN_FIXTURE);
-            let par2 = fake_par2(dir.path());
-            let udisksctl = fake_udisksctl(dir.path(), &mnt, &payload, &stage_dir);
-            let tools = tools_with(xorriso, Some(par2), Some(udisksctl), None);
-            let (ctx, rx, _ack) = ctx_pair(cfg_with(&device, &staging), tools);
-            let req = BurnRequest {
-                payloads: vec![payload.clone()],
-                label: Some("T1".into()),
-                parity: true,
-                dry_run: false,
-                assume_yes: true,
-                amend: false,
-                discard_iso: false,
-            };
-            match run_burn(&ctx, &req) {
-                Err(e) if is_busy(&e) => continue,
-                Err(e) => panic!("{e:#}"),
-                Ok(()) => {}
-            }
-            let events: Vec<StageEvent> = rx.try_iter().collect();
-            let Some(StageEvent::Finished { report }) = events.last() else {
-                panic!("expected Finished, got {:?}", events.last());
-            };
-            break (events.clone(), report.clone(), dir);
+        let dir = tempfile::tempdir().unwrap();
+        let payload = dir.path().join("vault.hc");
+        std::fs::write(&payload, vec![7u8; 128 * 1024]).unwrap();
+        let device = dir.path().join("device");
+        let staging = dir.path().join("staging");
+        let stage_dir = staging.join("T1");
+        let mnt = dir.path().join("mnt");
+        let xorriso = fake_xorriso(dir.path(), &device, CHECK_CLEAN_FIXTURE);
+        let par2 = fake_par2(dir.path());
+        let udisksctl = fake_udisksctl(dir.path(), &mnt, &payload, &stage_dir);
+        let tools = tools_with(xorriso, Some(par2), Some(udisksctl), None);
+        let (ctx, rx, _ack) = ctx_pair(cfg_with(&device, &staging), tools);
+        let req = BurnRequest {
+            payloads: vec![payload.clone()],
+            label: Some("T1".into()),
+            parity: true,
+            dry_run: false,
+            assume_yes: true,
+            amend: false,
+            discard_iso: false,
+        };
+        run_burn(&ctx, &req).unwrap_or_else(|e| panic!("{e:#}"));
+        let events: Vec<StageEvent> = rx.try_iter().collect();
+        let Some(StageEvent::Finished { report }) = events.last() else {
+            panic!("expected Finished, got {:?}", events.last());
         };
 
         let starts: Vec<Stage> = events
@@ -3153,169 +3047,126 @@ mod tests {
 
     #[test]
     fn run_burn_iso_verifies_against_sidecar() {
-        loop {
-            let dir = tempfile::tempdir().unwrap();
-            let iso = dir.path().join("copy.iso");
-            std::fs::write(&iso, vec![9u8; 8192]).unwrap();
-            let sha = hashing::sha256_file(&iso, &mut |_, _| {}).unwrap();
-            hashing::write_checksums(
-                &[(sha.clone(), "copy.iso".into())],
-                &dir.path().join("copy.iso.sha256"),
-            )
-            .unwrap();
-            let device = dir.path().join("device");
-            let xorriso = fake_xorriso(dir.path(), &device, CHECK_CLEAN_FIXTURE);
-            let tools = tools_with(xorriso, None, None, None);
-            let (ctx, rx, _ack) = ctx_pair(cfg_with(&device, &dir.path().join("staging")), tools);
-            match run_burn_iso(&ctx, &iso, true) {
-                Err(e) if is_busy(&e) => continue,
-                Err(e) => panic!("{e:#}"),
-                Ok(()) => {}
-            }
-            let events: Vec<StageEvent> = rx.try_iter().collect();
-            let Some(StageEvent::Finished { report }) = events.last() else {
-                panic!("expected Finished, got {:?}", events.last());
-            };
-            assert_eq!(report.iso_sha256.as_deref(), Some(sha.as_str()));
-            let log = dir.path().join("copy.burn.log");
-            assert_eq!(
-                report.written_files,
-                vec![
-                    dir.path().join("copy.run.log"),
-                    log.clone(),
-                    dir.path().join("copy.report.txt"),
-                ]
-            );
-            assert!(log.is_file());
-            assert!(events
-                .iter()
-                .any(|ev| matches!(ev, StageEvent::Info(t) if t.contains("recorded sha256"))));
-            return;
-        }
+        let dir = tempfile::tempdir().unwrap();
+        let iso = dir.path().join("copy.iso");
+        std::fs::write(&iso, vec![9u8; 8192]).unwrap();
+        let sha = hashing::sha256_file(&iso, &mut |_, _| {}).unwrap();
+        hashing::write_checksums(
+            &[(sha.clone(), "copy.iso".into())],
+            &dir.path().join("copy.iso.sha256"),
+        )
+        .unwrap();
+        let device = dir.path().join("device");
+        let xorriso = fake_xorriso(dir.path(), &device, CHECK_CLEAN_FIXTURE);
+        let tools = tools_with(xorriso, None, None, None);
+        let (ctx, rx, _ack) = ctx_pair(cfg_with(&device, &dir.path().join("staging")), tools);
+        run_burn_iso(&ctx, &iso, true).unwrap_or_else(|e| panic!("{e:#}"));
+        let events: Vec<StageEvent> = rx.try_iter().collect();
+        let Some(StageEvent::Finished { report }) = events.last() else {
+            panic!("expected Finished, got {:?}", events.last());
+        };
+        assert_eq!(report.iso_sha256.as_deref(), Some(sha.as_str()));
+        let log = dir.path().join("copy.burn.log");
+        assert_eq!(
+            report.written_files,
+            vec![
+                dir.path().join("copy.run.log"),
+                log.clone(),
+                dir.path().join("copy.report.txt"),
+            ]
+        );
+        assert!(log.is_file());
+        assert!(events
+            .iter()
+            .any(|ev| matches!(ev, StageEvent::Info(t) if t.contains("recorded sha256"))));
     }
 
     #[test]
     fn run_burn_iso_flags_readback_mismatch() {
-        loop {
-            let dir = tempfile::tempdir().unwrap();
-            let iso = dir.path().join("copy.iso");
-            std::fs::write(&iso, vec![9u8; 8192]).unwrap();
-            hashing::write_checksums(
-                &[("ab".repeat(32), "copy.iso".into())],
-                &dir.path().join("copy.iso.sha256"),
-            )
-            .unwrap();
-            let device = dir.path().join("device");
-            let xorriso = fake_xorriso(dir.path(), &device, CHECK_CLEAN_FIXTURE);
-            let tools = tools_with(xorriso, None, None, None);
-            let (ctx, _rx, _ack) = ctx_pair(cfg_with(&device, &dir.path().join("staging")), tools);
-            match run_burn_iso(&ctx, &iso, true) {
-                Err(e) if is_busy(&e) => continue,
-                Err(e) => {
-                    assert!(e.to_string().contains("DO NOT TRUST"), "{e:#}");
-                    return;
-                }
-                Ok(()) => panic!("mismatching sidecar must fail verification"),
-            }
-        }
+        let dir = tempfile::tempdir().unwrap();
+        let iso = dir.path().join("copy.iso");
+        std::fs::write(&iso, vec![9u8; 8192]).unwrap();
+        hashing::write_checksums(
+            &[("ab".repeat(32), "copy.iso".into())],
+            &dir.path().join("copy.iso.sha256"),
+        )
+        .unwrap();
+        let device = dir.path().join("device");
+        let xorriso = fake_xorriso(dir.path(), &device, CHECK_CLEAN_FIXTURE);
+        let tools = tools_with(xorriso, None, None, None);
+        let (ctx, _rx, _ack) = ctx_pair(cfg_with(&device, &dir.path().join("staging")), tools);
+        let e = run_burn_iso(&ctx, &iso, true).unwrap_err();
+        assert!(e.to_string().contains("DO NOT TRUST"), "{e:#}");
     }
 
     #[test]
     fn run_check_reports_clean_and_damaged() {
         for (fixture, want_clean) in [(CHECK_CLEAN_FIXTURE, true), (CHECK_DAMAGED_FIXTURE, false)] {
-            loop {
-                let dir = tempfile::tempdir().unwrap();
-                let device = dir.path().join("device");
-                std::fs::write(&device, vec![0u8; 4096]).unwrap();
-                let xorriso =
-                    fake_xorriso_probing(dir.path(), &device, PROBE_WRITTEN_FIXTURE, fixture);
-                let tools = tools_with(xorriso, None, None, None);
-                let (ctx, rx, _ack) =
-                    ctx_pair(cfg_with(&device, &dir.path().join("staging")), tools);
-                let res = run_check(&ctx, None);
-                match (&res, want_clean) {
-                    (Err(e), _) if is_busy(e) => continue,
-                    (Ok(()), true) => {
-                        let events: Vec<StageEvent> = rx.try_iter().collect();
-                        assert!(matches!(events.last(), Some(StageEvent::Finished { .. })));
-                    }
-                    (Err(e), false) => assert!(e.to_string().contains("DAMAGED"), "{e:#}"),
-                    (r, _) => panic!("unexpected result {r:?} for clean={want_clean}"),
+            let dir = tempfile::tempdir().unwrap();
+            let device = dir.path().join("device");
+            std::fs::write(&device, vec![0u8; 4096]).unwrap();
+            let xorriso = fake_xorriso_probing(dir.path(), &device, PROBE_WRITTEN_FIXTURE, fixture);
+            let tools = tools_with(xorriso, None, None, None);
+            let (ctx, rx, _ack) = ctx_pair(cfg_with(&device, &dir.path().join("staging")), tools);
+            let res = run_check(&ctx, None);
+            match (&res, want_clean) {
+                (Ok(()), true) => {
+                    let events: Vec<StageEvent> = rx.try_iter().collect();
+                    assert!(matches!(events.last(), Some(StageEvent::Finished { .. })));
                 }
-                break;
+                (Err(e), false) => assert!(e.to_string().contains("DAMAGED"), "{e:#}"),
+                (r, _) => panic!("unexpected result {r:?} for clean={want_clean}"),
             }
         }
     }
 
     #[test]
     fn run_info_save_persists_resolved_device() {
-        loop {
-            let dir = tempfile::tempdir().unwrap();
-            let device = dir.path().join("device");
-            let xorriso = fake_xorriso(dir.path(), &device, CHECK_CLEAN_FIXTURE);
-            let tools = tools_with(xorriso, None, None, None);
-            let (ctx, rx, _ack) = ctx_pair(cfg_with(&device, &dir.path().join("staging")), tools);
-            let cfg_path = dir.path().join("cfg").join("config.toml");
-            match run_info(&ctx, Some(&cfg_path)) {
-                Err(e) if is_busy(&e) => continue,
-                Err(e) => panic!("{e:#}"),
-                Ok(()) => {}
-            }
-            let text = std::fs::read_to_string(&cfg_path).unwrap();
-            assert!(text.contains(&device.display().to_string()));
-            let events: Vec<StageEvent> = rx.try_iter().collect();
-            assert!(events
-                .iter()
-                .any(|ev| matches!(ev, StageEvent::Info(t) if t.contains("saved device"))));
-            return;
-        }
+        let dir = tempfile::tempdir().unwrap();
+        let device = dir.path().join("device");
+        let xorriso = fake_xorriso(dir.path(), &device, CHECK_CLEAN_FIXTURE);
+        let tools = tools_with(xorriso, None, None, None);
+        let (ctx, rx, _ack) = ctx_pair(cfg_with(&device, &dir.path().join("staging")), tools);
+        let cfg_path = dir.path().join("cfg").join("config.toml");
+        run_info(&ctx, Some(&cfg_path)).unwrap_or_else(|e| panic!("{e:#}"));
+        let text = std::fs::read_to_string(&cfg_path).unwrap();
+        assert!(text.contains(&device.display().to_string()));
+        let events: Vec<StageEvent> = rx.try_iter().collect();
+        assert!(events
+            .iter()
+            .any(|ev| matches!(ev, StageEvent::Info(t) if t.contains("saved device"))));
     }
 
     #[test]
     fn run_check_save_persists_resolved_device() {
-        loop {
-            let dir = tempfile::tempdir().unwrap();
-            let device = dir.path().join("device");
-            std::fs::write(&device, vec![0u8; 4096]).unwrap();
-            let xorriso = fake_xorriso_probing(
-                dir.path(),
-                &device,
-                PROBE_WRITTEN_FIXTURE,
-                CHECK_CLEAN_FIXTURE,
-            );
-            let tools = tools_with(xorriso, None, None, None);
-            let (ctx, _rx, _ack) = ctx_pair(cfg_with(&device, &dir.path().join("staging")), tools);
-            let cfg_path = dir.path().join("config.toml");
-            match run_check(&ctx, Some(&cfg_path)) {
-                Err(e) if is_busy(&e) => continue,
-                Err(e) => panic!("{e:#}"),
-                Ok(()) => {}
-            }
-            let text = std::fs::read_to_string(&cfg_path).unwrap();
-            assert!(text.contains(&device.display().to_string()));
-            return;
-        }
+        let dir = tempfile::tempdir().unwrap();
+        let device = dir.path().join("device");
+        std::fs::write(&device, vec![0u8; 4096]).unwrap();
+        let xorriso = fake_xorriso_probing(
+            dir.path(),
+            &device,
+            PROBE_WRITTEN_FIXTURE,
+            CHECK_CLEAN_FIXTURE,
+        );
+        let tools = tools_with(xorriso, None, None, None);
+        let (ctx, _rx, _ack) = ctx_pair(cfg_with(&device, &dir.path().join("staging")), tools);
+        let cfg_path = dir.path().join("config.toml");
+        run_check(&ctx, Some(&cfg_path)).unwrap_or_else(|e| panic!("{e:#}"));
+        let text = std::fs::read_to_string(&cfg_path).unwrap();
+        assert!(text.contains(&device.display().to_string()));
     }
 
     #[test]
     fn run_check_refuses_blank_medium() {
-        loop {
-            let dir = tempfile::tempdir().unwrap();
-            let device = dir.path().join("device");
-            std::fs::write(&device, vec![0u8; 4096]).unwrap();
-            // default probe fixture reports a blank BD-R
-            let xorriso = fake_xorriso(dir.path(), &device, CHECK_CLEAN_FIXTURE);
-            let tools = tools_with(xorriso, None, None, None);
-            let (ctx, _rx, _ack) = ctx_pair(cfg_with(&device, &dir.path().join("staging")), tools);
-            match run_check(&ctx, None) {
-                Err(e) if is_busy(&e) => continue,
-                Err(e) => {
-                    assert!(e.to_string().contains("blank"), "{e:#}");
-                    return;
-                }
-                Ok(()) => panic!("check on a blank medium must refuse, not report clean"),
-            }
-        }
+        let dir = tempfile::tempdir().unwrap();
+        let device = dir.path().join("device");
+        std::fs::write(&device, vec![0u8; 4096]).unwrap();
+        // default probe fixture reports a blank BD-R
+        let xorriso = fake_xorriso(dir.path(), &device, CHECK_CLEAN_FIXTURE);
+        let tools = tools_with(xorriso, None, None, None);
+        let (ctx, _rx, _ack) = ctx_pair(cfg_with(&device, &dir.path().join("staging")), tools);
+        let e = run_check(&ctx, None).unwrap_err();
+        assert!(e.to_string().contains("blank"), "{e:#}");
     }
 
     #[test]
@@ -3350,31 +3201,24 @@ mod tests {
 
     #[test]
     fn run_info_emits_media_fields() {
-        loop {
-            let dir = tempfile::tempdir().unwrap();
-            let device = dir.path().join("device");
-            let xorriso = fake_xorriso(dir.path(), &device, CHECK_CLEAN_FIXTURE);
-            let tools = tools_with(xorriso, None, None, None);
-            let (ctx, rx, _ack) = ctx_pair(cfg_with(&device, &dir.path().join("staging")), tools);
-            match run_info(&ctx, None) {
-                Err(e) if is_busy(&e) => continue,
-                Err(e) => panic!("{e:#}"),
-                Ok(()) => {}
-            }
-            let events: Vec<StageEvent> = rx.try_iter().collect();
-            let outs: Vec<&String> = events
-                .iter()
-                .filter_map(|ev| match ev {
-                    StageEvent::Out(t) => Some(t),
-                    _ => None,
-                })
-                .collect();
-            assert!(outs.iter().any(|t| t.contains("BD-R 25 GB")));
-            assert!(outs.iter().any(|t| t.contains("free")));
-            assert!(outs.iter().any(|t| t.contains("write speeds")));
-            assert!(matches!(events.last(), Some(StageEvent::Finished { .. })));
-            return;
-        }
+        let dir = tempfile::tempdir().unwrap();
+        let device = dir.path().join("device");
+        let xorriso = fake_xorriso(dir.path(), &device, CHECK_CLEAN_FIXTURE);
+        let tools = tools_with(xorriso, None, None, None);
+        let (ctx, rx, _ack) = ctx_pair(cfg_with(&device, &dir.path().join("staging")), tools);
+        run_info(&ctx, None).unwrap_or_else(|e| panic!("{e:#}"));
+        let events: Vec<StageEvent> = rx.try_iter().collect();
+        let outs: Vec<&String> = events
+            .iter()
+            .filter_map(|ev| match ev {
+                StageEvent::Out(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert!(outs.iter().any(|t| t.contains("BD-R 25 GB")));
+        assert!(outs.iter().any(|t| t.contains("free")));
+        assert!(outs.iter().any(|t| t.contains("write speeds")));
+        assert!(matches!(events.last(), Some(StageEvent::Finished { .. })));
     }
 
     #[test]
@@ -3402,33 +3246,26 @@ mod tests {
 
     #[test]
     fn run_plan_falls_back_to_bd25_when_probe_fails() {
-        loop {
-            let dir = tempfile::tempdir().unwrap();
-            let payload = dir.path().join("vault.hc");
-            std::fs::write(&payload, vec![1u8; 4096]).unwrap();
-            let xorriso = dir.path().join("xorriso");
-            write_script(
-                &xorriso,
-                "#!/bin/sh\necho 'xorriso : FAILURE : Cannot acquire drive' >&2\nexit 1\n",
-            );
-            let tools = tools_with(xorriso, None, None, None);
-            let (ctx, rx, _ack) = ctx_pair(
-                cfg_with(Path::new("/dev/sr9"), &dir.path().join("s")),
-                tools,
-            );
-            match run_plan(&ctx, &[payload], None) {
-                Err(e) if is_busy(&e) => continue,
-                Err(e) => panic!("{e:#}"),
-                Ok(()) => {}
-            }
-            let events: Vec<StageEvent> = rx.try_iter().collect();
-            assert!(events.iter().any(
-                |ev| matches!(ev, StageEvent::Info(t) if t.contains("assuming a blank BD-R 25"))
-            ));
-            assert!(events
-                .iter()
-                .any(|ev| matches!(ev, StageEvent::Plan { .. })));
-            return;
-        }
+        let dir = tempfile::tempdir().unwrap();
+        let payload = dir.path().join("vault.hc");
+        std::fs::write(&payload, vec![1u8; 4096]).unwrap();
+        let xorriso = dir.path().join("xorriso");
+        write_script(
+            &xorriso,
+            "#!/bin/sh\necho 'xorriso : FAILURE : Cannot acquire drive' >&2\nexit 1\n",
+        );
+        let tools = tools_with(xorriso, None, None, None);
+        let (ctx, rx, _ack) = ctx_pair(
+            cfg_with(Path::new("/dev/sr9"), &dir.path().join("s")),
+            tools,
+        );
+        run_plan(&ctx, &[payload], None).unwrap_or_else(|e| panic!("{e:#}"));
+        let events: Vec<StageEvent> = rx.try_iter().collect();
+        assert!(events
+            .iter()
+            .any(|ev| matches!(ev, StageEvent::Info(t) if t.contains("assuming a blank BD-R 25"))));
+        assert!(events
+            .iter()
+            .any(|ev| matches!(ev, StageEvent::Plan { .. })));
     }
 }

@@ -274,15 +274,7 @@ mod tests {
         let fake = dir.join("xorriso");
         std::fs::write(&fake, script).unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-        Tools {
-            xorriso: fake,
-            par2: None,
-            par2_version: None,
-            udisksctl: None,
-            veracrypt: None,
-            eject: None,
-            mediainfo: None,
-        }
+        Tools::bare(fake)
     }
 
     #[test]

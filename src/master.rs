@@ -94,7 +94,7 @@ fn graft(target: &str, source: &Path) -> String {
     format!("{escaped}={}", source.display())
 }
 
-fn file_name_of(p: &Path) -> String {
+pub(crate) fn file_name_of(p: &Path) -> String {
     p.file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| p.display().to_string())
@@ -643,15 +643,7 @@ mod tests {
         let fake = dir.join("xorriso");
         std::fs::write(&fake, script).unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-        Tools {
-            xorriso: fake,
-            par2: None,
-            par2_version: None,
-            udisksctl: None,
-            veracrypt: None,
-            eject: None,
-            mediainfo: None,
-        }
+        Tools::bare(fake)
     }
 
     #[test]

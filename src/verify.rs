@@ -433,15 +433,7 @@ mod tests {
     }
 
     fn no_tools() -> Tools {
-        Tools {
-            xorriso: PathBuf::from("/bin/true"),
-            par2: None,
-            par2_version: None,
-            udisksctl: None,
-            veracrypt: None,
-            eject: None,
-            mediainfo: None,
-        }
+        Tools::bare("/bin/true")
     }
 
     #[test]
