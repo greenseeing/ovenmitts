@@ -4,12 +4,13 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use ratatui::backend::Backend;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, Gauge, Paragraph, Wrap};
-use ratatui::{DefaultTerminal, Frame};
+use ratatui::{Frame, Terminal};
 
 use crate::config::Config;
 use crate::plan::{human_bytes, ArchivePlan, MediaInfo, Payload};
@@ -41,11 +42,63 @@ const STAGE_ORDER: [Stage; 10] = [
     Stage::CheckMedia,
 ];
 
+/// Terminal input feed for the event loop: crossterm in production, a
+/// scripted queue in tests so the wizard runs headless against a TestBackend.
+pub(crate) trait InputSource {
+    fn poll(&mut self, timeout: Duration) -> Result<bool>;
+    fn read(&mut self) -> Result<Event>;
+    /// Discard queued input. Bounded so a pathological stream cannot stall
+    /// the UI; errors are moot (no input to flush is the goal state).
+    fn flush(&mut self) {
+        for _ in 0..1024 {
+            match self.poll(Duration::ZERO) {
+                Ok(true) => {
+                    let _ = self.read();
+                }
+                _ => break,
+            }
+        }
+    }
+}
+
+struct CrosstermInput;
+
+impl InputSource for CrosstermInput {
+    fn poll(&mut self, timeout: Duration) -> Result<bool> {
+        Ok(event::poll(timeout)?)
+    }
+
+    fn read(&mut self) -> Result<Event> {
+        Ok(event::read()?)
+    }
+}
+
 /// Ratatui wizard: probe + plan screen (Enter = burn, q = quit), live pipeline
 /// screen (stage gauges + event log), report screen. Runs the pipeline on a
 /// worker thread; renders StageEvents; answers NeedAck prompts through the ack
 /// channel.
 pub fn run(cfg: Config, tools: Tools, req: BurnRequest) -> Result<()> {
+    let mut terminal = ratatui::init();
+    // keys queued before this screen existed (shell autorepeat, the picker's
+    // confirm Enter) must not leak into the wizard
+    flush_input();
+    let result = run_with(&mut terminal, &mut CrosstermInput, cfg, tools, req);
+    ratatui::restore();
+    result
+}
+
+/// Everything [`run`] does between terminal setup and restore, generic over
+/// backend and input so tests can drive the whole wizard without a tty.
+fn run_with<B: Backend>(
+    terminal: &mut Terminal<B>,
+    input: &mut dyn InputSource,
+    cfg: Config,
+    tools: Tools,
+    req: BurnRequest,
+) -> Result<()>
+where
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
     let req = BurnRequest { amend: true, ..req };
     let payloads = payload_rows(&req.payloads);
     let params = BurnParams::resolve(&cfg, &req);
@@ -58,13 +111,8 @@ pub fn run(cfg: Config, tools: Tools, req: BurnRequest) -> Result<()> {
     // as Ctrl-C. (Ctrl-C itself reaches the loop as a key in raw mode.)
     let stop = crate::shutdown::install();
 
-    let mut terminal = ratatui::init();
-    // keys queued before this screen existed (shell autorepeat, the picker's
-    // confirm Enter) must not leak into the wizard
-    flush_input();
     let mut app = App::new(cfg, payloads, params, ack_tx);
-    let loop_result = app.event_loop(&mut terminal, &rx, &stop);
-    ratatui::restore();
+    let loop_result = app.event_loop(terminal, input, &rx, &stop);
 
     // A UI-loop error (e.g. a draw failure) while the burn is still live must
     // not orphan the tool: shut it down before surfacing the error.
@@ -248,12 +296,16 @@ impl App {
         self.edit.as_ref().unwrap_or(&self.params)
     }
 
-    fn event_loop(
+    fn event_loop<B: Backend>(
         &mut self,
-        terminal: &mut DefaultTerminal,
+        terminal: &mut Terminal<B>,
+        input: &mut dyn InputSource,
         rx: &Receiver<StageEvent>,
         stop: &std::sync::Arc<std::sync::atomic::AtomicBool>,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        B::Error: std::error::Error + Send + Sync + 'static,
+    {
         while !self.quit {
             if crate::shutdown::stopping(stop) {
                 self.force_quit = true;
@@ -263,10 +315,10 @@ impl App {
             terminal.draw(|frame| self.render(frame))?;
             if self.pending_ack.is_some() && self.ack_shown.is_none() {
                 self.ack_shown = Some(Instant::now());
-                flush_input();
+                input.flush();
             }
-            if event::poll(Duration::from_millis(100))? {
-                if let Event::Key(key) = event::read()? {
+            if input.poll(Duration::from_millis(100))? {
+                if let Event::Key(key) = input.read()? {
                     if key.kind == KeyEventKind::Press {
                         self.on_key(key);
                     }
@@ -1345,17 +1397,9 @@ fn log_row(warn: bool, row: String) -> Line<'static> {
     Line::from(Span::styled(row, style))
 }
 
-/// Discard queued terminal input. Bounded so a pathological stream cannot
-/// stall the UI; errors are moot (no input to flush is the goal state).
+/// Discard queued input from the real terminal (see [`InputSource::flush`]).
 pub(crate) fn flush_input() {
-    for _ in 0..1024 {
-        match event::poll(Duration::ZERO) {
-            Ok(true) => {
-                let _ = event::read();
-            }
-            _ => break,
-        }
-    }
+    CrosstermInput.flush();
 }
 
 pub(crate) fn pad(area: Rect) -> Rect {
@@ -2148,5 +2192,139 @@ mod tests {
         assert!(rows.len() > 1);
         assert!(rows[0].1.starts_with("  ! "));
         assert!(rows[1..].iter().all(|(_, r)| r.starts_with("    ")));
+    }
+
+    const SMOKE_DEADLINE: Duration = Duration::from_secs(30);
+
+    /// Scripted wizard keys: silent until the burn prompt arms (the event
+    /// loop's one flush() call anchors that instant), then Enter after the
+    /// real ACK_ARM_DELAY plus margin, then `q` forever — inert mid-run,
+    /// quits the report screen.
+    struct ScriptedInput {
+        started: Instant,
+        armed: Option<Instant>,
+        enter_sent: bool,
+        next_at: Instant,
+    }
+
+    impl ScriptedInput {
+        fn new() -> Self {
+            Self {
+                started: Instant::now(),
+                armed: None,
+                enter_sent: false,
+                next_at: Instant::now(),
+            }
+        }
+
+        fn due(&self) -> bool {
+            self.armed
+                .is_some_and(|t| t.elapsed() >= ACK_ARM_DELAY + Duration::from_millis(150))
+                && Instant::now() >= self.next_at
+        }
+    }
+
+    impl InputSource for ScriptedInput {
+        fn poll(&mut self, timeout: Duration) -> Result<bool> {
+            anyhow::ensure!(
+                self.started.elapsed() < SMOKE_DEADLINE,
+                "smoke test still running after {SMOKE_DEADLINE:?} — wizard never quit \
+                 (armed: {}, enter sent: {})",
+                self.armed.is_some(),
+                self.enter_sent,
+            );
+            if !self.due() {
+                std::thread::sleep(timeout);
+            }
+            Ok(self.due())
+        }
+
+        fn read(&mut self) -> Result<Event> {
+            self.next_at = Instant::now() + Duration::from_millis(50);
+            let code = if self.enter_sent {
+                KeyCode::Char('q')
+            } else {
+                self.enter_sent = true;
+                KeyCode::Enter
+            };
+            Ok(Event::Key(key(code)))
+        }
+
+        fn flush(&mut self) {
+            self.armed.get_or_insert_with(Instant::now);
+        }
+    }
+
+    // OVENMITTS_FAKE_* are process-global; this is the only tui test setting
+    // them (pipeline tests run in a separate process). Guard any second
+    // env-touching test in this file with a mutex.
+    #[test]
+    fn smoke_wizard_drives_plan_run_report_over_fake_pipeline() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = dir.path().join("vault.hc");
+        std::fs::write(&payload, vec![0xA5u8; 2 * 1024 * 1024]).unwrap();
+        let device = dir.path().join("fake-device");
+        let staging = dir.path().join("staging");
+        let iso = staging.join("SMOKE").join("SMOKE.iso");
+        std::env::set_var("OVENMITTS_FAKE_DEVICE", &device);
+        std::env::set_var(
+            "OVENMITTS_FAKE_MOUNT",
+            format!("{}.contents", iso.display()),
+        );
+
+        let bin = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fakebin");
+        let tools = Tools {
+            xorriso: bin.join("xorriso"),
+            par2: Some(bin.join("par2")),
+            par2_version: Some("fake par2".into()),
+            udisksctl: Some(bin.join("udisksctl")),
+            veracrypt: None,
+            eject: Some(bin.join("eject")),
+            mediainfo: None,
+            dvdisaster: Some(bin.join("dvdisaster")),
+        };
+        let cfg = Config {
+            device: device.display().to_string(),
+            device_explicit: true,
+            staging: staging.clone(),
+            speed: Some(4),
+            redundancy_pct: 15,
+            headroom_pct: 5,
+            defect_management: false,
+            keep_iso: true,
+            eject_when_done: None,
+            stall_timeout_secs: 0,
+            ecc: true,
+        };
+        let req = BurnRequest {
+            payloads: vec![payload],
+            label: Some("SMOKE".into()),
+            parity: true,
+            dry_run: false,
+            assume_yes: false,
+            amend: false,
+            discard_iso: false,
+        };
+
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut input = ScriptedInput::new();
+        run_with(&mut terminal, &mut input, cfg, tools, req)
+            .unwrap_or_else(|e| panic!("wizard must finish clean: {e:#}"));
+
+        let buf = terminal.backend().buffer();
+        let text = (0..40)
+            .map(|y| (0..120).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(iso.is_file(), "pipeline must stage the ISO");
+        assert!(
+            text.contains(" Report "),
+            "final draw must be the report screen:\n{text}"
+        );
+        assert!(text.contains("archive complete"), "{text}");
+        assert!(text.contains("Files written"), "{text}");
     }
 }
