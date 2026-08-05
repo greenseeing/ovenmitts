@@ -7,10 +7,33 @@ GitHub release. `install.sh` then resolves the latest release and downloads
 the binary for the host architecture.
 
 There is no one-time CI setup: the workflow authenticates with its own run
-token, granted `contents: write` inside the workflow file itself.
+token, granted `contents: write` (plus `id-token: write` and
+`attestations: write` for provenance) scoped to the release job itself.
+
+The release job also records a signed [build-provenance
+attestation](https://docs.github.com/actions/security-guides/using-artifact-attestations)
+for each binary via `actions/attest-build-provenance`. No key custody: GitHub's
+OIDC identity and the Sigstore public-good infrastructure sign it. Anyone can
+confirm a downloaded binary was built by this workflow from this repo:
+
+```bash
+gh attestation verify ovenmitts-linux-amd64 --repo greenseeing/ovenmitts
+```
 
 GitHub's runners are amd64-only; the arm64 binary is cross-compiled with
 `cargo zigbuild`.
+
+## Signing (deliberate non-goal, for now)
+
+Releases are **not** signed with a maintainer-held key (minisign/GPG). The
+provenance attestation above roots trust in GitHub + Sigstore, which is
+sufficient while the trust anchor is "this GitHub repo built it." A
+maintainer-held minisign key would additionally survive a full GitHub-account
+compromise, but only if the private key lives off GitHub and each release is
+signed locally — a key-custody obligation a solo maintainer must opt into
+deliberately. If adopted later: embed the public key in the binary, publish
+`<asset>.minisig` release assets, and verify with the zero-dependency
+`minisign-verify` crate before the updater replaces the binary.
 
 ## Cutting a release
 

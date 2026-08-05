@@ -96,32 +96,57 @@ install_backends() {
 }
 
 # --- versions -------------------------------------------------------------
+# Reject anything not MAJOR.MINOR.PATCH: the value lands in a URL and a path.
+valid_version() {
+  case "$1" in
+    *[!0-9.]*) return 1 ;;
+    [0-9]*.[0-9]*.[0-9]*)
+      [ "$(printf '%s' "$1" | tr -cd '.' | wc -c)" -eq 2 ] ;;
+    *) return 1 ;;
+  esac
+}
+
 latest_version() {
+  local version
   # An explicit pin skips the API entirely.
   if [ -n "${OVENMITTS_VERSION:-}" ]; then
-    printf '%s' "${OVENMITTS_VERSION#v}"
+    version="${OVENMITTS_VERSION#v}"
+    valid_version "$version" || die "OVENMITTS_VERSION is not a valid version: '$OVENMITTS_VERSION'"
+    printf '%s' "$version"
     return 0
   fi
   # Resolve the newest release tag (e.g. v0.1.0 -> 0.1.0) via the GitHub API.
   local body
-  body="$(curl -sSL "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null || true)"
-  printf '%s' "$body" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"v\{0,1\}\([^"]*\)".*/\1/p' | head -n1
+  body="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest")" \
+    || die "could not query GitHub for the latest release (is the network up?)"
+  version="$(printf '%s' "$body" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"v\{0,1\}\([^"]*\)".*/\1/p' | head -n1)"
+  valid_version "$version" || die "GitHub returned an unexpected release tag: '$version'"
+  printf '%s' "$version"
 }
 
-installed_version() {
-  if command -v "$BIN" >/dev/null 2>&1; then
-    "$BIN" --version 2>/dev/null | awk '{print $2}'
-  fi
+release_url() {
+  printf 'https://github.com/%s/releases/download/v%s/%s-linux-%s' "$REPO" "$1" "$BIN" "$2"
+}
+
+# Resolve the on-PATH binary to its real file, or nothing if not installed.
+# We deliberately do NOT execute it (e.g. `--version`): the decision to
+# upgrade is made from a hash comparison, never by running an untrusted file.
+installed_path() {
+  local existing
+  existing="$(command -v "$BIN" 2>/dev/null || true)"
+  [ -n "$existing" ] && readlink -f "$existing"
 }
 
 # --- install --------------------------------------------------------------
 # Reuse an existing install's directory so re-runs replace in place instead of
 # shadowing it; otherwise default to ~/.local/bin (no sudo for the common case).
+# This resolves through the user's own PATH — intentional, so upgrade-in-place
+# finds wherever the user actually installed the binary.
 choose_bindir() {
   local existing
-  existing="$(command -v "$BIN" 2>/dev/null || true)"
+  existing="$(installed_path)"
   if [ -n "$existing" ]; then
-    dirname "$(readlink -f "$existing")"
+    dirname "$existing"
   else
     echo "$HOME/.local/bin"
   fi
@@ -129,20 +154,25 @@ choose_bindir() {
 
 sha256_of() {
   if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$1" | awk '{print $1}'
+    sha256sum "$1" | awk 'NR==1{print $1}'
   elif command -v shasum >/dev/null 2>&1; then
-    shasum -a 256 "$1" | awk '{print $1}'
+    shasum -a 256 "$1" | awk 'NR==1{print $1}'
   fi
+}
+
+# The published SHA-256 for a release asset, from its `.sha256` sidecar.
+# Takes field 1 of the FIRST line only (a sidecar is one `<hash>  <name>` line).
+published_sha() {
+  local sums
+  sums="$(curl -fsSL "${1}.sha256")" \
+    || die "no published checksum for this release — refusing to install unverified"
+  printf '%s' "$sums" | awk 'NR==1{print $1}'
 }
 
 verify_checksum() {
   local file="$1" url="$2"
-  local sums expected actual
-  sums="$(curl -fsSL "${url}.sha256" 2>/dev/null || true)"
-  if [ -z "$sums" ]; then
-    die "no published checksum for this release — refusing to install unverified"
-  fi
-  expected="$(printf '%s' "$sums" | awk '{print $1}')"
+  local expected actual
+  expected="$(published_sha "$url")"
   actual="$(sha256_of "$file")"
   if [ -z "$actual" ]; then
     die "no sha256 tool found (install coreutils) — refusing to install unverified"
@@ -156,15 +186,18 @@ verify_checksum() {
 # sidesteps ETXTBSY ("Text file busy") when replacing a running binary.
 install_binary() {
   local version="$1" arch="$2" bindir="$3"
-  local url="https://github.com/$REPO/releases/download/v${version}/${BIN}-linux-${arch}"
+  local url
+  url="$(release_url "$version" "$arch")"
   step "Downloading $BIN v$version ($arch)"
 
   mkdir -p "$bindir" 2>/dev/null || as_root mkdir -p "$bindir"
 
   local tmp writable=0
   [ -w "$bindir" ] && writable=1
+  # mktemp gives an O_EXCL, unpredictable, 0600 file — an attacker can neither
+  # pre-create the name nor plant a symlink for the download/cp to follow.
   if [ "$writable" -eq 1 ]; then
-    tmp="$bindir/.$BIN.new.$$"
+    tmp="$(mktemp "$bindir/.$BIN.new.XXXXXXXX")"
   else
     tmp="$(mktemp)"
   fi
@@ -174,17 +207,20 @@ install_binary() {
     die "download failed: $url"
   fi
   verify_checksum "$tmp" "$url"
-  chmod +x "$tmp"
+  chmod 0755 "$tmp"
 
   if [ "$writable" -eq 1 ]; then
     mv -f "$tmp" "$bindir/$BIN"
   else
     # Stage inside $bindir (same filesystem) so the final replace is an atomic
     # rename. A cross-filesystem mv from /tmp is not atomic and can hit ETXTBSY
-    # when replacing a running binary.
-    local stage="$bindir/.$BIN.new.$$"
+    # when replacing a running binary. mktemp creates the staging file as a
+    # root-owned regular file, so the cp cannot be redirected through a
+    # pre-planted symlink.
+    local stage
+    stage="$(as_root mktemp "$bindir/.$BIN.new.XXXXXXXX")"
     as_root cp "$tmp" "$stage"
-    as_root chmod +x "$stage"
+    as_root chmod 0755 "$stage"
     as_root mv -f "$stage" "$bindir/$BIN"
     rm -f "$tmp" 2>/dev/null || true
   fi
@@ -203,18 +239,26 @@ backends_present() {
 main() {
   command -v curl >/dev/null 2>&1 || die "curl is required"
 
-  local arch pm latest current bindir
+  local arch pm latest latest_sha existing existing_sha up_to_date bindir
   arch="$(detect_arch)"
   latest="$(latest_version)"
-  current="$(installed_version)"
+  latest_sha="$(published_sha "$(release_url "$latest" "$arch")")"
 
-  if [ -z "$latest" ]; then
-    die "could not determine the latest release (is the network up?)"
+  # "Already current" is decided by hashing the installed file against the
+  # published sidecar — never by executing the on-PATH binary. Both hashes must
+  # be non-empty: an empty published sha (odd CDN response) or a missing sha256
+  # tool must never let "" = "" wave an unverified binary through.
+  existing="$(installed_path)"
+  existing_sha=""
+  [ -n "$existing" ] && existing_sha="$(sha256_of "$existing")"
+  up_to_date=0
+  if [ -n "$existing_sha" ] && [ -n "$latest_sha" ] && [ "$existing_sha" = "$latest_sha" ]; then
+    up_to_date=1
   fi
 
   # Nothing to do: skip the package manager entirely so a re-run is a fast no-op.
-  if [ "$current" = "$latest" ] && backends_present; then
-    ok "$BIN is already up to date (v$current) and ready to use"
+  if [ "$up_to_date" -eq 1 ] && backends_present; then
+    ok "$BIN is already up to date (v$latest) and ready to use"
     return 0
   fi
 
@@ -222,10 +266,10 @@ main() {
   install_backends "$pm"
 
   bindir="$(choose_bindir)"
-  if [ "$current" = "$latest" ]; then
-    ok "$BIN v$current is already installed"
+  if [ "$up_to_date" -eq 1 ]; then
+    ok "$BIN v$latest is already installed"
   else
-    [ -n "$current" ] && step "Upgrading $BIN: v$current -> v$latest"
+    [ -n "$existing" ] && step "Upgrading $BIN to v$latest"
     install_binary "$latest" "$arch" "$bindir"
   fi
 

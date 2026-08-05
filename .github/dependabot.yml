@@ -1,0 +1,12 @@
+# Keep the SHA-pinned actions and the Cargo lockfile current. Without this,
+# pinning by commit SHA silently freezes dependencies at their pinned version.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly

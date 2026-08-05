@@ -733,3 +733,45 @@ fn run_verify_passes_against_burned_device() {
         .iter()
         .any(|ev| matches!(ev, StageEvent::Failed { .. })));
 }
+
+#[test]
+fn run_verify_refuses_disc_with_traversal_checksums() {
+    let h = Harness::new();
+    let payload = h.payload("vault.hc", 8 * 1024 * 1024, 13);
+    let stage_dir = h.stage_dir("EVIL");
+    let iso = stage_dir.join("EVIL.iso");
+    h.set_mount_for(&iso);
+
+    let (ctx, rx, _ack) = h.ctx();
+    runner::run_burn(&ctx, &burn_request(vec![payload], "EVIL")).unwrap();
+    drain(ctx, rx);
+
+    // A crafted disc names a host path outside the mount. The verifier must
+    // abort before emitting any per-file result (no host-file existence oracle).
+    let mount = PathBuf::from(format!("{}.contents", iso.display()));
+    std::fs::write(
+        mount.join("checksums.sha256"),
+        format!("{}  ../../../../etc/hostname\n", "0".repeat(64)),
+    )
+    .unwrap();
+
+    let (ctx, rx, _ack) = h.ctx();
+    let err = runner::run_verify(&ctx, Some(&iso)).unwrap_err();
+    let events = drain(ctx, rx);
+
+    assert!(
+        format!("{err:#}").contains("plain relative path"),
+        "{err:#}"
+    );
+    assert!(
+        !stage_dones(&events).contains(&Stage::VerifyFiles),
+        "must not complete file verification on a tampered disc"
+    );
+    assert!(matches!(
+        events.last(),
+        Some(StageEvent::Failed {
+            stage: Stage::VerifyFiles,
+            ..
+        })
+    ));
+}

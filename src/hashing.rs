@@ -1,8 +1,8 @@
 use std::fs::File;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use sha2::{Digest, Sha256};
 
 const CHUNK: usize = 1024 * 1024;
@@ -70,9 +70,63 @@ pub fn parse_checksums(text: &str) -> Result<Vec<(String, String)>> {
         if rel.is_empty() {
             bail!("checksums line {}: empty path", i + 1);
         }
+        if !plain_relative(rel) {
+            bail!("checksums line {}: not a plain relative path", i + 1);
+        }
         entries.push((hash.to_ascii_lowercase(), rel.to_string()));
     }
     Ok(entries)
+}
+
+/// Only bare `a/b/c` paths: non-empty, no root, no `..`, no leading `.`.
+fn plain_relative(rel: &str) -> bool {
+    !rel.is_empty()
+        && Path::new(rel)
+            .components()
+            .all(|c| matches!(c, Component::Normal(_)))
+}
+
+enum Resolved {
+    File(PathBuf),
+    Missing,
+}
+
+// A verify disc is untrusted input: a checksums file naming host paths, or a
+// Rock Ridge symlink escaping the mount, must abort the whole run — per-entry
+// pass/fail output would tell a crafted disc which host files exist.
+//
+// Descend component by component with lstat (no symlink is ever followed). A
+// legitimate ovenmitts disc never lists symlinks (they are excluded from
+// checksums at burn time), so any symlink on the path is anomalous and rejected
+// uniformly — dangling or not. That uniformity is what closes the oracle:
+// following a symlink and letting its target's existence decide bail-vs-missing
+// would leak whether an attacker-named host path exists. `NotFound` therefore
+// only ever means a genuinely-absent, symlink-free path (an ordinary missing
+// file), never a probe of anything outside the mount.
+fn resolve_under_root(canon_root: &Path, rel: &str) -> Result<Resolved> {
+    ensure!(
+        plain_relative(rel),
+        "checksums entry '{rel}' is not a plain relative path - refusing to verify this disc"
+    );
+    let mut cur = canon_root.to_path_buf();
+    for comp in Path::new(rel).components() {
+        let Component::Normal(name) = comp else {
+            // plain_relative already guaranteed this; belt and suspenders.
+            bail!("checksums entry '{rel}' is not a plain relative path - refusing to verify this disc");
+        };
+        cur.push(name);
+        match std::fs::symlink_metadata(&cur) {
+            Ok(m) if m.file_type().is_symlink() => bail!(
+                "checksums entry '{rel}' escapes the disc root (symlink on the disc?) - refusing to verify this disc"
+            ),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Resolved::Missing),
+            Err(e) => return Err(e).with_context(|| format!("resolve {rel}")),
+        }
+    }
+    // Every component was a real, non-symlink entry pushed onto canon_root, so
+    // the result is guaranteed under the root.
+    Ok(Resolved::File(cur))
 }
 
 /// Hash every listed file under root and compare; returns (relpath, ok) per entry.
@@ -81,23 +135,33 @@ pub fn verify_checksums(
     entries: &[(String, String)],
     cb: &mut dyn FnMut(u64, u64),
 ) -> Result<Vec<(String, bool)>> {
-    let sizes: Vec<u64> = entries
+    let canon_root = root
+        .canonicalize()
+        .with_context(|| format!("resolve {}", root.display()))?;
+    let resolved = entries
         .iter()
-        .map(|(_, rel)| {
-            std::fs::metadata(root.join(rel))
-                .map(|m| m.len())
-                .unwrap_or(0)
+        .map(|(_, rel)| resolve_under_root(&canon_root, rel))
+        .collect::<Result<Vec<_>>>()?;
+    let sizes: Vec<u64> = resolved
+        .iter()
+        .map(|r| match r {
+            Resolved::File(p) => std::fs::metadata(p).map(|m| m.len()).unwrap_or(0),
+            Resolved::Missing => 0,
         })
         .collect();
     let total: u64 = sizes.iter().sum();
     let mut base = 0u64;
     cb(0, total);
     let mut results = Vec::with_capacity(entries.len());
-    for ((expected, rel), size) in entries.iter().zip(&sizes) {
-        let path = root.join(rel);
-        let ok = match sha256_file(&path, &mut |done, _| cb(base + done.min(*size), total)) {
-            Ok(actual) => actual == expected.to_ascii_lowercase(),
-            Err(_) => false,
+    for (((expected, rel), size), res) in entries.iter().zip(&sizes).zip(&resolved) {
+        let ok = match res {
+            Resolved::Missing => false,
+            Resolved::File(path) => {
+                match sha256_file(path, &mut |done, _| cb(base + done.min(*size), total)) {
+                    Ok(actual) => actual == expected.to_ascii_lowercase(),
+                    Err(_) => false,
+                }
+            }
         };
         base += size;
         cb(base, total);
@@ -178,6 +242,81 @@ mod tests {
         assert!(parse_checksums(&format!("{}zz  bad-chars", &ABC[..62])).is_err());
         assert!(parse_checksums(&format!("{ABC} single-space")).is_err());
         assert!(parse_checksums(&format!("{ABC}  ")).is_err());
+    }
+
+    #[test]
+    fn parse_rejects_traversal_paths() {
+        for rel in ["/etc/hostname", "../x", "a/../../x", "./x", ".."] {
+            let line = format!("{ABC}  {rel}");
+            assert!(parse_checksums(&line).is_err(), "accepted {rel:?}");
+        }
+        assert!(parse_checksums(&format!("{ABC}  parity/a.par2")).is_ok());
+    }
+
+    #[test]
+    fn verify_bails_on_traversal_before_any_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let entries = vec![(ABC.to_string(), "../outside".to_string())];
+        assert!(verify_checksums(dir.path(), &entries, &mut |_, _| {}).is_err());
+    }
+
+    #[test]
+    fn verify_bails_on_symlink_escape() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret"), b"abc").unwrap();
+        let root = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret"), root.path().join("link"))
+            .unwrap();
+        let entries = vec![(ABC.to_string(), "link".to_string())];
+        let err = verify_checksums(root.path(), &entries, &mut |_, _| {}).unwrap_err();
+        assert!(err.to_string().contains("escapes the disc root"), "{err:#}");
+    }
+
+    #[test]
+    fn dangling_symlink_bails_like_existing_one_no_oracle() {
+        // A symlink to a nonexistent path must bail exactly like one to an
+        // existing path — otherwise bail-vs-missing leaks host-path existence.
+        let root = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("/no/such/path/xyz-12345", root.path().join("probe")).unwrap();
+        let entries = vec![(ABC.to_string(), "probe".to_string())];
+        let err = verify_checksums(root.path(), &entries, &mut |_, _| {}).unwrap_err();
+        assert!(err.to_string().contains("escapes the disc root"), "{err:#}");
+    }
+
+    #[test]
+    fn intermediate_symlink_dir_bails() {
+        // A symlinked *directory* component must not be descended into either.
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(outside.path().join("d")).unwrap();
+        std::fs::write(outside.path().join("d/f"), b"abc").unwrap();
+        let root = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path().join("d"), root.path().join("d")).unwrap();
+        let entries = vec![(ABC.to_string(), "d/f".to_string())];
+        let err = verify_checksums(root.path(), &entries, &mut |_, _| {}).unwrap_err();
+        assert!(err.to_string().contains("escapes the disc root"), "{err:#}");
+    }
+
+    #[test]
+    fn verify_accepts_nested_real_files() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("parity")).unwrap();
+        std::fs::write(root.path().join("parity/a.par2"), b"abc").unwrap();
+        let entries = vec![(ABC.to_string(), "parity/a.par2".to_string())];
+        let res = verify_checksums(root.path(), &entries, &mut |_, _| {}).unwrap();
+        assert_eq!(res, vec![("parity/a.par2".to_string(), true)]);
+    }
+
+    #[test]
+    fn verify_rejects_even_in_root_symlinks() {
+        // A real ovenmitts disc never lists a symlink in checksums.sha256, so
+        // any symlink is anomalous and rejected uniformly - even one that
+        // resolves inside the mount - to keep the no-oracle guarantee simple.
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("real"), b"abc").unwrap();
+        std::os::unix::fs::symlink("real", root.path().join("alias")).unwrap();
+        let entries = vec![(ABC.to_string(), "alias".to_string())];
+        let err = verify_checksums(root.path(), &entries, &mut |_, _| {}).unwrap_err();
+        assert!(err.to_string().contains("escapes the disc root"), "{err:#}");
     }
 
     #[test]

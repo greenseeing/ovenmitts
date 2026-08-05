@@ -5,6 +5,63 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Mounted-VeraCrypt-container detection now fails closed.** The preflight
+  check that refuses to burn a mounted container previously treated *any*
+  `veracrypt --list` failure (a spawn error, an unexpected exit) as "nothing
+  mounted" and proceeded — so a transient failure could let a live container be
+  archived as silent garbage. It now distinguishes VeraCrypt's normal
+  "No volumes mounted" (exit 1) empty case from real failures, and refuses the
+  burn when mount state cannot be determined.
+- **External tools run under `LC_ALL=C`.** Progress and capacity parsing keyed
+  on `.`-decimal numbers and English keywords (`38.2%`, `23.3g`, `MB written`);
+  under a non-C locale the tools emit `38,2%` and localized words, silently
+  freezing progress bars and — worse — misreading capacity into the fit check.
+  Every external command is now spawned through one helper that pins the C
+  locale.
+
+### Security
+
+- **Disc verification refuses path-traversal and symlink escapes.** `ovenmitts
+  verify` reads `checksums.sha256` off the mounted disc, which is untrusted
+  input. Entries whose path is absolute, contains `..`, or resolves (via a Rock
+  Ridge symlink on the disc) outside the mount now abort the run instead of
+  hashing an arbitrary host file — closing a file-existence oracle. Malicious
+  entries fail the whole verify rather than reporting a per-file result.
+- **`ovenmitts update` no longer pipes a shell script into bash.** It was
+  re-fetching `install.sh` from the mutable `main` branch and running it, so any
+  push to `main` was code execution on every updater. Update is now entirely
+  in-process: it downloads the release binary for the host arch over hardened
+  TLS (`--proto =https --proto-redir =https --tlsv1.2`, no shell), verifies it
+  against the published SHA-256 sidecar before installing, and swaps the binary
+  with an atomic same-filesystem rename. It never escalates privileges and never
+  executes a fetched script. `OVENMITTS_VERSION` still pins a version (now
+  validated as `MAJOR.MINOR.PATCH`).
+- **`install.sh` hardened.** Staging files are created with `mktemp` (O_EXCL,
+  unpredictable, 0600) instead of a predictable `$bindir/.ovenmitts.new.$$`, so
+  the download and the root-side `cp` can no longer be redirected through a
+  planted symlink. The GitHub release tag is shape-validated before it reaches a
+  URL/path, the release-API call fails loudly instead of silently, and the
+  upgrade decision is made by hashing the installed binary against the published
+  sidecar rather than by executing the on-PATH binary.
+
+### Added
+
+- CI: `ci.yml` runs tests, `clippy -D warnings`, `rustfmt --check`, an MSRV
+  (1.80) check, and `shellcheck`/`bash -n` on `install.sh` for every push and
+  PR; `audit.yml` runs `cargo audit` weekly. Release binaries now carry signed
+  build-provenance attestations (`gh attestation verify`).
+
+### Changed
+
+- Supply-chain hardening for GitHub Actions: workflow actions and the build
+  container are pinned by commit SHA / image digest, `permissions` are
+  least-privilege (read-only by default, write scoped to the release job), and
+  `dependabot.yml` keeps the pins current.
+
 ## [0.1.8] - 2026-07-24
 
 No functional changes to ovenmitts itself — this release moves where it lives.
@@ -226,6 +283,7 @@ No functional changes to ovenmitts itself — this release moves where it lives.
   TUI — an operator is present — while unattended line-mode runs leave it
   loaded so the tray isn't left open.
 
+[Unreleased]: https://github.com/greenseeing/ovenmitts/compare/v0.1.8...HEAD
 [0.1.8]: https://github.com/greenseeing/ovenmitts/releases/tag/v0.1.8
 [0.1.7]: https://github.com/greenseeing/ovenmitts/releases/tag/v0.1.7
 [0.1.6]: https://github.com/greenseeing/ovenmitts/releases/tag/v0.1.6

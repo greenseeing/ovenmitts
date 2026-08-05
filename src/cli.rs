@@ -85,7 +85,7 @@ pub enum Command {
         #[arg(long)]
         save: bool,
     },
-    /// Update ovenmitts to the latest release (re-runs the installer)
+    /// Update ovenmitts: download and verify the latest release, replace in place
     Update,
     /// Capacity math without a disc: does the payload + parity fit?
     Plan {
