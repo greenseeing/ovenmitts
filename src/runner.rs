@@ -545,12 +545,14 @@ impl<'a> BurnRun<'a> {
             });
 
             if req.dry_run {
-                confirm_gate(ctx, &plan, &params.staging)?;
+                // table BEFORE the staging gate: a dry run on a host without
+                // the peak staging space must still show what it would take
                 if let Some(span) = &plan.span {
                     for line in span_table(span) {
                         ctx.info(line);
                     }
                 }
+                confirm_gate(ctx, &plan, &params.staging)?;
                 ctx.info("dry run - stopping after plan".into());
                 ctx.send(StageEvent::Finished {
                     report: RunReport::default(),

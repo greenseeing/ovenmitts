@@ -603,6 +603,11 @@ impl App {
                 self.amend_with(|p| p.speed = value);
             }
             ROW_REDUNDANCY => {
+                // inert for sets: the recovery count is derived, and a
+                // no-op replan would only suggest the knob does something
+                if self.plan.as_ref().is_some_and(|p| p.span.is_some()) {
+                    return;
+                }
                 let next = (self.shown_params().redundancy_pct as i64 + delta).clamp(1, 100) as u32;
                 self.amend_with(|p| p.redundancy_pct = next);
             }
@@ -963,11 +968,19 @@ impl App {
             ("Speed      ", speed_text, "←/→ cycle · e type"),
             (
                 "Redundancy ",
-                format!(
-                    "{}%  → parity ~{}",
-                    params.redundancy_pct,
-                    human_bytes(plan.parity_bytes_est)
-                ),
+                match &plan.span {
+                    // sets derive the recovery count from the parity disc's
+                    // capacity; redundancy_pct is not consulted
+                    Some(span) => format!(
+                        "derived — {} recovery blocks (fills the parity disc)",
+                        span.recovery_blocks
+                    ),
+                    None => format!(
+                        "{}%  → parity ~{}",
+                        params.redundancy_pct,
+                        human_bytes(plan.parity_bytes_est)
+                    ),
+                },
                 "←/→ adjust",
             ),
             (
