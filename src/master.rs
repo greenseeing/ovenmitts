@@ -141,6 +141,7 @@ pub fn write_manifest(
     payloads: &[ManifestEntry],
     redundancy_pct: Option<u32>,
     defect_management: bool,
+    ecc: bool,
 ) -> Result<()> {
     use std::fmt::Write as _;
     let mut t = String::new();
@@ -174,6 +175,15 @@ pub fn write_manifest(
             "off (stream recording)"
         }
     );
+    let _ = writeln!(
+        t,
+        "  sector ecc: {}",
+        if ecc {
+            "dvdisaster RS02, embedded when free capacity allowed (self-identifying)"
+        } else {
+            "none"
+        }
+    );
     let _ = writeln!(t);
     let _ = writeln!(t, "payloads:");
     for e in payloads {
@@ -201,18 +211,27 @@ pub fn write_manifest(
 /// exact commands for: mount + copy, ddrescue a failing disc, par2repair the
 /// payload, regenerate the file->LBA map from disc or ISO, VeraCrypt header
 /// restore pointers.
-pub fn write_recovery(out: &Path, label: &str, payloads: &[Payload]) -> Result<()> {
+pub fn write_recovery(out: &Path, label: &str, payloads: &[Payload], ecc: bool) -> Result<()> {
     use std::fmt::Write as _;
     let mut t = String::new();
+    let mut step = 0u32;
+    let mut num = move || {
+        step += 1;
+        step
+    };
     let _ = writeln!(t, "RECOVERY — disc \"{label}\"");
     let _ = writeln!(
         t,
         "Mastered and burned with xorriso; recovery needs only standard tools"
     );
-    let _ = writeln!(t, "(ddrescue, par2, xorriso).");
+    if ecc {
+        let _ = writeln!(t, "(ddrescue, dvdisaster, par2, xorriso).");
+    } else {
+        let _ = writeln!(t, "(ddrescue, par2, xorriso).");
+    }
     let _ = writeln!(t, "Commands assume Linux with this disc in /dev/sr0.");
     let _ = writeln!(t);
-    let _ = writeln!(t, "1. Disc reads normally: mount and copy");
+    let _ = writeln!(t, "{}. Disc reads normally: mount and copy", num());
     let _ = writeln!(t, "   mount -o ro /dev/sr0 /mnt");
     for p in payloads {
         let flag = if p.is_dir { "-r " } else { "" };
@@ -227,7 +246,8 @@ pub fn write_recovery(out: &Path, label: &str, payloads: &[Payload]) -> Result<(
     let _ = writeln!(t);
     let _ = writeln!(
         t,
-        "2. Disc has read errors: image everything readable first (GNU ddrescue)"
+        "{}. Disc has read errors: image everything readable first (GNU ddrescue)",
+        num()
     );
     let _ = writeln!(t, "   ddrescue /dev/sr0 recovered.iso rescue.map");
     let _ = writeln!(
@@ -238,9 +258,28 @@ pub fn write_recovery(out: &Path, label: &str, payloads: &[Payload]) -> Result<(
         t,
         "   Unreadable sectors stay zero-filled and the image keeps its full"
     );
-    let _ = writeln!(t, "   length - exactly what par2 repair (step 4) expects.");
+    let _ = writeln!(t, "   length - exactly what the repair steps below expect.");
+    if ecc {
+        let _ = writeln!(t);
+        let _ = writeln!(
+            t,
+            "{}. Repair sector damage with the embedded ECC (dvdisaster RS02)",
+            num()
+        );
+        let _ = writeln!(
+            t,
+            "   The image carries a dvdisaster RS02 layer when free disc capacity"
+        );
+        let _ = writeln!(
+            t,
+            "   allowed at mastering time; it self-identifies. Run this BEFORE the"
+        );
+        let _ = writeln!(t, "   par2 step - it repairs raw sectors in the image:");
+        let _ = writeln!(t, "   dvdisaster -i recovered.iso -t     # assess");
+        let _ = writeln!(t, "   dvdisaster -i recovered.iso -f     # repair in place");
+    }
     let _ = writeln!(t);
-    let _ = writeln!(t, "3. Extract files from the rescued image");
+    let _ = writeln!(t, "{}. Extract files from the rescued image", num());
     let _ = writeln!(t, "   mount -o loop,ro recovered.iso /mnt");
     let _ = writeln!(t, "   or without root:");
     for p in payloads {
@@ -253,7 +292,8 @@ pub fn write_recovery(out: &Path, label: &str, payloads: &[Payload]) -> Result<(
     let _ = writeln!(t);
     let _ = writeln!(
         t,
-        "4. Repair a damaged payload with the parity on this disc"
+        "{}. Repair a damaged payload with the parity on this disc",
+        num()
     );
     let _ = writeln!(
         t,
@@ -279,7 +319,8 @@ pub fn write_recovery(out: &Path, label: &str, payloads: &[Payload]) -> Result<(
     let _ = writeln!(t);
     let _ = writeln!(
         t,
-        "5. Map damaged sectors to files (regenerate the file->LBA table)"
+        "{}. Map damaged sectors to files (regenerate the file->LBA table)",
+        num()
     );
     let _ = writeln!(t, "   xorriso -indev /dev/sr0 -find / -exec report_lba --");
     let _ = writeln!(
@@ -294,7 +335,7 @@ pub fn write_recovery(out: &Path, label: &str, payloads: &[Payload]) -> Result<(
         .collect();
     if !containers.is_empty() {
         let _ = writeln!(t);
-        let _ = writeln!(t, "6. VeraCrypt containers");
+        let _ = writeln!(t, "{}. VeraCrypt containers", num());
         let _ = writeln!(
             t,
             "   Containers mount read-only straight from the mounted disc:"
@@ -566,7 +607,7 @@ mod tests {
             sha256: Some("ab".repeat(32)),
             par2: Some((655_360, 32_768)),
         }];
-        write_manifest(&out, "VAULT_20260717", &payloads, Some(15), false).unwrap();
+        write_manifest(&out, "VAULT_20260717", &payloads, Some(15), false, false).unwrap();
         let text = std::fs::read_to_string(&out).unwrap();
         assert!(
             !text.contains("ovenmitts"),
@@ -596,7 +637,7 @@ mod tests {
             sha256: Some("cd".repeat(32)),
             par2: None,
         };
-        write_manifest(&out, "L", &[entry], None, true).unwrap();
+        write_manifest(&out, "L", &[entry], None, true, false).unwrap();
         let text = std::fs::read_to_string(&out).unwrap();
         assert!(text.contains("parity: none"));
         assert!(text.contains("defect management: on"));
@@ -615,7 +656,7 @@ mod tests {
             sha256: None,
             par2: Some((65_536, 47)),
         };
-        write_manifest(&out, "L", &[entry], Some(15), false).unwrap();
+        write_manifest(&out, "L", &[entry], Some(15), false, true).unwrap();
         let text = std::fs::read_to_string(&out).unwrap();
         assert!(text.contains("  extras/\n"), "{text}");
         assert!(text.contains("files: 42"), "{text}");
@@ -634,7 +675,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("RECOVERY.txt");
         let payloads = vec![payload("/h/vault.hc", 10), payload("/h/notes.hc", 5)];
-        write_recovery(&out, "VAULT_20260717", &payloads).unwrap();
+        write_recovery(&out, "VAULT_20260717", &payloads, true).unwrap();
         let text = std::fs::read_to_string(&out).unwrap();
         assert!(text.contains("disc \"VAULT_20260717\""));
         assert!(text.contains("mount -o ro /dev/sr0 /mnt"));
@@ -674,7 +715,7 @@ mod tests {
             ),
             payload("/h/vault.hc", 10),
         ];
-        write_recovery(&out, "L", &payloads).unwrap();
+        write_recovery(&out, "L", &payloads, false).unwrap();
         let text = std::fs::read_to_string(&out).unwrap();
         assert!(text.contains("cp -r /mnt/extras ."), "{text}");
         assert!(
@@ -697,7 +738,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("RECOVERY.txt");
         let payloads = vec![dir_payload("/h/extras", &[("extras/a.bin", 10, false)])];
-        write_recovery(&out, "L", &payloads).unwrap();
+        write_recovery(&out, "L", &payloads, false).unwrap();
         let text = std::fs::read_to_string(&out).unwrap();
         assert!(!text.contains("veracrypt"), "{text}");
         assert!(!text.contains("VeraCrypt containers"), "{text}");

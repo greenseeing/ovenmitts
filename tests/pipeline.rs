@@ -67,6 +67,7 @@ impl Harness {
             veracrypt: None,
             eject: Some(bin.join("eject")),
             mediainfo: None,
+            dvdisaster: Some(bin.join("dvdisaster")),
         }
     }
 
@@ -82,6 +83,7 @@ impl Harness {
             keep_iso: true,
             eject_when_done: None,
             stall_timeout_secs: 0,
+            ecc: true,
         }
     }
 
@@ -478,6 +480,25 @@ fn burn_pipeline_end_to_end() {
     for f in &report.written_files {
         assert!(f.is_file(), "reported file missing: {}", f.display());
     }
+
+    // the RS02 layer rides inside the image (and therefore the burned copy -
+    // device_sha == iso_sha above); the sidecar hash was computed after
+    // augmentation or that equality would not hold
+    let iso_on_disk = std::fs::read(&iso).unwrap();
+    assert!(
+        iso_on_disk.ends_with(b"OVENMITTS-FAKE-ECC"),
+        "ECC augmentation must run between mastering and hashing"
+    );
+    let dv_argv = std::fs::read_to_string(format!("{}.dvdisaster_argv", iso.display())).unwrap();
+    let dv: Vec<&str> = dv_argv.lines().collect();
+    assert!(dv.contains(&"-mRS02"), "{dv_argv}");
+    assert!(dv.contains(&"-c"), "{dv_argv}");
+    assert!(
+        events
+            .iter()
+            .any(|ev| matches!(ev, StageEvent::Info(t) if t.contains("RS02 ECC embedded"))),
+        "ECC completion must be announced"
+    );
 
     // the run record must survive the process: stage transitions in run.log,
     // provenance + summaries in the report

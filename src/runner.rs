@@ -8,7 +8,7 @@ use anyhow::{bail, ensure, Context, Result};
 use crate::config::Config;
 use crate::plan::{self, human_bytes, ArchivePlan, MediaInfo, Payload, PlanInput};
 use crate::tools::Tools;
-use crate::{burn, hashing, master, media, parity, verify};
+use crate::{burn, ecc, hashing, master, media, parity, verify};
 
 const READY_TIMEOUT: Duration = Duration::from_secs(180);
 
@@ -710,6 +710,11 @@ impl<'a> BurnRun<'a> {
         // may have consumed the space that was free at confirm time.
         check_staging_space_for_iso(plan, &params.staging)?;
         let label = &staging.label;
+        // The on-disc docs go INTO the image, so the ECC decision is made on
+        // what is knowable now: tool present + enabled ("when free capacity
+        // allowed" - RS02 self-identifies, so the wording stays true even
+        // when the margin check later declines).
+        let ecc_attempted = ctx.cfg.ecc && ctx.tools.dvdisaster.is_some();
         let manifest_path = staging.dir.join("MANIFEST.txt");
         let recovery_path = staging.dir.join("RECOVERY.txt");
         master::write_manifest(
@@ -718,8 +723,9 @@ impl<'a> BurnRun<'a> {
             &sums.manifest_rows,
             params.parity.then_some(params.redundancy_pct),
             params.defect_management,
+            ecc_attempted,
         )?;
-        master::write_recovery(&recovery_path, label, payloads)?;
+        master::write_recovery(&recovery_path, label, payloads, ecc_attempted)?;
         let iso = staging.dir.join(format!("{label}.iso"));
         let input = master::MasterInput {
             label,
@@ -730,7 +736,7 @@ impl<'a> BurnRun<'a> {
             recovery: &recovery_path,
             out_iso: &iso,
         };
-        let iso_bytes = master::build_iso(
+        let mut iso_bytes = master::build_iso(
             &ctx.tools,
             &input,
             ctx.cfg.stall_timeout(),
@@ -740,6 +746,45 @@ impl<'a> BurnRun<'a> {
         )?;
         // a truncated master (torn write, full disk) must die here, not on a disc
         master::check_iso_truncation(&iso)?;
+        if let Some(dvdisaster) = ctx.tools.dvdisaster.as_ref().filter(|_| ctx.cfg.ecc) {
+            match ecc::augment_target(iso_bytes, plan.budget) {
+                Some(target) => {
+                    ctx.info(format!(
+                        "embedding RS02 sector ECC (dvdisaster): filling the image to \
+                         {target} sectors"
+                    ));
+                    iso_bytes = ecc::augment(
+                        dvdisaster,
+                        &iso,
+                        target,
+                        ctx.cfg.stall_timeout(),
+                        &mut |line| {
+                            let l = line.trim();
+                            if !l.is_empty() {
+                                ctx.progress(Stage::Master, None, l.to_string());
+                            }
+                        },
+                    )?;
+                    // descriptors must still parse after in-place augmentation
+                    master::check_iso_truncation(&iso)?;
+                    ctx.info(format!(
+                        "RS02 ECC embedded - image now {}",
+                        human_bytes(iso_bytes)
+                    ));
+                }
+                None => ctx.warn(
+                    "not enough free disc space for a meaningful RS02 ECC layer \
+                     (needs >=5% of the image) - skipped"
+                        .into(),
+                ),
+            }
+        } else if ctx.cfg.ecc {
+            ctx.info(
+                "dvdisaster not found - no sector-level ECC layer on this disc \
+                 (install the speed47 fork; par2 parity remains)"
+                    .into(),
+            );
+        }
         let lba_path = staging.dir.join(format!("{label}.lba.txt"));
         master::report_lba(&ctx.tools, &iso, &lba_path)?;
         let iso_sha = {
@@ -1866,6 +1911,7 @@ fn report_text(report: &RunReport, tools: &Tools) -> String {
         ("veracrypt", &tools.veracrypt),
         ("eject", &tools.eject),
         ("dvd+rw-mediainfo", &tools.mediainfo),
+        ("dvdisaster", &tools.dvdisaster),
     ] {
         if let Some(p) = path {
             let _ = writeln!(t, "  {name}: {}", p.display());
@@ -2117,6 +2163,7 @@ mod tests {
             keep_iso: true,
             eject_when_done: None,
             stall_timeout_secs: 0,
+            ecc: true,
         }
     }
 

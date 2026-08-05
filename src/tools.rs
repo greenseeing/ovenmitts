@@ -11,6 +11,7 @@ pub struct Tools {
     pub veracrypt: Option<PathBuf>,
     pub eject: Option<PathBuf>,
     pub mediainfo: Option<PathBuf>,
+    pub dvdisaster: Option<PathBuf>,
 }
 
 impl Tools {
@@ -24,6 +25,7 @@ impl Tools {
             veracrypt: None,
             eject: None,
             mediainfo: None,
+            dvdisaster: None,
         }
     }
 }
@@ -73,6 +75,7 @@ pub fn discover() -> Result<Tools> {
         veracrypt: which("veracrypt"),
         eject: which("eject"),
         mediainfo: which("dvd+rw-mediainfo"),
+        dvdisaster: which("dvdisaster"),
     })
 }
 

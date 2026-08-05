@@ -15,6 +15,7 @@ pub struct FileConfig {
     pub keep_iso: Option<bool>,
     pub eject_when_done: Option<bool>,
     pub stall_timeout_secs: Option<u32>,
+    pub ecc: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -35,6 +36,10 @@ pub struct Config {
     /// Kill a streaming tool after this many seconds of *no output* (inactivity,
     /// not total runtime — burns run for an hour). 0 disables the watchdog.
     pub stall_timeout_secs: u32,
+    /// Embed a dvdisaster RS02 sector-ECC layer in the mastered image, sized
+    /// to the disc budget (space that would otherwise burn empty). Effective
+    /// only when the dvdisaster binary is discovered.
+    pub ecc: bool,
 }
 
 pub fn default_path() -> PathBuf {
@@ -157,6 +162,7 @@ impl Config {
             keep_iso: file.keep_iso.unwrap_or(true),
             eject_when_done: file.eject_when_done,
             stall_timeout_secs: file.stall_timeout_secs.unwrap_or(900),
+            ecc: file.ecc.unwrap_or(true),
         })
     }
 
@@ -183,6 +189,9 @@ mod tests {
         assert_eq!(c.eject_when_done, None);
         assert_eq!(c.stall_timeout_secs, 900);
         assert_eq!(c.stall_timeout(), std::time::Duration::from_secs(900));
+        assert!(c.ecc, "sector ECC defaults on (needs the binary to act)");
+        let f: FileConfig = toml::from_str("ecc = false\n").unwrap();
+        assert!(!Config::resolve(f).unwrap().ecc);
     }
 
     #[test]

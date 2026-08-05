@@ -16,6 +16,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   version, tool paths, and the par2 version banner. `burn-iso` writes both
   next to the ISO. Until now a crash or closed terminal erased the whole
   story of a burn.
+- **Sector-level ECC layer (dvdisaster RS02).** File-level par2 cannot help
+  when the disc's filesystem metadata itself decays; a dvdisaster RS02 layer
+  can, because it protects raw sectors and self-identifies inside the image.
+  When the `dvdisaster` binary is discovered (the actively maintained
+  speed47 fork is recommended) and `ecc = true` (the default), the mastered
+  image is augmented in place, sized to fill the disc budget — protection
+  paid for with space that would otherwise burn empty. The ISO hash, sidecar
+  and read-back verification all cover the augmented image; the layer is
+  skipped with a note when the tool is absent or the free margin is under
+  5% of the image. `MANIFEST.txt` records the layer and `RECOVERY.txt` walks
+  through `dvdisaster -i recovered.iso -t` / `-f` ahead of the par2 step.
 - **ISO truncation self-check.** A truncated image (torn copy, disk that
   filled mid-master) burns into a disc that fails verification 20 minutes
   later — or worse, a disc missing its tail. The mastered image's ISO 9660

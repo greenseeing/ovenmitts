@@ -1,6 +1,7 @@
 pub mod burn;
 pub mod cli;
 pub mod config;
+pub mod ecc;
 pub mod fsutil;
 pub mod hashing;
 pub mod master;

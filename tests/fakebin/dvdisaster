@@ -1,0 +1,14 @@
+#!/bin/sh
+# Fake dvdisaster (speed47 fork argv: -i <image> -mRS02 -n <sectors> -c):
+# appends a marker tail to the image and records argv next to it.
+set -eu
+img=""
+prev=""
+for a in "$@"; do
+    if [ "$prev" = "-i" ]; then img="$a"; fi
+    prev="$a"
+done
+: "${img:?fake dvdisaster: no -i image argument}"
+printf '%s\n' "$@" > "$img.dvdisaster_argv"
+printf 'OVENMITTS-FAKE-ECC' >> "$img"
+printf 'augmenting image with RS02 error correction data\n'
