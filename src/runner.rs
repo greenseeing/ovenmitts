@@ -95,6 +95,9 @@ pub struct RunReport {
     pub reminders: Vec<String>,
     /// Every file the run left on disk, in write order.
     pub written_files: Vec<PathBuf>,
+    /// Ways the run's guarantees were weakened but not broken (e.g. buffered
+    /// read-back after a physical reload). Rendered as caveats, never silent.
+    pub degradations: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -254,6 +257,7 @@ pub fn run_burn(ctx: &RunnerCtx, req: &BurnRequest) -> Result<()> {
 
 fn burn_pipeline(ctx: &RunnerCtx, req: &BurnRequest, stage: &mut Stage) -> Result<()> {
     let mut stages: Vec<(Stage, String)> = Vec::new();
+    let mut degradations: Vec<String> = Vec::new();
 
     *stage = Stage::Preflight;
     ctx.start(Stage::Preflight);
@@ -533,7 +537,9 @@ fn burn_pipeline(ctx: &RunnerCtx, req: &BurnRequest, stage: &mut Stage) -> Resul
 
     *stage = Stage::VerifyImage;
     ctx.start(Stage::VerifyImage);
-    let disc_sha = readback_stage(ctx, &device, iso_bytes)?;
+    // The burn command carried -eject and readback waits for the reloaded
+    // medium, so a physical reload always defeated the cache here.
+    let (disc_sha, o_direct) = readback_stage(ctx, &device, iso_bytes, true, &mut degradations)?;
     ensure!(
         disc_sha == iso_sha,
         "READ-BACK MISMATCH - DO NOT TRUST THIS DISC: disc sha256 {disc_sha} != ISO sha256 {iso_sha}"
@@ -541,7 +547,7 @@ fn burn_pipeline(ctx: &RunnerCtx, req: &BurnRequest, stage: &mut Stage) -> Resul
     ctx.done(
         &mut stages,
         Stage::VerifyImage,
-        format!("{} read back, sha256 matches ISO", human_bytes(iso_bytes)),
+        readback_summary(iso_bytes, o_direct),
     );
 
     *stage = Stage::VerifyFiles;
@@ -630,6 +636,7 @@ fn burn_pipeline(ctx: &RunnerCtx, req: &BurnRequest, stage: &mut Stage) -> Resul
             stages,
             reminders,
             written_files,
+            degradations,
         },
     });
     Ok(())
@@ -639,6 +646,7 @@ fn burn_pipeline(ctx: &RunnerCtx, req: &BurnRequest, stage: &mut Stage) -> Resul
 pub fn run_burn_iso(ctx: &RunnerCtx, iso: &Path, assume_yes: bool) -> Result<()> {
     with_failure(ctx, |stage| {
         let mut stages: Vec<(Stage, String)> = Vec::new();
+        let mut degradations: Vec<String> = Vec::new();
 
         *stage = Stage::Preflight;
         ctx.start(Stage::Preflight);
@@ -705,7 +713,9 @@ pub fn run_burn_iso(ctx: &RunnerCtx, iso: &Path, assume_yes: bool) -> Result<()>
         *stage = Stage::VerifyImage;
         ctx.start(Stage::VerifyImage);
         let expected = expected_iso_sha(ctx, Stage::VerifyImage, iso)?;
-        let disc_sha = readback_stage(ctx, &device, iso_bytes)?;
+        // Burn carried -eject; readback waits for the reloaded medium.
+        let (disc_sha, o_direct) =
+            readback_stage(ctx, &device, iso_bytes, true, &mut degradations)?;
         ensure!(
             disc_sha == expected,
             "READ-BACK MISMATCH - DO NOT TRUST THIS DISC: disc sha256 {disc_sha} != ISO sha256 {expected}"
@@ -713,7 +723,7 @@ pub fn run_burn_iso(ctx: &RunnerCtx, iso: &Path, assume_yes: bool) -> Result<()>
         ctx.done(
             &mut stages,
             Stage::VerifyImage,
-            format!("{} read back, sha256 matches ISO", human_bytes(iso_bytes)),
+            readback_summary(iso_bytes, o_direct),
         );
 
         // burn-iso is always line mode; only an explicit config opt-in ejects
@@ -732,6 +742,7 @@ pub fn run_burn_iso(ctx: &RunnerCtx, iso: &Path, assume_yes: bool) -> Result<()>
                 } else {
                     Vec::new()
                 },
+                degradations,
             },
         });
         Ok(())
@@ -742,6 +753,7 @@ pub fn run_burn_iso(ctx: &RunnerCtx, iso: &Path, assume_yes: bool) -> Result<()>
 pub fn run_verify(ctx: &RunnerCtx, iso: Option<&Path>) -> Result<()> {
     with_failure(ctx, |stage| {
         let mut stages: Vec<(Stage, String)> = Vec::new();
+        let mut degradations: Vec<String> = Vec::new();
         let mut report_sha = None;
         let mut report_bytes = 0u64;
 
@@ -758,13 +770,20 @@ pub fn run_verify(ctx: &RunnerCtx, iso: Option<&Path>) -> Result<()> {
                 .with_context(|| format!("stat ISO {}", iso.display()))?
                 .len();
             let expected = expected_iso_sha(ctx, Stage::VerifyImage, iso)?;
-            match verify::eject(&ctx.tools, &device) {
-                Ok(()) => ctx.info("ejected disc - reload defeats the page cache".into()),
-                Err(e) => ctx.warn(format!(
-                    "no eject/reload before read-back ({e:#}); relying on O_DIRECT"
-                )),
-            }
-            let disc_sha = readback_stage(ctx, &device, iso_bytes)?;
+            let reloaded = match verify::eject(&ctx.tools, &device) {
+                Ok(()) => {
+                    ctx.info("ejected disc - reload defeats the page cache".into());
+                    true
+                }
+                Err(e) => {
+                    ctx.warn(format!(
+                        "no eject/reload before read-back ({e:#}); relying on O_DIRECT"
+                    ));
+                    false
+                }
+            };
+            let (disc_sha, o_direct) =
+                readback_stage(ctx, &device, iso_bytes, reloaded, &mut degradations)?;
             ensure!(
                 disc_sha == expected,
                 "READ-BACK MISMATCH - DO NOT TRUST THIS DISC: disc sha256 {disc_sha} != ISO sha256 {expected}"
@@ -772,10 +791,20 @@ pub fn run_verify(ctx: &RunnerCtx, iso: Option<&Path>) -> Result<()> {
             ctx.done(
                 &mut stages,
                 Stage::VerifyImage,
-                format!("{} read back, sha256 matches ISO", human_bytes(iso_bytes)),
+                readback_summary(iso_bytes, o_direct),
             );
             report_sha = Some(expected);
             report_bytes = iso_bytes;
+        } else {
+            // Without --iso this checks the disc against its OWN on-disc
+            // checksums (plus the MD5 session tags): it detects media decay,
+            // not whether the burn matched the source. Say so, and record it.
+            let caveat = "no --iso given: checked the disc against its own recorded checksums, \
+                 which detects media decay but not an incorrect burn - pass --iso for \
+                 byte-exact source verification"
+                .to_string();
+            ctx.warn(caveat.clone());
+            degradations.push(caveat);
         }
 
         *stage = Stage::VerifyFiles;
@@ -831,10 +860,10 @@ pub fn run_verify(ctx: &RunnerCtx, iso: Option<&Path>) -> Result<()> {
                 "MD5 tags and read check clean".into(),
             ),
             Ok(false) => bail!("xorriso -check_media reports damage or MD5 mismatch"),
-            Err(e) => {
-                ctx.warn(format!("check_media could not run: {e:#}"));
-                ctx.done(&mut stages, Stage::CheckMedia, "skipped (no result)".into());
-            }
+            // A verify that exits 0 after silently skipping its media check is
+            // false confidence. check_media needs only xorriso (always present),
+            // so an error here is exceptional - fail rather than report success.
+            Err(e) => return Err(e).context("check_media could not run"),
         }
 
         ctx.send(StageEvent::Finished {
@@ -845,6 +874,7 @@ pub fn run_verify(ctx: &RunnerCtx, iso: Option<&Path>) -> Result<()> {
                 stages,
                 reminders: Vec::new(),
                 written_files: Vec::new(),
+                degradations,
             },
         });
         Ok(())
@@ -1297,7 +1327,19 @@ fn wait_ready(ctx: &RunnerCtx, device: &str) -> Result<()> {
     verify::wait_medium_ready(&ctx.tools, device, READY_TIMEOUT, &mut |msg| ctx.warn(msg))
 }
 
-fn readback_stage(ctx: &RunnerCtx, device: &str, iso_bytes: u64) -> Result<String> {
+/// Read the disc back and hash it. `reloaded` states whether a physical
+/// eject/reload preceded this read. The cache-proof guarantee holds iff the
+/// page cache was defeated by O_DIRECT **or** by that reload; if neither
+/// happened the buffered read could be served from cache and a match would be
+/// meaningless, so we fail closed. A buffered read after a real reload is a
+/// degradation (recorded), not a failure. Returns (sha256, used_o_direct).
+fn readback_stage(
+    ctx: &RunnerCtx,
+    device: &str,
+    iso_bytes: u64,
+    reloaded: bool,
+    degradations: &mut Vec<String>,
+) -> Result<(String, bool)> {
     wait_ready(ctx, device)?;
     verify::ensure_unmounted(&ctx.tools, device)?;
     let mut th = Throttle::default();
@@ -1312,13 +1354,32 @@ fn readback_stage(ctx: &RunnerCtx, device: &str, iso_bytes: u64) -> Result<Strin
         );
     })?;
     if !rb.o_direct {
-        ctx.warn(
-            "O_DIRECT unavailable - read-back used buffered reads; \
-             cache defeat relies on the eject/reload cycle"
-                .into(),
+        ensure!(
+            reloaded,
+            "cannot defeat the page cache: O_DIRECT is unavailable and no \
+             eject/reload happened, so a buffered read-back would compare \
+             against cached data - install 'eject' or free the device, then retry"
         );
+        let caveat = "image read-back used buffered reads (O_DIRECT unavailable); \
+             cache defeat relied on the physical disc reload"
+            .to_string();
+        ctx.warn(caveat.clone());
+        degradations.push(caveat);
     }
-    Ok(rb.sha256)
+    Ok((rb.sha256, rb.o_direct))
+}
+
+/// VerifyImage stage summary noting how the page cache was defeated.
+fn readback_summary(iso_bytes: u64, o_direct: bool) -> String {
+    let how = if o_direct {
+        "O_DIRECT"
+    } else {
+        "buffered after disc reload"
+    };
+    format!(
+        "{} read back, sha256 matches ISO ({how})",
+        human_bytes(iso_bytes)
+    )
 }
 
 fn expected_iso_sha(ctx: &RunnerCtx, stage: Stage, iso: &Path) -> Result<String> {
@@ -1641,6 +1702,12 @@ mod tests {
         let long = sanitize_label(&"a".repeat(50));
         assert_eq!(long.len(), 32);
         assert!(long.chars().all(|c| c == 'A'));
+    }
+
+    #[test]
+    fn readback_summary_names_the_cache_defeat() {
+        assert!(readback_summary(2048, true).contains("(O_DIRECT)"));
+        assert!(readback_summary(2048, false).contains("(buffered after disc reload)"));
     }
 
     #[test]

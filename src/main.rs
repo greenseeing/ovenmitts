@@ -338,7 +338,8 @@ fn print_report(report: &RunReport) {
         && report.iso_path.is_none()
         && report.iso_sha256.is_none()
         && report.reminders.is_empty()
-        && report.written_files.is_empty();
+        && report.written_files.is_empty()
+        && report.degradations.is_empty();
     if empty {
         return;
     }
@@ -361,6 +362,9 @@ fn print_report(report: &RunReport) {
     }
     for f in &report.written_files {
         println!("  wrote: {}", f.display());
+    }
+    for c in &report.degradations {
+        println!("  caveat: {c}");
     }
     for r in &report.reminders {
         println!("  reminder: {r}");

@@ -1079,6 +1079,16 @@ impl App {
                 )));
             }
         }
+        if !report.degradations.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(heading("Caveats"));
+            for c in &report.degradations {
+                lines.push(Line::from(Span::styled(
+                    format!("  ! {c}"),
+                    Style::new().fg(WARN),
+                )));
+            }
+        }
         lines.push(Line::from(""));
         lines.push(heading("Reminders"));
         for r in &report.reminders {
@@ -1844,6 +1854,7 @@ mod tests {
                     "second copy: insert a fresh disc and run `ovenmitts burn-iso /staging/ARCHIVE/ARCHIVE.iso`".into(),
                 ],
                 written_files: vec![],
+                degradations: vec![],
             },
         });
         let backend = ratatui::backend::TestBackend::new(120, 30);

@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Verification fails closed when the page cache can't be defeated.** With
+  `verify --iso`, if `eject` is unavailable *and* the O_DIRECT read-back also
+  fails, ovenmitts previously fell back to a buffered read that could be served
+  from cache and still print PASS. It now hard-errors in that case. A buffered
+  read-back that *did* follow a physical disc reload is allowed but recorded as
+  a caveat (shown in the report, in both line and TUI modes), and each
+  VerifyImage summary states whether the cache was defeated by O_DIRECT or by
+  the reload.
+- **`verify` without `--iso` is labeled advisory.** That mode checks the disc
+  against its own on-disc checksums (media-decay detection), not against the
+  source; it now says so via a warning and a recorded caveat.
+- **`check_media` errors fail the verify.** A `verify` run that couldn't run its
+  media check previously reported the stage as "skipped" and still finished
+  successfully — false confidence. It now fails the run (matching `check`).
 - **Mounted-VeraCrypt-container detection now fails closed.** The preflight
   check that refuses to burn a mounted container previously treated *any*
   `veracrypt --list` failure (a spawn error, an unexpected exit) as "nothing

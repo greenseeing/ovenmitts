@@ -735,6 +735,39 @@ fn run_verify_passes_against_burned_device() {
 }
 
 #[test]
+fn run_verify_without_iso_is_labeled_advisory() {
+    let h = Harness::new();
+    let payload = h.payload("vault.hc", 8 * 1024 * 1024, 21);
+    let stage_dir = h.stage_dir("ADVISORY");
+    let iso = stage_dir.join("ADVISORY.iso");
+    h.set_mount_for(&iso);
+
+    let (ctx, rx, _ack) = h.ctx();
+    runner::run_burn(&ctx, &burn_request(vec![payload], "ADVISORY")).unwrap();
+    drain(ctx, rx);
+
+    // No --iso: checks the disc against its own on-disc checksums only. Must
+    // finish, but must record a caveat that this is not source verification.
+    let (ctx, rx, _ack) = h.ctx();
+    runner::run_verify(&ctx, None).unwrap();
+    let events = drain(ctx, rx);
+
+    let Some(StageEvent::Finished { report }) = events.last() else {
+        panic!("expected Finished last, got {:?}", events.last());
+    };
+    assert!(
+        report.degradations.iter().any(|d| d.contains("no --iso")),
+        "expected an advisory caveat, got {:?}",
+        report.degradations
+    );
+    // The image read-back stage must not run without an ISO to compare against.
+    assert!(!stage_starts(&events).contains(&Stage::VerifyImage));
+    assert!(events
+        .iter()
+        .any(|ev| matches!(ev, StageEvent::Warn(t) if t.contains("no --iso"))));
+}
+
+#[test]
 fn run_verify_refuses_disc_with_traversal_checksums() {
     let h = Harness::new();
     let payload = h.payload("vault.hc", 8 * 1024 * 1024, 13);
