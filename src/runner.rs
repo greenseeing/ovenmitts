@@ -180,10 +180,41 @@ pub struct RunnerCtx {
     pub tools: Tools,
     pub tx: Sender<StageEvent>,
     pub ack_rx: Receiver<Ack>,
+    /// When set, every event is also appended to a run.log on disk, so a
+    /// crash or power loss mid-burn leaves a forensic record.
+    tee: std::sync::Mutex<Option<RunLog>>,
 }
 
 impl RunnerCtx {
+    pub fn new(cfg: Config, tools: Tools, tx: Sender<StageEvent>, ack_rx: Receiver<Ack>) -> Self {
+        Self {
+            cfg,
+            tools,
+            tx,
+            ack_rx,
+            tee: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Start teeing events to `path` (append, dated header). Best effort: a
+    /// run log that cannot be opened warns but never fails the run.
+    fn tee_events_to(&self, path: &Path) {
+        match RunLog::open(path) {
+            Ok(log) => {
+                if let Ok(mut tee) = self.tee.lock() {
+                    *tee = Some(log);
+                }
+            }
+            Err(e) => self.warn(format!("no run log at {}: {e:#}", path.display())),
+        }
+    }
+
     pub fn send(&self, ev: StageEvent) {
+        if let Ok(mut tee) = self.tee.lock() {
+            if let Some(log) = tee.as_mut() {
+                log.record(&ev);
+            }
+        }
         let _ = self.tx.send(ev);
     }
 
@@ -233,6 +264,70 @@ impl RunnerCtx {
 
     fn out(&self, text: String) {
         self.send(StageEvent::Out(text));
+    }
+}
+
+/// Append-mode event log: one dated header per run, then timestamped lines
+/// for stage transitions, info/warnings, failures, and decile progress steps
+/// (full progress would be megabytes of \r spam).
+struct RunLog {
+    file: std::fs::File,
+    last_decile: Option<(Stage, u32)>,
+}
+
+impl RunLog {
+    fn open(path: &Path) -> std::io::Result<Self> {
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(path)?;
+        writeln!(
+            file,
+            "=== run {} (ovenmitts {}) ===",
+            chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC"),
+            env!("CARGO_PKG_VERSION")
+        )?;
+        Ok(Self {
+            file,
+            last_decile: None,
+        })
+    }
+
+    fn record(&mut self, ev: &StageEvent) {
+        use std::io::Write as _;
+        let line = match ev {
+            StageEvent::StageStart(stage) => Some(format!("[{}] start", stage.label())),
+            StageEvent::StageDone { stage, summary } => {
+                Some(format!("[{}] done - {summary}", stage.label()))
+            }
+            StageEvent::Progress {
+                stage,
+                pct: Some(pct),
+                detail,
+            } => {
+                let decile = (*pct / 10.0) as u32;
+                if self.last_decile == Some((*stage, decile)) {
+                    None
+                } else {
+                    self.last_decile = Some((*stage, decile));
+                    Some(format!("[{}] {pct:5.1}% {detail}", stage.label()))
+                }
+            }
+            StageEvent::Info(t) => Some(format!("info: {t}")),
+            StageEvent::Warn(t) => Some(format!("warning: {t}")),
+            StageEvent::Failed { stage, error } => {
+                Some(format!("error: [{}] {error}", stage.label()))
+            }
+            _ => None,
+        };
+        if let Some(line) = line {
+            let _ = writeln!(
+                self.file,
+                "{} {line}",
+                chrono::Utc::now().format("%Y-%m-%d %H:%M:%S")
+            );
+        }
     }
 }
 
@@ -356,6 +451,8 @@ fn burn_pipeline(ctx: &RunnerCtx, req: &BurnRequest, stage: &mut Stage) -> Resul
     let stage_dir = params.staging.join(&label);
     std::fs::create_dir_all(stage_dir.join("parity"))
         .with_context(|| format!("create staging dir {}", stage_dir.display()))?;
+    let run_log_path = stage_dir.join("run.log");
+    ctx.tee_events_to(&run_log_path);
     ctx.info(format!("staging into {}", stage_dir.display()));
 
     let mut parity_files: Vec<PathBuf> = Vec::new();
@@ -623,7 +720,11 @@ fn burn_pipeline(ctx: &RunnerCtx, req: &BurnRequest, stage: &mut Stage) -> Resul
                 .into(),
         );
     }
-    let mut written_files = parity_files;
+    let mut written_files = Vec::new();
+    if run_log_path.is_file() {
+        written_files.push(run_log_path);
+    }
+    written_files.extend(parity_files);
     written_files.push(checksums_path);
     written_files.push(manifest_path);
     written_files.push(recovery_path);
@@ -636,17 +737,19 @@ fn burn_pipeline(ctx: &RunnerCtx, req: &BurnRequest, stage: &mut Stage) -> Resul
     if burn_log.is_file() {
         written_files.push(burn_log);
     }
-    ctx.send(StageEvent::Finished {
-        report: RunReport {
-            iso_path: keep_iso.then_some(iso),
-            iso_sha256: Some(iso_sha),
-            iso_bytes,
-            stages,
-            reminders,
-            written_files,
-            degradations,
-        },
-    });
+    let report_path = stage_dir.join(format!("{label}.report.txt"));
+    written_files.push(report_path.clone());
+    let report = RunReport {
+        iso_path: keep_iso.then_some(iso),
+        iso_sha256: Some(iso_sha),
+        iso_bytes,
+        stages,
+        reminders,
+        written_files,
+        degradations,
+    };
+    crate::fsutil::write_durable(&report_path, report_text(&report, &ctx.tools))?;
+    ctx.send(StageEvent::Finished { report });
     Ok(())
 }
 
@@ -662,6 +765,8 @@ pub fn run_burn_iso(ctx: &RunnerCtx, iso: &Path, assume_yes: bool) -> Result<()>
             .with_context(|| format!("stat ISO {}", iso.display()))?
             .len();
         ensure!(iso_bytes > 0, "ISO is empty: {}", iso.display());
+        let run_log_path = iso.with_extension("run.log");
+        ctx.tee_events_to(&run_log_path);
         let (device, media) = resolve_device(ctx)?;
         ctx.info(format!(
             "media: {} — {} free",
@@ -744,22 +849,27 @@ pub fn run_burn_iso(ctx: &RunnerCtx, iso: &Path, assume_yes: bool) -> Result<()>
         // burn-iso is always line mode; only an explicit config opt-in ejects
         eject_if_configured(ctx, &device, false);
 
+        let mut written_files = Vec::new();
+        if run_log_path.is_file() {
+            written_files.push(run_log_path);
+        }
         let burn_log = burn::burn_log_path(iso);
-        ctx.send(StageEvent::Finished {
-            report: RunReport {
-                iso_path: Some(iso.to_path_buf()),
-                iso_sha256: Some(expected),
-                iso_bytes,
-                stages,
-                reminders: Vec::new(),
-                written_files: if burn_log.is_file() {
-                    vec![burn_log]
-                } else {
-                    Vec::new()
-                },
-                degradations,
-            },
-        });
+        if burn_log.is_file() {
+            written_files.push(burn_log);
+        }
+        let report_path = iso.with_extension("report.txt");
+        written_files.push(report_path.clone());
+        let report = RunReport {
+            iso_path: Some(iso.to_path_buf()),
+            iso_sha256: Some(expected),
+            iso_bytes,
+            stages,
+            reminders: Vec::new(),
+            written_files,
+            degradations,
+        };
+        crate::fsutil::write_durable(&report_path, report_text(&report, &ctx.tools))?;
+        ctx.send(StageEvent::Finished { report });
         Ok(())
     })
 }
@@ -1394,6 +1504,70 @@ fn readback_stage(
     Ok((rb.sha256, rb.o_direct))
 }
 
+/// The written report mirrors the on-screen summary plus provenance: which
+/// ovenmitts and which tools made this disc - the facts a future reader needs
+/// to trust or reconstruct it.
+fn report_text(report: &RunReport, tools: &Tools) -> String {
+    use std::fmt::Write as _;
+    let mut t = String::new();
+    let _ = writeln!(t, "ovenmitts {} run report", env!("CARGO_PKG_VERSION"));
+    let _ = writeln!(
+        t,
+        "finished: {}",
+        chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
+    );
+    let _ = writeln!(t, "tools:");
+    let _ = writeln!(t, "  xorriso: {}", tools.xorriso.display());
+    if let Some(par2) = &tools.par2 {
+        match &tools.par2_version {
+            Some(v) => {
+                let _ = writeln!(t, "  par2: {} ({v})", par2.display());
+            }
+            None => {
+                let _ = writeln!(t, "  par2: {}", par2.display());
+            }
+        }
+    }
+    for (name, path) in [
+        ("udisksctl", &tools.udisksctl),
+        ("veracrypt", &tools.veracrypt),
+        ("eject", &tools.eject),
+        ("dvd+rw-mediainfo", &tools.mediainfo),
+    ] {
+        if let Some(p) = path {
+            let _ = writeln!(t, "  {name}: {}", p.display());
+        }
+    }
+    let _ = writeln!(t);
+    for (stage, summary) in &report.stages {
+        let _ = writeln!(t, "{:<13} {summary}", stage.label());
+    }
+    if let Some(p) = &report.iso_path {
+        let _ = writeln!(t, "iso: {}", p.display());
+    }
+    if let Some(h) = &report.iso_sha256 {
+        let _ = writeln!(t, "iso sha256: {h}");
+    }
+    if report.iso_bytes > 0 {
+        let _ = writeln!(
+            t,
+            "iso size: {} ({} bytes)",
+            human_bytes(report.iso_bytes),
+            report.iso_bytes
+        );
+    }
+    for f in &report.written_files {
+        let _ = writeln!(t, "wrote: {}", f.display());
+    }
+    for c in &report.degradations {
+        let _ = writeln!(t, "caveat: {c}");
+    }
+    for r in &report.reminders {
+        let _ = writeln!(t, "reminder: {r}");
+    }
+    t
+}
+
 /// VerifyImage stage summary noting how the page cache was defeated.
 fn readback_summary(iso_bytes: u64, o_direct: bool) -> String {
     let how = if o_direct {
@@ -1703,16 +1877,7 @@ mod tests {
     fn ctx_pair(cfg: Config, tools: Tools) -> (RunnerCtx, Receiver<StageEvent>, Sender<Ack>) {
         let (tx, rx) = mpsc::channel();
         let (ack_tx, ack_rx) = mpsc::channel();
-        (
-            RunnerCtx {
-                cfg,
-                tools,
-                tx,
-                ack_rx,
-            },
-            rx,
-            ack_tx,
-        )
+        (RunnerCtx::new(cfg, tools, tx, ack_rx), rx, ack_tx)
     }
 
     fn is_busy(e: &anyhow::Error) -> bool {
@@ -2557,7 +2722,14 @@ mod tests {
             };
             assert_eq!(report.iso_sha256.as_deref(), Some(sha.as_str()));
             let log = dir.path().join("copy.burn.log");
-            assert_eq!(report.written_files, vec![log.clone()]);
+            assert_eq!(
+                report.written_files,
+                vec![
+                    dir.path().join("copy.run.log"),
+                    log.clone(),
+                    dir.path().join("copy.report.txt"),
+                ]
+            );
             assert!(log.is_file());
             assert!(events
                 .iter()

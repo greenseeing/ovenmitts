@@ -50,12 +50,7 @@ pub fn run(cfg: Config, tools: Tools, req: BurnRequest) -> Result<()> {
     let params = BurnParams::resolve(&cfg, &req);
     let (tx, rx) = mpsc::channel::<StageEvent>();
     let (ack_tx, ack_rx) = mpsc::channel::<Ack>();
-    let ctx = RunnerCtx {
-        cfg: cfg.clone(),
-        tools,
-        tx,
-        ack_rx,
-    };
+    let ctx = RunnerCtx::new(cfg.clone(), tools, tx, ack_rx);
     let worker = std::thread::spawn(move || runner::run_burn(&ctx, &req));
     // SIGTERM/SIGHUP (terminal closed, `systemctl stop`) arrive as signals, not
     // key events; the loop polls this so they trigger the same clean shutdown

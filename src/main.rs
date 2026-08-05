@@ -199,12 +199,7 @@ where
     let headroom_pct = cfg.headroom_pct;
     let (tx, rx) = mpsc::channel();
     let (ack_tx, ack_rx) = mpsc::channel();
-    let ctx = RunnerCtx {
-        cfg,
-        tools,
-        tx,
-        ack_rx,
-    };
+    let ctx = RunnerCtx::new(cfg, tools, tx, ack_rx);
     let worker = std::thread::spawn(move || run(&ctx));
     let stop = ovenmitts::shutdown::install();
 

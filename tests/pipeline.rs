@@ -89,12 +89,7 @@ impl Harness {
         let (tx, rx) = std::sync::mpsc::channel();
         let (ack_tx, ack_rx) = std::sync::mpsc::channel();
         (
-            RunnerCtx {
-                cfg: self.config(),
-                tools: self.tools(),
-                tx,
-                ack_rx,
-            },
+            RunnerCtx::new(self.config(), self.tools(), tx, ack_rx),
             rx,
             ack_tx,
         )
@@ -467,6 +462,7 @@ fn burn_pipeline_end_to_end() {
     assert!(report.reminders.iter().any(|r| r.contains("VeraCrypt")));
 
     let expected_written = vec![
+        stage_dir.join("run.log"),
         stage_dir.join("parity").join("vault.hc.par2"),
         stage_dir.join("parity").join("vault.hc.vol000+01.par2"),
         stage_dir.join("checksums.sha256"),
@@ -476,11 +472,27 @@ fn burn_pipeline_end_to_end() {
         stage_dir.join("PIPE.lba.txt"),
         stage_dir.join("PIPE.iso.sha256"),
         stage_dir.join("PIPE.burn.log"),
+        stage_dir.join("PIPE.report.txt"),
     ];
     assert_eq!(report.written_files, expected_written);
     for f in &report.written_files {
         assert!(f.is_file(), "reported file missing: {}", f.display());
     }
+
+    // the run record must survive the process: stage transitions in run.log,
+    // provenance + summaries in the report
+    let run_log = std::fs::read_to_string(stage_dir.join("run.log")).unwrap();
+    assert!(run_log.contains("=== run "), "{run_log}");
+    assert!(run_log.contains("[burn] start"), "{run_log}");
+    assert!(run_log.contains("[verify files] done"), "{run_log}");
+    let report_txt = std::fs::read_to_string(stage_dir.join("PIPE.report.txt")).unwrap();
+    assert!(
+        report_txt.contains(&format!("ovenmitts {}", env!("CARGO_PKG_VERSION"))),
+        "{report_txt}"
+    );
+    assert!(report_txt.contains("fake par2"), "{report_txt}");
+    assert!(report_txt.contains(&device_sha), "{report_txt}");
+    assert!(report_txt.contains("read back"), "{report_txt}");
 
     assert!(events.iter().any(|ev| matches!(
         ev,
@@ -668,6 +680,33 @@ fn discard_iso_drops_iso_from_written_files_but_keeps_sidecars() {
     for f in &report.written_files {
         assert!(f.is_file(), "reported file missing: {}", f.display());
     }
+}
+
+#[test]
+fn burn_iso_writes_forensics_next_to_iso() {
+    let h = Harness::new();
+    let iso = h.dir.path().join("copy.iso");
+    std::fs::write(&iso, pseudo_random(64 * 1024, 3)).unwrap();
+
+    let (ctx, rx, _ack) = h.ctx();
+    runner::run_burn_iso(&ctx, &iso, true).unwrap();
+    let events = drain(ctx, rx);
+
+    let Some(StageEvent::Finished { report }) = events.last() else {
+        panic!("expected Finished last, got {:?}", events.last());
+    };
+    let run_log = h.dir.path().join("copy.run.log");
+    let report_txt = h.dir.path().join("copy.report.txt");
+    assert_eq!(report.written_files.first(), Some(&run_log));
+    assert_eq!(report.written_files.last(), Some(&report_txt));
+    for f in &report.written_files {
+        assert!(f.is_file(), "reported file missing: {}", f.display());
+    }
+    let log = std::fs::read_to_string(&run_log).unwrap();
+    assert!(log.contains("[burn] start"), "{log}");
+    let text = std::fs::read_to_string(&report_txt).unwrap();
+    assert!(text.contains("read back"), "{text}");
+    assert!(text.contains(&sha256_of(&iso)), "{text}");
 }
 
 #[test]
