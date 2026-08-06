@@ -1231,16 +1231,11 @@ impl App {
                 Style::new().fg(WARN),
             )));
         }
-        // logical-line clamp: wrapped lines under-scroll slightly, accepted
-        // over the feature-gated Paragraph::line_count
-        let max = lines.len().saturating_sub(inner.height as usize) as u16;
+        let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+        let total = paragraph.line_count(inner.width) as u16;
+        let max = total.saturating_sub(inner.height);
         let offset = self.report_scroll.min(max);
-        frame.render_widget(
-            Paragraph::new(lines)
-                .wrap(Wrap { trim: false })
-                .scroll((offset, 0)),
-            inner,
-        );
+        frame.render_widget(paragraph.scroll((offset, 0)), inner);
     }
 }
 
@@ -2042,6 +2037,47 @@ mod tests {
             .filter(|row| row.contains("second copy"))
             .count();
         assert_eq!(hits, 1, "the second-copy reminder must render exactly once");
+    }
+
+    #[test]
+    fn report_scroll_reaches_wrapped_reminder_tail() {
+        let (mut app, _ack_rx) = test_app();
+        app.apply(StageEvent::Finished {
+            report: RunReport {
+                iso_path: None,
+                iso_sha256: None,
+                iso_bytes: 0,
+                stages: vec![],
+                reminders: vec![
+                    "second copy: insert a fresh disc and run `ovenmitts burn-iso \
+                     /home/user/.local/share/ovenmitts/staging/ARCHIVE_20260806/ARCHIVE_20260806.iso`"
+                        .into(),
+                    "keep /home/user/.local/share/ovenmitts/staging/ARCHIVE_20260806 off-disc: \
+                     parity, ARCHIVE_20260806.lba.txt and checksums.sha256 are what repair a \
+                     damaged disc"
+                        .into(),
+                ],
+                written_files: vec![],
+                degradations: vec![],
+            },
+        });
+        let backend = ratatui::backend::TestBackend::new(60, 13);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        for _ in 0..20 {
+            app.on_key(key(KeyCode::Down));
+        }
+        terminal.draw(|f| app.render(f)).unwrap();
+        let buf = terminal.backend().buffer();
+        let tail_visible = (0..13).any(|y| {
+            (0..60)
+                .map(|x| buf.cell((x, y)).unwrap().symbol())
+                .collect::<String>()
+                .contains(".iso`")
+        });
+        assert!(
+            tail_visible,
+            "scrolling to the bottom must reveal the wrapped burn-iso path"
+        );
     }
 
     #[test]

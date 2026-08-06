@@ -15,6 +15,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   caught it on its first-ever run. `rust-version` and the CI job now say
   what has been true all along.
 
+- **Report screen scroll now reaches wrapped reminder tail.** The scroll clamp
+  counted logical lines while ratatui scrolls wrapped visual lines, making the
+  continuation of the second-copy reminder (`ovenmitts burn-iso <iso path>`)
+  unreachable at max scroll. Fixed by enabling ratatui's
+  `unstable-rendered-line-info` feature and clamping with
+  `Paragraph::line_count(inner.width)`. Added regression test.
+
 ## [0.2.0] - 2026-08-06
 
 ### Added
