@@ -5,6 +5,25 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.2] - 2026-08-18
+
+### Changed
+
+- The installer resolves the latest version from the `/releases/latest`
+  redirect instead of the GitHub API, whose unauthenticated 60-per-hour budget
+  is shared by everything on the same IP and intermittently answers 429.
+  (`ovenmitts update` already used release-asset URLs exclusively and was
+  never exposed.)
+- The install one-liner in the README, `RELEASING.md`, and the installer's own
+  header fetches `install.sh` from the latest release's assets instead of
+  `raw.githubusercontent.com`, which GitHub rate-limits per IP for
+  unauthenticated fetches (HTTP 429).
+
+### Fixed
+
+- The "bindir not writable" error from `ovenmitts update` no longer recommends
+  re-running the installer via the rate-limited raw URL.
+
 ## [0.2.1] - 2026-08-06
 
 ### Fixed
@@ -436,6 +455,7 @@ release; no tag or binaries exist for it.
   loaded so the tray isn't left open.
 
 [Unreleased]: https://github.com/greenseeing/ovenmitts/compare/v0.2.0...HEAD
+[0.2.2]: https://github.com/greenseeing/ovenmitts/releases/tag/v0.2.2
 [0.2.1]: https://github.com/greenseeing/ovenmitts/releases/tag/v0.2.1
 [0.2.0]: https://github.com/greenseeing/ovenmitts/releases/tag/v0.2.0
 [0.1.8]: https://github.com/greenseeing/ovenmitts/releases/tag/v0.1.8
