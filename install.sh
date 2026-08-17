@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ovenmitts installer — safe to re-run; upgrades in place when a newer release exists.
 #
-#   curl -fsSL https://raw.githubusercontent.com/greenseeing/ovenmitts/main/install.sh | bash
+#   curl -fsSL https://github.com/greenseeing/ovenmitts/releases/latest/download/install.sh | bash
 #
 set -euo pipefail
 
@@ -108,18 +108,24 @@ valid_version() {
 
 latest_version() {
   local version
-  # An explicit pin skips the API entirely.
+  # An explicit pin skips the network entirely.
   if [ -n "${OVENMITTS_VERSION:-}" ]; then
     version="${OVENMITTS_VERSION#v}"
     valid_version "$version" || die "OVENMITTS_VERSION is not a valid version: '$OVENMITTS_VERSION'"
     printf '%s' "$version"
     return 0
   fi
-  # Resolve the newest release tag (e.g. v0.1.0 -> 0.1.0) via the GitHub API.
-  local body
-  body="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest")" \
-    || die "could not query GitHub for the latest release (is the network up?)"
-  version="$(printf '%s' "$body" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"v\{0,1\}\([^"]*\)".*/\1/p' | head -n1)"
+  # Resolve the newest release tag (e.g. v0.1.0 -> 0.1.0) from the redirect of
+  # /releases/latest. Unlike api.github.com (shared 60/hr per-IP budget) and
+  # raw.githubusercontent.com, this endpoint is not rate-limited when
+  # unauthenticated.
+  local tag_url
+  tag_url="$(curl -fsS -o /dev/null -w '%{redirect_url}' "https://github.com/$REPO/releases/latest")" \
+    || die "could not resolve the latest release from https://github.com/$REPO/releases/latest — check the network, or pin one: OVENMITTS_VERSION=x.y.z"
+  case "$tag_url" in
+    */releases/tag/v*) version="${tag_url##*/tag/v}" ;;
+    *) die "GitHub did not redirect to a release tag (got: '$tag_url')" ;;
+  esac
   valid_version "$version" || die "GitHub returned an unexpected release tag: '$version'"
   printf '%s' "$version"
 }

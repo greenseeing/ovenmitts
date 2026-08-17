@@ -116,6 +116,6 @@ sidecar is missing.
 On a target device:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/greenseeing/ovenmitts/main/install.sh | bash
+curl -fsSL https://github.com/greenseeing/ovenmitts/releases/latest/download/install.sh | bash
 ovenmitts --version   # prints the new version
 ```

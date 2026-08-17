@@ -21,7 +21,7 @@ research in [`mdisc-archival-claims_2026-07-16/`](mdisc-archival-claims_2026-07-
 ## Install
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/greenseeing/ovenmitts/main/install.sh | bash
+curl -fsSL https://github.com/greenseeing/ovenmitts/releases/latest/download/install.sh | bash
 ```
 
 The installer detects `apt`/`dnf`/`zypper`/`pacman`, installs the burn

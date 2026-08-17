@@ -160,7 +160,7 @@ fn update_binary(curl_bin: &Path, base: &str, asset: &str, current_exe: &Path) -
     if !is_writable_dir(&bindir) {
         bail!(
             "{} is not writable - re-run the installer instead:\n  \
-             curl -fsSL https://raw.githubusercontent.com/{REPO}/main/install.sh | bash",
+             curl -fsSL https://github.com/{REPO}/releases/latest/download/install.sh | bash",
             bindir.display()
         );
     }
