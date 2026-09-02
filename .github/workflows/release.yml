@@ -50,7 +50,7 @@ jobs:
         with:
           subject-path: "dist/ovenmitts-linux-amd64, dist/ovenmitts-linux-arm64"
       - name: publish
-        uses: softprops/action-gh-release@6da8fa9354ddfdc4aeace5fc48d7f679b5214090 # v2.4.1
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           files: dist/*
           # Explicit: a release left drafted serves nothing — /releases/latest
