@@ -5,6 +5,19 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.3] - 2026-09-06
+
+### Changed
+
+- Dependency updates via Dependabot: `sha2` 0.10 -> 0.11, `toml` 0.8 -> 1.1,
+  `signal-hook` 0.3 -> 0.4, `clap` 4.6.2 -> 4.6.5, `serde` 1.0.228 -> 1.0.229.
+  No behaviour change; hashing, config parsing, and signal handling use the
+  same APIs on the new majors.
+- CI and release actions moved to their Node 24 lines: `actions/checkout` v7,
+  `actions/attest-build-provenance` v4, `softprops/action-gh-release` v3.
+  Release assets, `.sha256` sidecars, and provenance attestations are produced
+  exactly as before.
+
 ## [0.2.2] - 2026-08-18
 
 ### Changed
@@ -455,6 +468,7 @@ release; no tag or binaries exist for it.
   loaded so the tray isn't left open.
 
 [Unreleased]: https://github.com/greenseeing/ovenmitts/compare/v0.2.0...HEAD
+[0.2.3]: https://github.com/greenseeing/ovenmitts/releases/tag/v0.2.3
 [0.2.2]: https://github.com/greenseeing/ovenmitts/releases/tag/v0.2.2
 [0.2.1]: https://github.com/greenseeing/ovenmitts/releases/tag/v0.2.1
 [0.2.0]: https://github.com/greenseeing/ovenmitts/releases/tag/v0.2.0
