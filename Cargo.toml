@@ -22,7 +22,7 @@ clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 toml = "1.1"
-toml_edit = "0.22"
+toml_edit = "0.25"
 sha2 = "0.11"
 libc = "0.2"
 signal-hook = { version = "0.4", default-features = false }
